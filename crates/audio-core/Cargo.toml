@@ -1,0 +1,21 @@
+[package]
+name = "audio-core"
+version = "0.1.0"
+edition = "2021"
+description = "OpenAudio audio engine: device enumeration, capture, and playback."
+
+[lib]
+name = "audio_core"
+path = "src/lib.rs"
+
+
+
+
+[dependencies]
+cpal = "0.15"
+hound = "3.5"
+bytes = "1"
+# Windows-only for now, per project scope. cpal uses WASAPI as its
+# default backend on Windows automatically -- no extra config needed
+# for this milestone. ASIO support comes in a later milestone via the
+# cpal "asio" feature + Steinberg ASIO SDK.

@@ -1,0 +1,17 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/audio-core",
+]
+
+# Future milestones will add:
+# "crates/network-core"
+# "crates/routing-core"
+# "crates/discovery"
+# "crates/metadata"
+# "crates/protocol"
+# "crates/driver"
+# "crates/sdk"
+# "apps/sender"
+# "apps/receiver"
+# "apps/dashboard"
