@@ -3,7 +3,7 @@
 //! Run with: cargo run --example bus_transmit_a -p audio-core
 
 fn main() {
-    let duration_secs = 6;
+    let duration_secs = 20;
     let dest_addr = "127.0.0.1:6972";
     let stream_id = 2001;
 

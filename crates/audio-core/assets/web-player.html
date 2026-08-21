@@ -1,0 +1,549 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Ferronme's OpenAudio Web Player</title>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+    background: linear-gradient(135deg, #0f0f14 0%, #1a1a24 100%);
+    color: #e8e8ec; min-height: 100vh;
+    display: flex; align-items: center; justify-content: center; padding: 2rem;
+  }
+  .card {
+    background: rgba(30,30,40,0.7); backdrop-filter: blur(20px);
+    border: 1px solid rgba(255,255,255,0.08); border-radius: 20px;
+    padding: 2.5rem; max-width: 560px; width: 100%;
+    box-shadow: 0 20px 60px rgba(0,0,0,0.4);
+  }
+  h1 { font-size: 1.4rem; font-weight: 600; display: flex; align-items: center; gap: 0.5rem; margin-bottom: 0.3rem; }
+  .dot { width: 10px; height: 10px; border-radius: 50%; background: #444; transition: background 0.3s; flex-shrink: 0; }
+  .dot.live { background: #34d399; box-shadow: 0 0 12px #34d399; animation: pulse 1.5s infinite; }
+  @keyframes pulse { 0%,100%{opacity:1} 50%{opacity:0.4} }
+  .subtitle { color: #888; font-size: 0.85rem; margin-bottom: 1.8rem; }
+
+  /* stream list */
+  #streamList { display: flex; flex-direction: column; gap: 0.6rem; margin-bottom: 1.2rem; }
+  .stream-card {
+    background: rgba(0,0,0,0.25); border: 1px solid rgba(255,255,255,0.07);
+    border-radius: 12px; padding: 0.85rem 1rem; cursor: pointer;
+    transition: border-color 0.15s, background 0.15s;
+    display: flex; align-items: center; justify-content: space-between;
+  }
+  .stream-card:hover { border-color: #6366f1; background: rgba(99,102,241,0.08); }
+  .stream-card.selected { border-color: #6366f1; background: rgba(99,102,241,0.15); }
+  .stream-card .name { font-weight: 600; font-size: 0.95rem; }
+  .stream-card .meta { font-size: 0.75rem; color: #888; margin-top: 0.2rem; }
+  .stream-card .arrow { color: #6366f1; font-size: 1.1rem; opacity: 0; transition: opacity 0.15s; }
+  .stream-card:hover .arrow, .stream-card.selected .arrow { opacity: 1; }
+  .empty { color: #666; font-size: 0.85rem; text-align: center; padding: 1.2rem; }
+
+  /* channel picker */
+  #channelSection {
+    display: none; margin-bottom: 1.2rem;
+    background: rgba(0,0,0,0.25); border: 1px solid rgba(255,255,255,0.07);
+    border-radius: 14px; padding: 1rem;
+  }
+  #channelSection .sec-title {
+    font-size: 0.75rem; text-transform: uppercase; letter-spacing: 0.05em;
+    color: #777; margin-bottom: 0.7rem; display: flex; align-items: center; justify-content: space-between;
+  }
+  #channelSection .sec-title span { color: #a5b4fc; font-size: 0.7rem; cursor: pointer; text-transform: none; letter-spacing: 0; }
+  #channelGrid { display: flex; flex-wrap: wrap; gap: 0.45rem; margin-bottom: 0.8rem; }
+  .ch-btn {
+    width: 42px; height: 42px; border-radius: 8px;
+    background: rgba(255,255,255,0.05); border: 1px solid rgba(255,255,255,0.1);
+    color: #aaa; font-size: 0.75rem; font-weight: 600; cursor: pointer;
+    transition: background 0.15s, border-color 0.15s, color 0.15s;
+    display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 1px;
+  }
+  .ch-btn .ch-num { font-size: 0.8rem; }
+  .ch-btn .ch-label { font-size: 0.55rem; color: #666; }
+  .ch-btn.active {
+    background: rgba(99,102,241,0.3); border-color: #6366f1; color: #fff;
+  }
+  .ch-btn.active .ch-label { color: #a5b4fc; }
+  .ch-quick { display: flex; gap: 0.4rem; flex-wrap: wrap; }
+  .ch-quick button {
+    flex: none; padding: 0.3rem 0.7rem; font-size: 0.72rem;
+    background: rgba(255,255,255,0.06); border: 1px solid rgba(255,255,255,0.1);
+    border-radius: 6px; color: #aaa; cursor: pointer; font-weight: 500;
+    transition: background 0.15s, color 0.15s;
+  }
+  .ch-quick button:hover { background: rgba(99,102,241,0.2); color: #fff; border-color: #6366f1; }
+
+  /* output mix mode */
+  #mixRow { display: flex; gap: 0.5rem; margin-top: 0.7rem; flex-wrap: wrap; }
+  .mix-btn {
+    flex: 1; min-width: 80px; padding: 0.35rem 0.5rem;
+    background: rgba(255,255,255,0.05); border: 1px solid rgba(255,255,255,0.1);
+    border-radius: 8px; color: #aaa; font-size: 0.72rem; font-weight: 600;
+    cursor: pointer; text-align: center; transition: background 0.15s, color 0.15s;
+  }
+  .mix-btn.active { background: rgba(52,199,89,0.2); border-color: #34c759; color: #6ee7b7; }
+
+  /* buttons */
+  .btn-row { display: flex; gap: 0.7rem; margin-bottom: 0.5rem; }
+  button {
+    flex: 1; background: linear-gradient(135deg, #6366f1, #8b5cf6);
+    border: none; border-radius: 10px; padding: 0.8rem; color: #fff;
+    font-size: 0.9rem; font-weight: 600; cursor: pointer;
+    transition: transform 0.15s, box-shadow 0.15s;
+  }
+  button:hover:not(:disabled) { transform: translateY(-1px); box-shadow: 0 8px 20px rgba(99,102,241,0.35); }
+  button:disabled { opacity: 0.4; cursor: not-allowed; }
+  button.secondary { background: linear-gradient(135deg, #374151, #1f2937); }
+  button.warn-btn { background: linear-gradient(135deg, #f59e0b, #f97316); }
+
+  /* now playing */
+  .now-playing {
+    margin-top: 1.2rem; padding: 1rem; border-radius: 14px;
+    background: rgba(0,0,0,0.25); border: 1px solid rgba(255,255,255,0.06); display: none;
+  }
+  .np-label { font-size: 0.7rem; text-transform: uppercase; letter-spacing: 0.05em; color: #777; }
+  .np-name { font-size: 1.1rem; font-weight: 600; color: #a5b4fc; margin: 0.2rem 0 0.4rem; }
+  .meta-row { display: flex; gap: 1rem; font-size: 0.78rem; color: #999; flex-wrap: wrap; }
+  .meta-row b { color: #ddd; }
+  .engine-badge {
+    display: inline-block; padding: 0.1rem 0.45rem; border-radius: 6px;
+    background: rgba(99,102,241,0.2); color: #a5b4fc; font-size: 0.67rem; font-weight: 600;
+  }
+  .ch-active-badge {
+    display: inline-block; padding: 0.1rem 0.45rem; border-radius: 6px;
+    background: rgba(52,199,89,0.2); color: #6ee7b7; font-size: 0.67rem; font-weight: 600;
+  }
+
+  /* status */
+  #status { margin-top: 0.9rem; padding: 0.65rem 0.9rem; border-radius: 10px; font-size: 0.83rem; }
+  .ok   { background: rgba(52,211,153,0.15); color: #6ee7b7; border: 1px solid rgba(52,211,153,0.3); }
+  .err  { background: rgba(248,113,113,0.15); color: #fca5a5; border: 1px solid rgba(248,113,113,0.3); }
+  .idle { background: rgba(255,255,255,0.05); color: #999; }
+  .warn-st { background: rgba(245,158,11,0.15); color: #fcd34d; border: 1px solid rgba(245,158,11,0.3); }
+  #stats { margin-top: 0.5rem; font-size: 0.71rem; color: #555; text-align: center; }
+  #resumeBtn { display: none; width: 100%; margin-bottom: 0.5rem; }
+  #resumeBtn.show { display: block; }
+</style>
+</head>
+<body>
+<div class="card">
+  <h1><span id="liveDot" class="dot"></span> OpenAudio Web Player</h1>
+  <div class="subtitle">Live streams on your network</div>
+
+  <div id="streamList"><div class="empty">Loading streams…</div></div>
+
+  <!-- channel picker (shown after format arrives) -->
+  <div id="channelSection">
+    <div class="sec-title">
+      <span style="color:#e8e8ec;font-size:0.75rem;text-transform:uppercase;letter-spacing:0.05em;">Channel Selection</span>
+      <span id="chSelectAll">Select all</span>
+    </div>
+    <div id="channelGrid"></div>
+    <div class="ch-quick">
+      <button onclick="selectPairs('L')">L only</button>
+      <button onclick="selectPairs('R')">R only</button>
+      <button onclick="selectPairs('LR')">Stereo pairs</button>
+      <button onclick="selectNone()">None</button>
+      <button onclick="selectAll()">All</button>
+    </div>
+    <div id="mixRow">
+      <div class="mix-btn active" data-mix="downmix" onclick="setMix(this)">🔀 Downmix</div>
+      <div class="mix-btn" data-mix="first2" onclick="setMix(this)">1–2 only</div>
+      <div class="mix-btn" data-mix="mono" onclick="setMix(this)">Mono sum</div>
+    </div>
+  </div>
+
+  <div class="btn-row">
+    <button id="refreshBtn" class="secondary">⟳ Refresh</button>
+    <button id="playBtn" disabled>▶ Play Selected</button>
+  </div>
+  <button id="resumeBtn" class="warn-btn">🔊 Click to Enable Audio</button>
+
+  <div id="nowPlaying" class="now-playing">
+    <div class="np-label">Now Playing</div>
+    <div class="np-name" id="npName">—</div>
+    <div class="meta-row">
+      <span>📡 <b id="npFormat">—</b></span>
+      <span>⚙️ <span class="engine-badge" id="npEngine">—</span></span>
+      <span>🎚️ <span class="ch-active-badge" id="npChannels">—</span></span>
+    </div>
+  </div>
+
+  <div id="status" class="idle">Select a stream above, then press Play.</div>
+  <div id="stats"></div>
+</div>
+
+<script>
+  const WS_PORT = location.port ? parseInt(location.port) + 1 : 7101;
+  let streams = [], selectedNodeId = null;
+  let ws = null, audioCtx = null, workletNode = null, processorNode = null;
+  let usingWorklet = false;
+  let totalChannels = 2, sampleRate = 48000, streamDisplayName = '';
+
+  // channel selection state
+  let activeChannels = new Set();   // 0-based indices user wants to hear
+  let mixMode = 'downmix';          // 'downmix' | 'first2' | 'mono'
+
+  // fallback ring
+  let ringCapacity = 0, ringBuffers = [], ringWrite = 0, ringRead = 0;
+  let ringAvailable = 0, fallbackUnderruns = 0;
+
+  // DOM
+  const listEl     = document.getElementById('streamList');
+  const playBtn    = document.getElementById('playBtn');
+  const refreshBtn = document.getElementById('refreshBtn');
+  const resumeBtn  = document.getElementById('resumeBtn');
+  const statusEl   = document.getElementById('status');
+  const statsEl    = document.getElementById('stats');
+  const liveDot    = document.getElementById('liveDot');
+  const nowPlaying = document.getElementById('nowPlaying');
+  const chSection  = document.getElementById('channelSection');
+  const chGrid     = document.getElementById('channelGrid');
+
+  function setStatus(t, c) { statusEl.textContent = t; statusEl.className = c; }
+  function setLive(on) { liveDot.className = 'dot' + (on ? ' live' : ''); }
+  function esc(s) { return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;'); }
+
+  // ── stream list ────────────────────────────────────────────────────────
+  async function fetchStreams() {
+    listEl.innerHTML = '<div class="empty">Loading…</div>';
+    try {
+      const res = await fetch('/api/streams');
+      streams = await res.json();
+      renderList();
+    } catch(e) {
+      listEl.innerHTML = '<div class="empty">Could not reach /api/streams</div>';
+    }
+  }
+
+  function renderList() {
+    if (!streams.length) {
+      listEl.innerHTML = '<div class="empty">No streams discovered yet — is a publisher running?</div>';
+      playBtn.disabled = true; return;
+    }
+    listEl.innerHTML = '';
+    streams.forEach(s => {
+      const el = document.createElement('div');
+      el.className = 'stream-card' + (s.nodeId === selectedNodeId ? ' selected' : '');
+      el.innerHTML = `
+        <div>
+          <div class="name">${esc(s.streamName)}</div>
+          <div class="meta">${esc(s.nodeName)} · ${s.channelCount}ch · ${esc(s.ip)}</div>
+        </div>
+        <span class="arrow">▶</span>`;
+      el.addEventListener('click', () => { selectedNodeId = s.nodeId; renderList(); playBtn.disabled = false; });
+      listEl.appendChild(el);
+    });
+    playBtn.disabled = selectedNodeId === null;
+  }
+
+  // ── channel grid ───────────────────────────────────────────────────────
+  function buildChannelGrid(n) {
+    chGrid.innerHTML = '';
+    activeChannels = new Set(Array.from({length: n}, (_, i) => i)); // all on by default
+    for (let i = 0; i < n; i++) {
+      const btn = document.createElement('div');
+      btn.className = 'ch-btn active';
+      btn.dataset.ch = i;
+      const side = n > 1 ? (i % 2 === 0 ? 'L' : 'R') : 'M';
+      const pair = Math.floor(i / 2) + 1;
+      btn.innerHTML = `<span class="ch-num">${i + 1}</span><span class="ch-label">${n <= 2 ? side : pair + side}</span>`;
+      btn.addEventListener('click', () => toggleChannel(i, btn));
+      chGrid.appendChild(btn);
+    }
+    chSection.style.display = 'block';
+  }
+
+  function toggleChannel(i, btn) {
+    if (activeChannels.has(i)) { activeChannels.delete(i); btn.classList.remove('active'); }
+    else { activeChannels.add(i); btn.classList.add('active'); }
+    updateChannelBadge();
+  }
+
+  function selectAll() {
+    for (let i = 0; i < totalChannels; i++) activeChannels.add(i);
+    chGrid.querySelectorAll('.ch-btn').forEach(b => b.classList.add('active'));
+    updateChannelBadge();
+  }
+  function selectNone() {
+    activeChannels.clear();
+    chGrid.querySelectorAll('.ch-btn').forEach(b => b.classList.remove('active'));
+    updateChannelBadge();
+  }
+  function selectPairs(mode) {
+    activeChannels.clear();
+    chGrid.querySelectorAll('.ch-btn').forEach((b, i) => {
+      const keep = mode === 'L' ? i % 2 === 0 : mode === 'R' ? i % 2 === 1 : true;
+      if (keep) { activeChannels.add(i); b.classList.add('active'); }
+      else b.classList.remove('active');
+    });
+    updateChannelBadge();
+  }
+  function setMix(el) {
+    document.querySelectorAll('.mix-btn').forEach(b => b.classList.remove('active'));
+    el.classList.add('active');
+    mixMode = el.dataset.mix;
+  }
+  function updateChannelBadge() {
+    const sorted = [...activeChannels].sort((a,b)=>a-b).map(i=>i+1);
+    document.getElementById('npChannels').textContent =
+      sorted.length === totalChannels ? 'All channels' :
+      sorted.length === 0 ? 'Muted' :
+      'Ch ' + sorted.join(', ');
+  }
+  document.getElementById('chSelectAll').addEventListener('click', selectAll);
+
+  // ── downmix helper ─────────────────────────────────────────────────────
+  // Takes full interleaved Float32Array, returns stereo interleaved Float32Array
+  // based on activeChannels + mixMode
+  function downmixToStereo(interleaved) {
+    const frames = interleaved.length / totalChannels;
+    const out = new Float32Array(frames * 2);
+    const selected = [...activeChannels].sort((a,b)=>a-b);
+    if (selected.length === 0) return out; // silence
+
+    if (mixMode === 'first2') {
+      // just pass ch 0→L, ch 1→R (or mono if only 1 selected)
+      const chL = selected[0];
+      const chR = selected.length > 1 ? selected[1] : selected[0];
+      for (let f = 0; f < frames; f++) {
+        out[f*2]   = interleaved[f*totalChannels + chL];
+        out[f*2+1] = interleaved[f*totalChannels + chR];
+      }
+      return out;
+    }
+
+    if (mixMode === 'mono') {
+      const gain = 1 / selected.length;
+      for (let f = 0; f < frames; f++) {
+        let sum = 0;
+        for (const ch of selected) sum += interleaved[f*totalChannels + ch];
+        const v = sum * gain;
+        out[f*2] = v; out[f*2+1] = v;
+      }
+      return out;
+    }
+
+    // downmix: pair even→L, odd→R; unpaired channels split to both
+    const leftChs  = selected.filter(i => i % 2 === 0);
+    const rightChs = selected.filter(i => i % 2 === 1);
+    // if user selected only odd or only even, route everything to both sides
+    const lSrc = leftChs.length  ? leftChs  : selected;
+    const rSrc = rightChs.length ? rightChs : selected;
+    const lGain = 1 / lSrc.length;
+    const rGain = 1 / rSrc.length;
+    for (let f = 0; f < frames; f++) {
+      let l = 0, r = 0;
+      for (const ch of lSrc) l += interleaved[f*totalChannels + ch];
+      for (const ch of rSrc) r += interleaved[f*totalChannels + ch];
+      out[f*2]   = l * lGain;
+      out[f*2+1] = r * rGain;
+    }
+    return out;
+  }
+
+  // ── audio worklet ──────────────────────────────────────────────────────
+  const WORKLET_CODE = `
+    class PCMPlayerProcessor extends AudioWorkletProcessor {
+      constructor(options) {
+        super();
+        const { capacitySamples, prebufferSeconds, sampleRate } = options.processorOptions;
+        this.capacity = capacitySamples;
+        // always stereo output after downmix
+        this.bufL = new Float32Array(this.capacity);
+        this.bufR = new Float32Array(this.capacity);
+        this.writeIndex = 0; this.readIndex = 0; this.available = 0;
+        this.started = false;
+        this.prebufferSamples = Math.floor(sampleRate * prebufferSeconds);
+        this.underrunCount = 0; this.statsCounter = 0;
+        this.port.onmessage = e => { if (e.data.type === 'data') this._write(e.data.l, e.data.r); };
+      }
+      _write(l, r) {
+        for (let i = 0; i < l.length; i++) {
+          this.bufL[this.writeIndex] = l[i];
+          this.bufR[this.writeIndex] = r[i];
+          this.writeIndex = (this.writeIndex + 1) % this.capacity;
+          if (this.available < this.capacity) this.available++;
+          else this.readIndex = (this.readIndex + 1) % this.capacity;
+        }
+      }
+      process(inputs, outputs) {
+        const outL = outputs[0][0], outR = outputs[0][1] || outputs[0][0];
+        const need = outL.length;
+        if (++this.statsCounter >= 20) {
+          this.statsCounter = 0;
+          this.port.postMessage({ type: 'stats', available: this.available, underruns: this.underrunCount });
+        }
+        if (!this.started) {
+          if (this.available >= this.prebufferSamples) this.started = true;
+          else { outL.fill(0); outR.fill(0); return true; }
+        }
+        if (this.available < need) {
+          this.underrunCount++; outL.fill(0); outR.fill(0);
+          this.started = this.available >= this.prebufferSamples; return true;
+        }
+        for (let f = 0; f < need; f++) {
+          outL[f] = this.bufL[this.readIndex];
+          outR[f] = this.bufR[this.readIndex];
+          this.readIndex = (this.readIndex + 1) % this.capacity;
+          this.available--;
+        }
+        return true;
+      }
+    }
+    registerProcessor('pcm-player', PCMPlayerProcessor);
+  `;
+
+  function ensureAudioContext() {
+    if (!audioCtx) audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+    audioCtx.resume().catch(()=>{});
+  }
+
+  async function setupPlaybackEngine() {
+    const canWorklet = window.isSecureContext && audioCtx.audioWorklet;
+    if (canWorklet) {
+      try {
+        const blob = new Blob([WORKLET_CODE], { type: 'application/javascript' });
+        await audioCtx.audioWorklet.addModule(URL.createObjectURL(blob));
+        workletNode = new AudioWorkletNode(audioCtx, 'pcm-player', {
+          numberOfInputs: 0, numberOfOutputs: 1, outputChannelCount: [2],
+          processorOptions: {
+            sampleRate, capacitySamples: audioCtx.sampleRate * 2, prebufferSeconds: 0.15
+          }
+        });
+        workletNode.port.onmessage = e => {
+          if (e.data.type === 'stats') {
+            const ms = (e.data.available / audioCtx.sampleRate * 1000).toFixed(0);
+            statsEl.textContent = `Buffered: ${ms}ms · Underruns: ${e.data.underruns}`;
+          }
+        };
+        workletNode.connect(audioCtx.destination);
+        usingWorklet = true; return;
+      } catch(e) { console.warn('AudioWorklet failed, falling back:', e); }
+    }
+    // ScriptProcessor fallback (stereo ring)
+    ringCapacity = audioCtx.sampleRate * 2;
+    ringBuffers = [new Float32Array(ringCapacity), new Float32Array(ringCapacity)];
+    ringWrite = ringRead = ringAvailable = fallbackUnderruns = 0;
+    const prebuf = Math.floor(audioCtx.sampleRate * 0.15);
+    let started = false;
+    processorNode = audioCtx.createScriptProcessor(2048, 0, 2);
+    processorNode.onaudioprocess = e => {
+      const outL = e.outputBuffer.getChannelData(0);
+      const outR = e.outputBuffer.getChannelData(1);
+      const need = outL.length;
+      if (!started) {
+        if (ringAvailable >= prebuf) started = true;
+        else { outL.fill(0); outR.fill(0); return; }
+      }
+      if (ringAvailable < need) {
+        fallbackUnderruns++; outL.fill(0); outR.fill(0);
+        started = ringAvailable >= prebuf; return;
+      }
+      for (let f = 0; f < need; f++) {
+        outL[f] = ringBuffers[0][ringRead];
+        outR[f] = ringBuffers[1][ringRead];
+        ringRead = (ringRead+1) % ringCapacity; ringAvailable--;
+      }
+      statsEl.textContent = `Buffered: ${(ringAvailable/audioCtx.sampleRate*1000).toFixed(0)}ms · Underruns: ${fallbackUnderruns}`;
+    };
+    processorNode.connect(audioCtx.destination);
+    usingWorklet = false;
+  }
+
+  // ── incoming PCM handler ───────────────────────────────────────────────
+  function handleBinaryChunk(buf) {
+    const raw = new Float32Array(buf);
+    const stereo = downmixToStereo(raw); // always returns stereo interleaved
+    const frames = stereo.length / 2;
+
+    if (usingWorklet && workletNode) {
+      // de-interleave into separate L/R for worklet
+      const l = new Float32Array(frames);
+      const r = new Float32Array(frames);
+      for (let f = 0; f < frames; f++) { l[f] = stereo[f*2]; r[f] = stereo[f*2+1]; }
+      workletNode.port.postMessage({ type: 'data', l, r }, [l.buffer, r.buffer]);
+    } else {
+      for (let f = 0; f < frames; f++) {
+        ringBuffers[0][ringWrite] = stereo[f*2];
+        ringBuffers[1][ringWrite] = stereo[f*2+1];
+        ringWrite = (ringWrite+1) % ringCapacity;
+        if (ringAvailable < ringCapacity) ringAvailable++;
+        else ringRead = (ringRead+1) % ringCapacity;
+      }
+    }
+  }
+
+  function teardown() {
+    if (ws) { ws.onclose = null; ws.close(); ws = null; }
+    if (workletNode) { workletNode.disconnect(); workletNode = null; }
+    if (processorNode) { processorNode.disconnect(); processorNode = null; }
+    usingWorklet = false; setLive(false);
+    statsEl.textContent = '';
+    nowPlaying.style.display = 'none';
+    resumeBtn.classList.remove('show');
+  }
+
+  // ── play ───────────────────────────────────────────────────────────────
+  playBtn.addEventListener('click', () => {
+    if (!selectedNodeId) return;
+    teardown();
+    ensureAudioContext();
+    const wsUrl = `ws://${location.hostname}:${WS_PORT}`;
+    setStatus(`Connecting…`, 'idle');
+    ws = new WebSocket(wsUrl);
+    ws.binaryType = 'arraybuffer';
+
+    ws.onopen = () => {
+      ws.send(JSON.stringify({ type: 'select', nodeId: selectedNodeId }));
+      setStatus('Connected — waiting for audio…', 'idle');
+    };
+
+    ws.onmessage = async event => {
+      try {
+        if (typeof event.data === 'string') {
+          const msg = JSON.parse(event.data);
+          if (msg.type === 'format') {
+            totalChannels = msg.channels;
+            sampleRate    = msg.sampleRate;
+            streamDisplayName = msg.streamName || selectedNodeId;
+            buildChannelGrid(totalChannels);
+            await setupPlaybackEngine();
+            nowPlaying.style.display = 'block';
+            document.getElementById('npName').textContent   = streamDisplayName;
+            document.getElementById('npFormat').textContent = `${totalChannels}ch @ ${sampleRate}Hz`;
+            document.getElementById('npEngine').textContent = usingWorklet ? 'AudioWorklet' : 'Fallback';
+            updateChannelBadge();
+            if (audioCtx.state === 'running') {
+              setStatus(`Playing: ${streamDisplayName}`, 'ok'); setLive(true);
+              resumeBtn.classList.remove('show');
+            } else {
+              setStatus('Audio suspended — click the button below.', 'warn-st');
+              resumeBtn.classList.add('show');
+            }
+          } else if (msg.type === 'error') {
+            setStatus(`Server: ${msg.message}`, 'err');
+          }
+        } else {
+          handleBinaryChunk(event.data);
+        }
+      } catch(e) { setStatus(`Error: ${e.message}`, 'err'); console.error(e); }
+    };
+
+    ws.onerror = () => { setStatus('WebSocket error.', 'err'); setLive(false); };
+    ws.onclose = () => { setStatus('Disconnected.', 'err'); setLive(false); };
+  });
+
+  resumeBtn.addEventListener('click', () => {
+    ensureAudioContext();
+    if (audioCtx.state === 'running') {
+      setStatus(`Playing: ${streamDisplayName}`, 'ok');
+      setLive(true); resumeBtn.classList.remove('show');
+    }
+  });
+
+  refreshBtn.addEventListener('click', fetchStreams);
+  fetchStreams();
+</script>
+</body>
+</html>

@@ -1,4 +1,6 @@
+use crate::ensure_realtime_audio_thread;
 use crate::protocol::parse_packet;
+use crate::JITTER_BUFFER_TARGET_SECS;
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use std::collections::VecDeque;
 use std::net::UdpSocket;
@@ -14,6 +16,7 @@ use std::time::{Duration, Instant};
 /// sample rate match what the sender is transmitting. Resampling for
 /// mismatched devices is a later milestone.
 pub fn receive_and_play(bind_addr: &str, duration_secs: u64) -> Result<(), String> {
+    ensure_realtime_audio_thread();
     let socket = UdpSocket::bind(bind_addr).map_err(|e| format!("failed to bind {bind_addr}: {e}"))?;
     socket
         .set_read_timeout(Some(Duration::from_millis(200)))
@@ -22,8 +25,19 @@ pub fn receive_and_play(bind_addr: &str, duration_secs: u64) -> Result<(), Strin
     println!("Listening on {bind_addr}, waiting for first packet to detect format...");
 
     let buffer: Arc<Mutex<VecDeque<f32>>> = Arc::new(Mutex::new(VecDeque::new()));
-    let mut buf = [0u8; 1500];
-    let mut last_sequence: Option<u32> = None;
+    // Sized for worst case: protocol allows up to 255 channels
+    // (see asio.rs validation) at MAX_FRAMES_PER_PACKET=58 frames,
+    // 4 bytes/sample: 255 * 58 * 4 + headers ≈ 59KB. A 1500-byte
+    // buffer (old MTU-sized default) causes WSAEMSGSIZE the moment
+    // more than ~9 channels are streamed in one packet.
+    let mut buf = [0u8; 65536];
+
+    // No initial value here on purpose -- the loop below always
+    // assigns this (via `Some(...)`) on the only path that exits
+    // it, so the compiler can prove it's initialized before the
+    // first real read, without us writing a throwaway `None` that
+    // gets silently discarded (that's what caused the warning).
+    let mut last_sequence: Option<u32>;
     let mut packets_received = 0u32;
     let mut packets_dropped = 0u32;
 
@@ -76,6 +90,7 @@ pub fn receive_and_play(bind_addr: &str, duration_secs: u64) -> Result<(), Strin
         .build_output_stream(
             &stream_config,
             move |data: &mut [f32], _| {
+                ensure_realtime_audio_thread();
                 let mut buf = buffer_for_callback.lock().unwrap();
                 for sample in data.iter_mut() {
                     *sample = buf.pop_front().unwrap_or(0.0); // underrun -> silence
@@ -89,7 +104,8 @@ pub fn receive_and_play(bind_addr: &str, duration_secs: u64) -> Result<(), Strin
     // Prime the jitter buffer toward the spec's 6ms default target
     // before starting playback, so the callback isn't starved
     // immediately (protocol spec section 6.1).
-    let target_samples = ((sample_rate as f64 * 0.006) as usize) * channel_count as usize;
+    let target_samples =
+        ((sample_rate as f64 * JITTER_BUFFER_TARGET_SECS) as usize) * channel_count as usize;
     let prime_deadline = Instant::now() + Duration::from_millis(500);
     while buffer.lock().unwrap().len() < target_samples && Instant::now() < prime_deadline {
         if let Ok((len, _src)) = socket.recv_from(&mut buf) {
@@ -119,11 +135,12 @@ pub fn receive_and_play(bind_addr: &str, duration_secs: u64) -> Result<(), Strin
 
     let start = Instant::now();
     while start.elapsed().as_secs() < duration_secs {
-       let (len, _src) = match socket.recv_from(&mut buf) {
-    Ok(r) => r,
-    Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => continue,
-    Err(e) => return Err(format!("recv error: {e}")),
-};
+        let (len, _src) = match socket.recv_from(&mut buf) {
+            Ok(r) => r,
+            Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => continue,
+            Err(ref e) if e.kind() == std::io::ErrorKind::TimedOut => continue,
+            Err(e) => return Err(format!("recv error: {e}")),
+        };
 
         let Some(parsed) = parse_packet(&buf[..len]) else {
             continue;

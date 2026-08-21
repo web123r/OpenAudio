@@ -1,3 +1,5 @@
+// At the top of combine.rs, transmit.rs, receive.rs, split.rs, web.rs, etc.
+use crate::ensure_realtime_audio_thread;
 use crate::protocol::parse_packet;
 use std::net::UdpSocket;
 use std::time::{Duration, Instant};
@@ -26,6 +28,7 @@ pub fn receive_to_wav(duration_secs: u64, bind_addr: &str, output_path: &str) ->
         let (len, _src) = match socket.recv_from(&mut buf) {
             Ok(r) => r,
             Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => continue,
+            Err(ref e) if e.kind() == std::io::ErrorKind::TimedOut => continue,
             Err(e) => return Err(format!("recv error: {e}")),
         };
 
