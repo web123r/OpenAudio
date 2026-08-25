@@ -31,7 +31,9 @@ fn main() {
     }
 
     println!("\nNow open default.json yourself and confirm:");
-    println!("  1. Your existing manual endpoints (Test1, Output1, etc.) are still there, unchanged.");
+    println!(
+        "  1. Your existing manual endpoints (Test1, Output1, etc.) are still there, unchanged."
+    );
     println!("  2. Three new entries exist: OpenAudio-test1-Ch0, OpenAudio-test1-Ch1, OpenAudio-test1-Ch2.");
     println!("  3. A default.json.bak file exists in the same folder (the pre-change backup).");
 }

@@ -80,8 +80,8 @@ pub fn start_advertising(
         control_port: CONTROL_PORT,
         channel_count,
     };
-    let payload = serde_json::to_vec(&advert)
-        .map_err(|e| format!("failed to encode advertisement: {e}"))?;
+    let payload =
+        serde_json::to_vec(&advert).map_err(|e| format!("failed to encode advertisement: {e}"))?;
 
     while keep_running.load(Ordering::Relaxed) {
         let interfaces = get_local_ipv4_addrs();
@@ -217,8 +217,8 @@ pub fn send_subscribe_request(
         stream_id,
         receiver_port: my_receive_port,
     };
-    let payload = serde_json::to_vec(&req)
-        .map_err(|e| format!("failed to encode subscribe request: {e}"))?;
+    let payload =
+        serde_json::to_vec(&req).map_err(|e| format!("failed to encode subscribe request: {e}"))?;
     socket
         .send_to(&payload, &dest)
         .map_err(|e| format!("failed to send subscribe request to {dest}: {e}"))?;

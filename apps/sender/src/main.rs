@@ -1,3 +1,12 @@
+mod asio_subscribe_ui;
+mod diagnostic_panel;
+mod signal_monitor;
+
+use signal_monitor::SignalMonitor;
+
+use diagnostic_panel::DiagnosticPanel;
+
+use asio_subscribe_ui::AsioSubscribePanel;
 use eframe::egui;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -75,11 +84,29 @@ struct SplitSubscribeSession {
 // /api/streams, so there's nothing left for the desktop UI to manage
 // per-session here.
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum BrowserAccessMode {
+    PasswordProtected,
+    OpenLan,
+}
+
 struct OpenAudioApp {
     next_id: u64,
     publish_sessions: Vec<PublishSession>,
     combine_publish_sessions: Vec<CombinePublishSession>,
     asio_publish_sessions: Vec<AsioPublishSession>,
+    asio_subscribe_panel: AsioSubscribePanel,
+    diagnostic_panel: DiagnosticPanel,
+    signal_monitor: SignalMonitor,
+    browser_access_mode: BrowserAccessMode,
+    browser_password: String,
+    browser_password_confirmation: String,
+    browser_show_password: bool,
+    browser_gateway_running: Arc<AtomicBool>,
+    browser_gateway_thread_active: Arc<AtomicBool>,
+    browser_gateway_status: Arc<Mutex<String>>,
+    browser_gateway_last_toggle: std::time::Instant,
+
     subscribe_sessions: Vec<SubscribeSession>,
     split_subscribe_sessions: Vec<SplitSubscribeSession>,
     input_devices: Vec<audio_core::DeviceInfo>,
@@ -91,7 +118,8 @@ struct OpenAudioApp {
     error_banner: Arc<Mutex<Option<String>>>,
     info_banner: Arc<Mutex<Option<String>>>,
     refreshing_devices: Arc<AtomicBool>,
-    pending_device_refresh: Arc<Mutex<Option<(Vec<audio_core::DeviceInfo>, Vec<audio_core::DeviceInfo>)>>>,
+    pending_device_refresh:
+        Arc<Mutex<Option<(Vec<audio_core::DeviceInfo>, Vec<audio_core::DeviceInfo>)>>>,
 }
 
 impl Default for OpenAudioApp {
@@ -124,14 +152,6 @@ impl Default for OpenAudioApp {
         // HTTP on :7100 serves the player page + /api/streams (live
         // list from `discovery_directory`); WebSocket on :7101 handles
         // per-client stream selection and relay.
-        let web_gateway_dir = discovery_directory.clone();
-        let web_gateway_flag = always_on.clone();
-        thread::spawn(move || {
-            audio_core::ensure_realtime_audio_thread();
-            if let Err(e) = audio_core::run_web_gateway(7100, web_gateway_dir, web_gateway_flag) {
-                eprintln!("web gateway error: {e}");
-            }
-        });
 
         let (asio_drivers, asio_drivers_error) = match audio_core::list_asio_drivers() {
             Ok(drivers) => (drivers, None),
@@ -143,7 +163,21 @@ impl Default for OpenAudioApp {
             publish_sessions: Vec::new(),
             combine_publish_sessions: Vec::new(),
             asio_publish_sessions: Vec::new(),
+            signal_monitor: SignalMonitor::default(),
+            browser_access_mode: BrowserAccessMode::PasswordProtected,
+            browser_password: String::new(),
+            browser_password_confirmation: String::new(),
+            browser_show_password: false,
+            browser_gateway_running: Arc::new(AtomicBool::new(false)),
+            browser_gateway_thread_active: Arc::new(AtomicBool::new(false)),
+            browser_gateway_status: Arc::new(Mutex::new(
+                "Gateway stopped. Browser playback is not exposed.".to_string(),
+            )),
+            browser_gateway_last_toggle: std::time::Instant::now() - Duration::from_secs(1),
+            asio_subscribe_panel: AsioSubscribePanel::default(),
+            diagnostic_panel: DiagnosticPanel::default(),
             subscribe_sessions: Vec::new(),
+
             split_subscribe_sessions: Vec::new(),
             input_devices: audio_core::list_input_devices(),
             output_devices: audio_core::list_output_devices(),
@@ -161,20 +195,21 @@ impl Default for OpenAudioApp {
 
 struct Theme;
 impl Theme {
-    const BG_PRIMARY:    egui::Color32 = egui::Color32::from_rgb(18, 18, 20);
-    const BG_SECONDARY:  egui::Color32 = egui::Color32::from_rgb(28, 28, 32);
-    const BG_CARD:       egui::Color32 = egui::Color32::from_rgb(38, 38, 42);
-    const ACCENT_BLUE:   egui::Color32 = egui::Color32::from_rgb(0, 122, 255);
-    const ACCENT_GREEN:  egui::Color32 = egui::Color32::from_rgb(52, 199, 89);
-    const ACCENT_RED:    egui::Color32 = egui::Color32::from_rgb(255, 69, 58);
+    const BG_PRIMARY: egui::Color32 = egui::Color32::from_rgb(18, 18, 20);
+    const BG_SECONDARY: egui::Color32 = egui::Color32::from_rgb(28, 28, 32);
+    const BG_CARD: egui::Color32 = egui::Color32::from_rgb(38, 38, 42);
+    const ACCENT_BLUE: egui::Color32 = egui::Color32::from_rgb(0, 122, 255);
+    const ACCENT_GREEN: egui::Color32 = egui::Color32::from_rgb(52, 199, 89);
+    const ACCENT_RED: egui::Color32 = egui::Color32::from_rgb(255, 69, 58);
     const ACCENT_PURPLE: egui::Color32 = egui::Color32::from_rgb(175, 82, 222);
-    const TEXT_PRIMARY:  egui::Color32 = egui::Color32::from_rgb(255, 255, 255);
-    const TEXT_SECONDARY:egui::Color32 = egui::Color32::from_rgb(152, 152, 157);
+    const TEXT_PRIMARY: egui::Color32 = egui::Color32::from_rgb(255, 255, 255);
+    const TEXT_SECONDARY: egui::Color32 = egui::Color32::from_rgb(152, 152, 157);
 }
 
 fn friendly_error(raw: &str) -> String {
     if raw.contains("0x8889000A") {
-        "That device is already in use by another app. Close other audio apps and try again.".to_string()
+        "That device is already in use by another app. Close other audio apps and try again."
+            .to_string()
     } else if raw.contains("no default input device") {
         "No microphone/input device found. Check it's plugged in and enabled in Windows Sound settings.".to_string()
     } else if raw.contains("no default output device") {
@@ -280,6 +315,10 @@ impl eframe::App for OpenAudioApp {
                             });
                             ui.add_space(10.0);
                         }
+                        // ── GLOBAL SIGNAL MONITOR ─────────────────────────
+self.signal_monitor.ui(ui);
+ui.add_space(12.0);
+
 
                         // ── ASIO PUBLISH ───────────────────────────────────
                         egui::Frame::none().fill(Theme::BG_SECONDARY).rounding(12.0).inner_margin(16.0).show(ui, |ui| {
@@ -435,7 +474,34 @@ impl eframe::App for OpenAudioApp {
                                 });
                             }
                         });
-                        ui.add_space(12.0);
+ui.add_space(12.0);
+
+// ── ASIO SUBSCRIBE ─────────────────────────────────
+self.asio_subscribe_panel.ui(
+    ui,
+    &self.asio_drivers,
+    &self.discovery_directory,
+    &self.error_banner,
+);
+ui.add_space(12.0);
+
+// ── NETWORK STRESS TEST ────────────────────────────
+egui::Frame::none()
+    .fill(Theme::BG_SECONDARY)
+    .rounding(12.0)
+    .inner_margin(16.0)
+    .show(ui, |ui| {
+        self.diagnostic_panel.show(
+            ui,
+            &self.subscribers_by_stream,
+        );
+    });
+
+ui.add_space(12.0);
+
+// ── WASAPI SINGLE PUBLISH ──────────────────────────
+
+
 
                         // ── WASAPI SINGLE PUBLISH ──────────────────────────
                         egui::Frame::none().fill(Theme::BG_SECONDARY).rounding(12.0).inner_margin(16.0).show(ui, |ui| {
@@ -947,22 +1013,434 @@ impl eframe::App for OpenAudioApp {
                         ui.add_space(12.0);
 
                                                 // ── WEB PLAYBACK (BROWSER) ──────────────────────────
-                        egui::Frame::none().fill(Theme::BG_SECONDARY).rounding(12.0).inner_margin(16.0).show(ui, |ui| {
-                            ui.label(egui::RichText::new("🌐 Browser Playback").size(18.0).strong().color(Theme::TEXT_PRIMARY));
-                            ui.add_space(8.0);
+                        // ── WEB PLAYBACK (BROWSER) ──────────────────────────
+egui::Frame::none()
+    .fill(Theme::BG_SECONDARY)
+    .rounding(12.0)
+    .inner_margin(16.0)
+    .show(ui, |ui| {
+        let gateway_running = self
+            .browser_gateway_running
+            .load(Ordering::Acquire);
+
+        let gateway_thread_active = self
+            .browser_gateway_thread_active
+            .load(Ordering::Acquire);
+
+        let debounce_ok = self.browser_gateway_last_toggle.elapsed()
+            > Duration::from_millis(500);
+
+        ui.horizontal(|ui| {
+            ui.label(
+                egui::RichText::new("🌐 Browser Playback")
+                    .size(18.0)
+                    .strong()
+                    .color(Theme::TEXT_PRIMARY),
+            );
+
+            let (label, color) = if gateway_running {
+                ("● RUNNING", Theme::ACCENT_GREEN)
+            } else if gateway_thread_active {
+                ("● STOPPING", egui::Color32::YELLOW)
+            } else {
+                ("○ STOPPED", Theme::TEXT_SECONDARY)
+            };
+
+            ui.label(
+                egui::RichText::new(label)
+                    .size(11.0)
+                    .strong()
+                    .color(color),
+            );
+        });
+
+        ui.add_space(6.0);
+
+        ui.label(
+            egui::RichText::new(
+                "Serve discovered OpenAudio streams to browsers on this network.",
+            )
+            .size(12.0)
+            .color(Theme::TEXT_SECONDARY),
+        );
+
+        ui.add_space(12.0);
+
+        ui.add_enabled_ui(!gateway_thread_active, |ui| {
+            ui.label(
+                egui::RichText::new("Access Mode")
+                    .size(12.0)
+                    .strong()
+                    .color(Theme::TEXT_PRIMARY),
+            );
+
+            ui.add_space(4.0);
+
+            ui.radio_value(
+                &mut self.browser_access_mode,
+                BrowserAccessMode::PasswordProtected,
+                "🔒 Password Protected — recommended",
+            );
+
+            ui.radio_value(
+                &mut self.browser_access_mode,
+                BrowserAccessMode::OpenLan,
+                "🔓 Open LAN — no password required",
+            );
+
+            ui.add_space(8.0);
+
+            match self.browser_access_mode {
+                BrowserAccessMode::PasswordProtected => {
+                    egui::Frame::none()
+                        .fill(Theme::BG_CARD)
+                        .rounding(8.0)
+                        .inner_margin(12.0)
+                        .show(ui, |ui| {
                             ui.label(
-                                egui::RichText::new("Always running. Open this on any device on your LAN — it lists every discovered stream and lets you pick one.")
-                                    .size(12.0).color(Theme::TEXT_SECONDARY)
+                                egui::RichText::new(
+                                    "Visitors must enter this password before they can see or play streams.",
+                                )
+                                .size(11.0)
+                                .color(Theme::TEXT_SECONDARY),
                             );
+
                             ui.add_space(8.0);
-                            egui::Frame::none().fill(Theme::BG_CARD).rounding(8.0).inner_margin(10.0).show(ui, |ui| {
-                                ui.horizontal(|ui| {
-                                    ui.label(egui::RichText::new("●").color(Theme::ACCENT_GREEN));
-                                    ui.monospace(egui::RichText::new("http://<this-machine-IP>:7100/").color(Theme::TEXT_PRIMARY));
-                                });
+
+                            ui.horizontal(|ui| {
+                                ui.label(
+                                    egui::RichText::new("Password:")
+                                        .color(Theme::TEXT_SECONDARY),
+                                );
+
+                                let password_edit = egui::TextEdit::singleline(
+                                    &mut self.browser_password,
+                                )
+                                .password(!self.browser_show_password)
+                                .desired_width(240.0)
+                                .hint_text("At least 8 characters");
+
+                                ui.add(password_edit);
                             });
+
+                            ui.horizontal(|ui| {
+                                ui.label(
+                                    egui::RichText::new("Confirm:")
+                                        .color(Theme::TEXT_SECONDARY),
+                                );
+
+                                let confirmation_edit = egui::TextEdit::singleline(
+                                    &mut self.browser_password_confirmation,
+                                )
+                                .password(!self.browser_show_password)
+                                .desired_width(240.0)
+                                .hint_text("Enter the password again");
+
+                                ui.add(confirmation_edit);
+                            });
+
+                            ui.checkbox(
+                                &mut self.browser_show_password,
+                                "Show password",
+                            );
+
+                            if !self.browser_password.is_empty()
+                                && self.browser_password.chars().count() < 8
+                            {
+                                ui.label(
+                                    egui::RichText::new(
+                                        "Password must contain at least 8 characters.",
+                                    )
+                                    .size(11.0)
+                                    .color(Theme::ACCENT_RED),
+                                );
+                            } else if !self.browser_password_confirmation.is_empty()
+                                && self.browser_password
+                                    != self.browser_password_confirmation
+                            {
+                                ui.label(
+                                    egui::RichText::new(
+                                        "The passwords do not match.",
+                                    )
+                                    .size(11.0)
+                                    .color(Theme::ACCENT_RED),
+                                );
+                            }
                         });
-                        ui.add_space(12.0);
+                }
+
+                BrowserAccessMode::OpenLan => {
+                    egui::Frame::none()
+                        .fill(egui::Color32::from_rgb(70, 48, 12))
+                        .rounding(8.0)
+                        .inner_margin(12.0)
+                        .show(ui, |ui| {
+                            ui.label(
+                                egui::RichText::new(
+                                    "⚠ Open access: anyone who can reach this computer \
+                                     on the network can view and play discovered streams.",
+                                )
+                                .size(11.0)
+                                .color(egui::Color32::YELLOW),
+                            );
+                        });
+                }
+            }
+        });
+
+        ui.add_space(12.0);
+
+        if gateway_thread_active {
+            egui::Frame::none()
+                .fill(Theme::BG_CARD)
+                .rounding(8.0)
+                .inner_margin(10.0)
+                .show(ui, |ui| {
+                    ui.horizontal(|ui| {
+                        let indicator_color = if gateway_running {
+                            Theme::ACCENT_GREEN
+                        } else {
+                            egui::Color32::YELLOW
+                        };
+
+                        ui.label(
+                            egui::RichText::new("●")
+                                .color(indicator_color),
+                        );
+
+                        ui.monospace(
+                            egui::RichText::new(
+                                "http://<this-machine-IP>:7100/",
+                            )
+                            .color(Theme::TEXT_PRIMARY),
+                        );
+                    });
+
+                    ui.label(
+                        egui::RichText::new(
+                            "HTTP: 7100  •  WebSocket: 7101",
+                        )
+                        .size(11.0)
+                        .color(Theme::TEXT_SECONDARY),
+                    );
+
+                    if self.browser_access_mode
+                        == BrowserAccessMode::PasswordProtected
+                    {
+                        ui.label(
+                            egui::RichText::new(
+                                "Access: Password Protected",
+                            )
+                            .size(11.0)
+                            .color(Theme::ACCENT_GREEN),
+                        );
+                    } else {
+                        ui.label(
+                            egui::RichText::new(
+                                "Access: OPEN LAN — authentication disabled",
+                            )
+                            .size(11.0)
+                            .strong()
+                            .color(egui::Color32::YELLOW),
+                        );
+                    }
+                });
+
+            ui.add_space(10.0);
+
+            if gateway_running {
+                if ui
+                    .add_enabled(
+                        debounce_ok,
+                        egui::Button::new(
+                            egui::RichText::new("⏹ Stop Browser Gateway")
+                                .color(egui::Color32::WHITE),
+                        )
+                        .fill(Theme::ACCENT_RED)
+                        .rounding(8.0)
+                        .min_size(egui::vec2(170.0, 30.0)),
+                    )
+                    .clicked()
+                {
+                    self.browser_gateway_last_toggle =
+                        std::time::Instant::now();
+
+                    self.browser_gateway_running
+                        .store(false, Ordering::Release);
+
+                    if let Ok(mut status) =
+                        self.browser_gateway_status.lock()
+                    {
+                        *status =
+                            "Stopping browser gateway...".to_string();
+                    }
+                }
+            } else {
+                ui.add_enabled(
+                    false,
+                    egui::Button::new("Stopping browser gateway..."),
+                );
+            }
+        } else {
+            let password_valid = match self.browser_access_mode {
+                BrowserAccessMode::OpenLan => true,
+                BrowserAccessMode::PasswordProtected => {
+                    self.browser_password.chars().count() >= 8
+                        && self.browser_password
+                            == self.browser_password_confirmation
+                }
+            };
+
+            let can_start = debounce_ok && password_valid;
+
+            if ui
+                .add_enabled(
+                    can_start,
+                    egui::Button::new(
+                        egui::RichText::new("▶ Start Browser Gateway")
+                            .color(egui::Color32::WHITE),
+                    )
+                    .fill(Theme::ACCENT_GREEN)
+                    .rounding(8.0)
+                    .min_size(egui::vec2(180.0, 30.0)),
+                )
+                .clicked()
+            {
+                self.browser_gateway_last_toggle =
+                    std::time::Instant::now();
+
+                *self.error_banner.lock().unwrap() = None;
+
+                let access = match self.browser_access_mode {
+                    BrowserAccessMode::OpenLan => {
+                        audio_core::GatewayAccess::Open
+                    }
+                    BrowserAccessMode::PasswordProtected => {
+                        audio_core::GatewayAccess::PasswordProtected {
+                            password: self.browser_password.clone(),
+                        }
+                    }
+                };
+
+                let config = audio_core::WebGatewayConfig {
+                    http_port: 7100,
+                    access,
+                    max_clients: 8,
+                    session_duration: Duration::from_secs(
+                        8 * 60 * 60,
+                    ),
+                };
+
+                let directory = self.discovery_directory.clone();
+                let running = self.browser_gateway_running.clone();
+                let thread_active =
+                    self.browser_gateway_thread_active.clone();
+                let status = self.browser_gateway_status.clone();
+                let error_banner = self.error_banner.clone();
+
+                running.store(true, Ordering::Release);
+                thread_active.store(true, Ordering::Release);
+
+                if let Ok(mut gateway_status) = status.lock() {
+                    *gateway_status =
+                        "Starting browser gateway...".to_string();
+                }
+
+                // The gateway receives its own password copy. Clear the
+                // visible desktop fields immediately after starting.
+                self.browser_password.clear();
+                self.browser_password_confirmation.clear();
+                self.browser_show_password = false;
+
+                thread::spawn(move || {
+                    audio_core::ensure_realtime_audio_thread();
+
+                    if let Ok(mut gateway_status) = status.lock() {
+                        *gateway_status =
+                            "Browser gateway running.".to_string();
+                    }
+
+                    let result = audio_core::run_web_gateway(
+                        config,
+                        directory,
+                        running.clone(),
+                    );
+
+                    running.store(false, Ordering::Release);
+
+                    match result {
+                        Ok(()) => {
+                            if let Ok(mut gateway_status) = status.lock() {
+                                *gateway_status =
+                                    "Gateway stopped. Browser playback \
+                                     is not exposed."
+                                        .to_string();
+                            }
+                        }
+                        Err(error) => {
+                            let friendly = friendly_error(&error);
+
+                            if let Ok(mut gateway_status) = status.lock() {
+                                *gateway_status =
+                                    format!("Gateway error: {friendly}");
+                            }
+
+                            if let Ok(mut banner) = error_banner.lock() {
+                                *banner = Some(format!(
+                                    "Browser gateway failed: {friendly}"
+                                ));
+                            }
+                        }
+                    }
+
+                    thread_active.store(false, Ordering::Release);
+                });
+            }
+
+            if !password_valid
+                && self.browser_access_mode
+                    == BrowserAccessMode::PasswordProtected
+            {
+                ui.label(
+                    egui::RichText::new(
+                        "Enter matching passwords of at least 8 characters \
+                         to start.",
+                    )
+                    .size(11.0)
+                    .color(Theme::TEXT_SECONDARY),
+                );
+            }
+        }
+
+        ui.add_space(8.0);
+
+        let status_text = self
+            .browser_gateway_status
+            .lock()
+            .map(|status| status.clone())
+            .unwrap_or_else(|_| "Gateway status unavailable.".to_string());
+
+        ui.label(
+            egui::RichText::new(status_text)
+                .size(11.0)
+                .color(Theme::TEXT_SECONDARY),
+        );
+
+        ui.add_space(4.0);
+
+        ui.label(
+            egui::RichText::new(
+                "Trusted-LAN beta: password access controls entry, but HTTP \
+                 does not encrypt traffic in transit.",
+            )
+            .size(10.0)
+            .italics()
+            .color(Theme::TEXT_SECONDARY),
+        );
+    });
+
+ui.add_space(12.0);
+
 
 
 // ══════════════════════════════════════════════════════════════════
@@ -1006,11 +1484,18 @@ fn load_icon() -> egui::IconData {
                 rgba.push((pulse * 220.0) as u8);
                 rgba.push(200u8);
             } else {
-                rgba.push(0); rgba.push(0); rgba.push(0); rgba.push(0);
+                rgba.push(0);
+                rgba.push(0);
+                rgba.push(0);
+                rgba.push(0);
             }
         }
     }
-    egui::IconData { rgba, width: size, height: size }
+    egui::IconData {
+        rgba,
+        width: size,
+        height: size,
+    }
 }
 
 // ═══════════════════════════════════════════════════════════════════════════

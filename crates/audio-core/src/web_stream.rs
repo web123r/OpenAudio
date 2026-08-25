@@ -30,7 +30,8 @@ pub fn receive_and_serve_web(
 
     let ws_port = http_port + 1;
 
-    let socket = UdpSocket::bind(bind_addr).map_err(|e| format!("failed to bind {bind_addr}: {e}"))?;
+    let socket =
+        UdpSocket::bind(bind_addr).map_err(|e| format!("failed to bind {bind_addr}: {e}"))?;
     socket
         .set_read_timeout(Some(Duration::from_millis(200)))
         .map_err(|e| format!("failed to set read timeout: {e}"))?;
@@ -92,7 +93,8 @@ pub fn receive_and_serve_web(
     });
 
     // WebSocket server: streams the actual audio + format/name info.
-    let clients: Arc<Mutex<Vec<std::sync::mpsc::Sender<Vec<u8>>>>> = Arc::new(Mutex::new(Vec::new()));
+    let clients: Arc<Mutex<Vec<std::sync::mpsc::Sender<Vec<u8>>>>> =
+        Arc::new(Mutex::new(Vec::new()));
 
     let ws_listener = TcpListener::bind(("0.0.0.0", ws_port))
         .map_err(|e| format!("failed to bind websocket port {ws_port}: {e}"))?;
@@ -150,7 +152,9 @@ pub fn receive_and_serve_web(
             Err(e) => return Err(format!("recv error: {e}")),
         };
 
-        let Some(parsed) = parse_packet(&buf[..len]) else { continue };
+        let Some(parsed) = parse_packet(&buf[..len]) else {
+            continue;
+        };
         if parsed.channel_count as u16 != channel_count || parsed.sample_rate != sample_rate {
             continue;
         }

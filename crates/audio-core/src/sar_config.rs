@@ -76,8 +76,7 @@ pub fn find_sar_config_path() -> Option<PathBuf> {
 fn load_config(path: &Path) -> Result<SarConfig, String> {
     let content = fs::read_to_string(path)
         .map_err(|e| format!("failed to read SAR config at {}: {e}", path.display()))?;
-    serde_json::from_str(&content)
-        .map_err(|e| format!("failed to parse SAR config JSON: {e}"))
+    serde_json::from_str(&content).map_err(|e| format!("failed to parse SAR config JSON: {e}"))
 }
 
 fn save_config(path: &Path, config: &SarConfig) -> Result<(), String> {
@@ -86,8 +85,12 @@ fn save_config(path: &Path, config: &SarConfig) -> Result<(), String> {
     // without a way back.
     let backup_path = path.with_extension("json.bak");
     if path.exists() {
-        fs::copy(path, &backup_path)
-            .map_err(|e| format!("failed to back up SAR config to {}: {e}", backup_path.display()))?;
+        fs::copy(path, &backup_path).map_err(|e| {
+            format!(
+                "failed to back up SAR config to {}: {e}",
+                backup_path.display()
+            )
+        })?;
     }
 
     let json = serde_json::to_string_pretty(config)
@@ -151,9 +154,8 @@ pub fn ensure_openaudio_endpoints(
 /// Removes all OpenAudio-created endpoints for a session tag, without
 /// adding any replacements. Use when a session is removed entirely.
 pub fn remove_openaudio_endpoints(session_tag: &str) -> Result<(), String> {
-    let path = find_sar_config_path().ok_or_else(|| {
-        "couldn't find SAR's default.json".to_string()
-    })?;
+    let path =
+        find_sar_config_path().ok_or_else(|| "couldn't find SAR's default.json".to_string())?;
 
     let mut config = load_config(&path)?;
     let id_prefix = format!("openaudio_{session_tag}_");

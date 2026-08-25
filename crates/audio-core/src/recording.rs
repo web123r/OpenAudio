@@ -9,7 +9,11 @@ pub type SharedWavWriter = Arc<Mutex<Option<WavWriter<BufWriter<File>>>>>;
 /// directories if needed (e.g. "recordings/"). Best-effort: recording
 /// failures never crash the actual audio pipeline, they just get
 /// logged and recording silently stops for that stream.
-pub fn create_wav_writer(path: &str, channels: u16, sample_rate: u32) -> Result<SharedWavWriter, String> {
+pub fn create_wav_writer(
+    path: &str,
+    channels: u16,
+    sample_rate: u32,
+) -> Result<SharedWavWriter, String> {
     if let Some(parent) = std::path::Path::new(path).parent() {
         if !parent.as_os_str().is_empty() {
             std::fs::create_dir_all(parent)
@@ -52,7 +56,13 @@ pub fn finalize(writer: &SharedWavWriter) {
 pub fn generate_record_path(label: &str) -> String {
     let safe: String = label
         .chars()
-        .map(|c| if c.is_alphanumeric() || c == '-' || c == '_' { c } else { '_' })
+        .map(|c| {
+            if c.is_alphanumeric() || c == '-' || c == '_' {
+                c
+            } else {
+                '_'
+            }
+        })
         .collect();
     let ts = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)

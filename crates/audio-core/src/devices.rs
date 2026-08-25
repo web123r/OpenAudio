@@ -71,8 +71,14 @@ fn list_devices_for_host(host: cpal::Host, direction: Direction) -> Vec<DeviceIn
         }
 
         let default_sample_rate = match direction {
-            Direction::Input => device.default_input_config().ok().map(|c| c.sample_rate().0),
-            Direction::Output => device.default_output_config().ok().map(|c| c.sample_rate().0),
+            Direction::Input => device
+                .default_input_config()
+                .ok()
+                .map(|c| c.sample_rate().0),
+            Direction::Output => device
+                .default_output_config()
+                .ok()
+                .map(|c| c.sample_rate().0),
         };
 
         let is_default = default_name.as_deref() == Some(raw_name.as_str());
@@ -108,13 +114,16 @@ pub fn get_output_device(name: Option<&str>) -> Result<cpal::Device, String> {
 }
 
 fn find_device_in_host(host: cpal::Host, name: &str) -> Result<cpal::Device, String> {
-    let all_names: Vec<String> = host.devices()
+    let all_names: Vec<String> = host
+        .devices()
         .map_err(|e| format!("failed to enumerate devices: {e}"))?
         .filter_map(|d| d.name().ok())
         .collect();
 
     if !all_names.iter().any(|dn| dn == name) {
-        return Err(format!("device not found: '{name}'. Devices seen: {all_names:?}"));
+        return Err(format!(
+            "device not found: '{name}'. Devices seen: {all_names:?}"
+        ));
     }
 
     host.devices()
@@ -167,5 +176,8 @@ pub fn resolve_input_device(selection: DeviceSelection) -> Result<Option<cpal::D
 /// combine.rs, split.rs) use this instead of matching on
 /// `DeviceSelection` directly.
 pub fn is_skip(value: &Option<String>) -> bool {
-    matches!(DeviceSelection::parse(value.as_deref()), DeviceSelection::NoDevice)
+    matches!(
+        DeviceSelection::parse(value.as_deref()),
+        DeviceSelection::NoDevice
+    )
 }

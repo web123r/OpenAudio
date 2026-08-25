@@ -12,10 +12,7 @@
 //! EDIT the constants below to match your GUI's Publish session, then:
 //! cargo run --example discovery_subscribe_split -p audio-core
 
-
-
 fn main() {
-
     println!("=== Output devices cpal actually sees ===");
     for d in audio_core::list_output_devices() {
         println!("{:?}", d.name);
@@ -29,9 +26,9 @@ fn main() {
     // EDIT THIS: exact Windows device names for your SAR endpoints, in
     // the order you want network channels routed to them.
     let device_names: Vec<String> = vec![
-    "Ferronme 1 (Synchronous Audio Router)".to_string(),
-    "Ferronme 1 (Synchronous Audio Router)".to_string(),
-];
+        "Ferronme 1 (Synchronous Audio Router)".to_string(),
+        "Ferronme 1 (Synchronous Audio Router)".to_string(),
+    ];
     let play_duration_secs = 60;
     let my_receive_port: u16 = 6981;
     let my_bind_addr = format!("0.0.0.0:{my_receive_port}");
@@ -49,7 +46,10 @@ fn main() {
         return;
     }
 
-    println!("Subscribe request sent. Splitting to {} device(s) for {play_duration_secs}s...", device_names.len());
+    println!(
+        "Subscribe request sent. Splitting to {} device(s) for {play_duration_secs}s...",
+        device_names.len()
+    );
 
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::Arc;
@@ -61,7 +61,9 @@ fn main() {
         timer_flag.store(false, Ordering::Relaxed);
     });
 
-    if let Err(e) = audio_core::receive_and_split_to_devices(&my_bind_addr, device_names, keep_running) {
+    if let Err(e) =
+        audio_core::receive_and_split_to_devices(&my_bind_addr, device_names, keep_running)
+    {
         eprintln!("Error: {e}");
     }
 

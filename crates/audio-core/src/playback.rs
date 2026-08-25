@@ -17,7 +17,8 @@ use std::time::{Duration, Instant};
 /// mismatched devices is a later milestone.
 pub fn receive_and_play(bind_addr: &str, duration_secs: u64) -> Result<(), String> {
     ensure_realtime_audio_thread();
-    let socket = UdpSocket::bind(bind_addr).map_err(|e| format!("failed to bind {bind_addr}: {e}"))?;
+    let socket =
+        UdpSocket::bind(bind_addr).map_err(|e| format!("failed to bind {bind_addr}: {e}"))?;
     socket
         .set_read_timeout(Some(Duration::from_millis(200)))
         .map_err(|e| format!("failed to set read timeout: {e}"))?;
@@ -118,7 +119,8 @@ pub fn receive_and_play(bind_addr: &str, duration_secs: u64) -> Result<(), Strin
                 }
                 last_sequence = Some(parsed.sequence_number);
                 packets_received += 1;
-                let sample_count = parsed.samples_per_channel as usize * parsed.channel_count as usize;
+                let sample_count =
+                    parsed.samples_per_channel as usize * parsed.channel_count as usize;
                 let payload = &buf[parsed.payload_offset..parsed.payload_offset + sample_count * 4];
                 let mut jitter_buf = buffer.lock().unwrap();
                 for chunk in payload.chunks_exact(4) {

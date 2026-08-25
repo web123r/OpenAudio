@@ -45,8 +45,8 @@ pub fn boost_audio_thread_priority() {
 fn prepare_realtime_audio_thread_windows() {
     use windows::core::PCWSTR;
     use windows::Win32::System::Threading::{
-        AvSetMmThreadCharacteristicsW, AvSetMmThreadPriority, GetCurrentThread,
-        SetThreadPriority, AVRT_PRIORITY_CRITICAL, THREAD_PRIORITY_TIME_CRITICAL,
+        AvSetMmThreadCharacteristicsW, AvSetMmThreadPriority, GetCurrentThread, SetThreadPriority,
+        AVRT_PRIORITY_CRITICAL, THREAD_PRIORITY_TIME_CRITICAL,
     };
 
     unsafe {
@@ -54,7 +54,9 @@ fn prepare_realtime_audio_thread_windows() {
 
         let task_name: Vec<u16> = "Pro Audio\0".encode_utf16().collect();
         let mut task_index = 0u32;
-        if let Ok(handle) = AvSetMmThreadCharacteristicsW(PCWSTR(task_name.as_ptr()), &mut task_index) {
+        if let Ok(handle) =
+            AvSetMmThreadCharacteristicsW(PCWSTR(task_name.as_ptr()), &mut task_index)
+        {
             let _ = AvSetMmThreadPriority(handle, AVRT_PRIORITY_CRITICAL);
         }
     }
@@ -63,9 +65,9 @@ fn prepare_realtime_audio_thread_windows() {
 #[cfg(windows)]
 fn disable_process_power_throttling_windows() {
     use windows::Win32::System::Threading::{
-        GetCurrentProcess, SetProcessInformation, ProcessPowerThrottling, SetPriorityClass, HIGH_PRIORITY_CLASS,
-        PROCESS_POWER_THROTTLING_EXECUTION_SPEED, PROCESS_POWER_THROTTLING_IGNORE_TIMER_RESOLUTION,
-        PROCESS_POWER_THROTTLING_STATE,
+        GetCurrentProcess, ProcessPowerThrottling, SetPriorityClass, SetProcessInformation,
+        HIGH_PRIORITY_CLASS, PROCESS_POWER_THROTTLING_EXECUTION_SPEED,
+        PROCESS_POWER_THROTTLING_IGNORE_TIMER_RESOLUTION, PROCESS_POWER_THROTTLING_STATE,
     };
 
     unsafe {

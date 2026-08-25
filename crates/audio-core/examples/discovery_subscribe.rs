@@ -49,9 +49,12 @@ fn main() {
         node.stream_name, node.node_name, node.ip
     );
 
-    if let Err(e) =
-        audio_core::send_subscribe_request(&node.ip, node.control_port, node.stream_id, my_receive_port)
-    {
+    if let Err(e) = audio_core::send_subscribe_request(
+        &node.ip,
+        node.control_port,
+        node.stream_id,
+        my_receive_port,
+    ) {
         eprintln!("Failed to send subscribe request: {e}");
         listener_keep_running.store(false, Ordering::Relaxed);
         return;
