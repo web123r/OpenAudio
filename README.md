@@ -53,11 +53,20 @@ Ferronme's Open Audio is an experimental Windows desktop application for publish
 
 
 
-```markdown
+## Screenshots
+
+### Overview
+
 ![OpenAudio overview](docs/images/overview.png)
+
+### ASIO Publishing
+
 ![ASIO publishing](docs/images/asio-publish.png)
+
+### Browser Sharing
+
 ![Browser sharing](docs/images/browser-sharing.png)
-```
+
 
 ## Requirements
 
