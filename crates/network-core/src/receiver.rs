@@ -119,16 +119,14 @@ impl StreamReceiver {
         // Add packet reordering policy and gap detection
         if let Some(prev) = self.last_sequence {
             let expected = prev.wrapping_add(1);
-            let gap = packet.sequence_number.wrapping_sub(expected);
-            
-            // Reordering policy:
-            // If gap > 0 and gap < 1,000,000, we missed packets (dropped).
-            // If gap > 2^31, it's actually negative, meaning the packet is late/reordered.
-            // For now, we drop late packets by returning early.
-            if gap > 1_000_000 {
-                return Ok(None); // Drop late packet out of order
-            } else if gap > 0 {
-                self.event_queue.push_back(ReceiveEvent::Dropped(gap));
+            if packet.sequence_number != expected {
+                let gap = packet.sequence_number.wrapping_sub(expected);
+                // If the gap is massive (e.g. > 2^31), it's likely a late packet or sender restart.
+                // To prevent locking up forever on restart, we will unconditionally accept the packet
+                // but only report 'Dropped' if the gap is reasonably positive.
+                if gap > 0 && gap < 1_000_000 {
+                    self.event_queue.push_back(ReceiveEvent::Dropped(gap));
+                }
             }
         }
         
