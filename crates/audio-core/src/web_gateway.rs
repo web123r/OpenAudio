@@ -35,6 +35,7 @@ const MAX_HTTP_HEADERS: usize = 64;
 const MAX_HTTP_PATH_BYTES: usize = 2048;
 const MAX_UDP_PACKET_BYTES: usize = 65_536;
 const MAX_CHANNELS: usize = 255;
+const WEB_AUDIO_BATCH_MS: u32 = 20;
 const MAX_LOGIN_FAILURES: u32 = 5;
 const LOGIN_LOCKOUT_DURATION: Duration =
     Duration::from_secs(30);
@@ -1483,6 +1484,9 @@ fn relay_audio_to_websocket(
     global_keep_running: &AtomicBool,
 ) -> Result<(), String> {
     let mut buffer = [0_u8; MAX_UDP_PACKET_BYTES];
+    let mut batched_payload = Vec::new();
+    let mut batched_frames = 0usize;
+    let mut batch_started = Instant::now();
 
     let mut expected_format:
         Option<(u16, u32)> = None;
@@ -1562,6 +1566,7 @@ fn relay_audio_to_websocket(
                             ws,
                             packet_format,
                             &node.stream_name,
+                            &node.channel_labels,
                         )
                         .is_err()
                         {
@@ -1582,13 +1587,22 @@ fn relay_audio_to_websocket(
                     [parsed.payload_offset..payload_end]
                     .to_vec();
 
-                if ws
-                    .send(Message::Binary(
-                        payload.into(),
-                    ))
-                    .is_err()
-                {
-                    return Ok(());
+                let target_batch_frames =
+                    (parsed.sample_rate as usize * WEB_AUDIO_BATCH_MS as usize / 1_000)
+                        .max(parsed.samples_per_channel as usize);
+
+                if batched_payload.is_empty() {
+                    batch_started = Instant::now();
+                }
+
+                batched_payload.extend_from_slice(&payload);
+                batched_frames += parsed.samples_per_channel as usize;
+
+                if batched_frames >= target_batch_frames {
+                    if flush_web_audio_batch(ws, &mut batched_payload).is_err() {
+                        return Ok(());
+                    }
+                    batched_frames = 0;
                 }
             }
 
@@ -1596,12 +1610,30 @@ fn relay_audio_to_websocket(
                 if error.kind()
                     == std::io::ErrorKind::WouldBlock =>
             {
+                if !batched_payload.is_empty()
+                    && batch_started.elapsed()
+                        >= Duration::from_millis(WEB_AUDIO_BATCH_MS as u64)
+                {
+                    if flush_web_audio_batch(ws, &mut batched_payload).is_err() {
+                        return Ok(());
+                    }
+                    batched_frames = 0;
+                }
             }
 
             Err(ref error)
                 if error.kind()
                     == std::io::ErrorKind::TimedOut =>
             {
+                if !batched_payload.is_empty()
+                    && batch_started.elapsed()
+                        >= Duration::from_millis(WEB_AUDIO_BATCH_MS as u64)
+                {
+                    if flush_web_audio_batch(ws, &mut batched_payload).is_err() {
+                        return Ok(());
+                    }
+                    batched_frames = 0;
+                }
             }
 
             Err(ref error)
@@ -1620,16 +1652,30 @@ fn relay_audio_to_websocket(
     }
 }
 
+fn flush_web_audio_batch(
+    ws: &mut tungstenite::WebSocket<TcpStream>,
+    payload: &mut Vec<u8>,
+) -> Result<(), tungstenite::Error> {
+    if payload.is_empty() {
+        return Ok(());
+    }
+
+    let message = Message::Binary(std::mem::take(payload).into());
+    ws.send(message)
+}
+
 fn send_ws_format(
     ws: &mut tungstenite::WebSocket<TcpStream>,
     format: (u16, u32),
     stream_name: &str,
+    channel_labels: &[String],
 ) -> Result<(), tungstenite::Error> {
     let payload = serde_json::json!({
         "type": "format",
         "channels": format.0,
         "sampleRate": format.1,
         "streamName": stream_name,
+        "channelLabels": channel_labels,
     });
 
     ws.send(Message::Text(

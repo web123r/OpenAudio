@@ -6,10 +6,11 @@ use std::net::{TcpListener, TcpStream, UdpSocket};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tungstenite::{accept, Message};
 
 const PLAYER_HTML: &str = include_str!("../assets/web-player.html");
+const WEB_AUDIO_BATCH_MS: u32 = 20;
 
 /// Receives one network audio stream over UDP and serves it two ways
 /// on the same process, no external files needed:
@@ -104,8 +105,14 @@ pub fn receive_and_serve_web(
 
     let clients_for_accept = clients.clone();
     let accept_keep_running = keep_running.clone();
+    let channel_labels = serde_json::to_string(
+        &(0..channel_count)
+            .map(|index| format!("Channel {}", index + 1))
+            .collect::<Vec<_>>(),
+    )
+    .unwrap_or_else(|_| "[]".to_string());
     let format_json = format!(
-        r#"{{"type":"format","channels":{channel_count},"sampleRate":{sample_rate},"streamName":{}}}"#,
+        r#"{{"type":"format","channels":{channel_count},"sampleRate":{sample_rate},"streamName":{},"channelLabels":{channel_labels}}}"#,
         serde_json::to_string(&stream_name).unwrap_or_else(|_| "\"stream\"".to_string())
     );
 
@@ -142,12 +149,31 @@ pub fn receive_and_serve_web(
     });
 
     let mut packets_received: u32 = 0;
+    let mut batched_payload = Vec::new();
+    let mut batched_frames = 0usize;
+    let mut batch_started = Instant::now();
 
     while keep_running.load(Ordering::Relaxed) {
         let (len, _src) = match socket.recv_from(&mut buf) {
             Ok(r) => r,
-            Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => continue,
-            Err(ref e) if e.kind() == std::io::ErrorKind::TimedOut => continue,
+            Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                flush_web_audio_batch(
+                    &clients,
+                    &mut batched_payload,
+                    &mut batched_frames,
+                    &mut batch_started,
+                );
+                continue;
+            }
+            Err(ref e) if e.kind() == std::io::ErrorKind::TimedOut => {
+                flush_web_audio_batch(
+                    &clients,
+                    &mut batched_payload,
+                    &mut batched_frames,
+                    &mut batch_started,
+                );
+                continue;
+            }
             Err(ref e) if e.kind() == std::io::ErrorKind::ConnectionReset => continue,
             Err(e) => return Err(format!("recv error: {e}")),
         };
@@ -161,14 +187,53 @@ pub fn receive_and_serve_web(
         packets_received += 1;
 
         let sample_count = parsed.samples_per_channel as usize * parsed.channel_count as usize;
-        let payload = buf[parsed.payload_offset..parsed.payload_offset + sample_count * 4].to_vec();
+        let payload_end = parsed.payload_offset + sample_count * 4;
+        if payload_end > len {
+            continue;
+        }
 
-        let mut clients_guard = clients.lock().unwrap();
-        clients_guard.retain(|tx| tx.send(payload.clone()).is_ok());
+        if batched_payload.is_empty() {
+            batch_started = Instant::now();
+        }
+
+        batched_payload.extend_from_slice(&buf[parsed.payload_offset..payload_end]);
+        batched_frames += parsed.samples_per_channel as usize;
+
+        let target_batch_frames =
+            (sample_rate as usize * WEB_AUDIO_BATCH_MS as usize / 1_000)
+                .max(parsed.samples_per_channel as usize);
+
+        if batched_frames >= target_batch_frames {
+            flush_web_audio_batch(
+                &clients,
+                &mut batched_payload,
+                &mut batched_frames,
+                &mut batch_started,
+            );
+        }
     }
 
     println!("Web-stream done. {packets_received} packets received.");
     Ok(())
+}
+
+fn flush_web_audio_batch(
+    clients: &Arc<Mutex<Vec<std::sync::mpsc::Sender<Vec<u8>>>>>,
+    payload: &mut Vec<u8>,
+    frames: &mut usize,
+    started: &mut Instant,
+) {
+    if payload.is_empty()
+        || (*frames == 0 && started.elapsed() < Duration::from_millis(WEB_AUDIO_BATCH_MS as u64))
+    {
+        return;
+    }
+
+    let payload = std::mem::take(payload);
+    let mut clients_guard = clients.lock().unwrap();
+    clients_guard.retain(|tx| tx.send(payload.clone()).is_ok());
+    *frames = 0;
+    *started = Instant::now();
 }
 
 fn serve_http_page(mut stream: TcpStream) -> std::io::Result<()> {

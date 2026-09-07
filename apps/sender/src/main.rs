@@ -1,5 +1,7 @@
 mod asio_subscribe_ui;
 mod diagnostic_panel;
+mod file_dialog;
+mod preset;
 mod signal_monitor;
 mod ui_shell;
 
@@ -7,13 +9,71 @@ use asio_subscribe_ui::AsioSubscribePanel;
 use diagnostic_panel::DiagnosticPanel;
 use signal_monitor::SignalMonitor;
 use ui_shell::{AppPage, UiSummary};
+use preset::{
+    AsioPublishPreset, BrowserPreset, CombinePublishPreset, PresetFile,
+    PublishPreset, SplitSubscribePreset, SubscribePreset,
+};
 
 use eframe::egui;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant};
+
+static ASIO_DEVICE_LOCKS: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
+
+pub(crate) fn reserve_asio_device(driver_name: &str) -> Result<(), String> {
+    let driver_name = driver_name.trim();
+    if driver_name.is_empty() {
+        return Err("ASIO driver name is empty".to_string());
+    }
+
+    let mut locks = ASIO_DEVICE_LOCKS
+        .get_or_init(|| Mutex::new(HashSet::new()))
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+
+    if locks.contains(driver_name) {
+        return Err(format!(
+            "ASIO driver '{}' is already in use by another OpenAudio ASIO session. Stop the other ASIO publish or subscribe session before starting a new one.",
+            driver_name
+        ));
+    }
+
+    locks.insert(driver_name.to_string());
+    Ok(())
+}
+
+pub(crate) fn release_asio_device(driver_name: &str) {
+    let driver_name = driver_name.trim();
+    if driver_name.is_empty() {
+        return;
+    }
+
+    if let Ok(mut locks) = ASIO_DEVICE_LOCKS
+        .get_or_init(|| Mutex::new(HashSet::new()))
+        .lock()
+    {
+        locks.remove(driver_name);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{release_asio_device, reserve_asio_device};
+
+    #[test]
+    fn asio_device_lock_rejects_duplicate_driver() {
+        let driver = "duplicate-lock-test";
+        release_asio_device(driver);
+
+        assert!(reserve_asio_device(driver).is_ok());
+        assert!(reserve_asio_device(driver).is_err());
+
+        release_asio_device(driver);
+    }
+}
 
 // ============================================================================
 // PUBLISH SESSION TYPES
@@ -27,6 +87,7 @@ struct PublishSession {
     selected_input: Option<String>,
     is_loopback: bool,
     record: bool,
+    channel_labels: Vec<String>,
     running: Arc<AtomicBool>,
     status: Arc<Mutex<String>>,
     last_toggle: Instant,
@@ -40,6 +101,7 @@ struct CombinePublishSession {
     stream_id: u32,
     channel_count: usize,
     channel_sources: Vec<(Option<String>, bool)>,
+    channel_labels: Vec<String>,
     record: bool,
     running: Arc<AtomicBool>,
     status: Arc<Mutex<String>>,
@@ -54,6 +116,7 @@ struct AsioPublishSession {
     selected_driver: Option<String>,
     driver_channel_count: usize,
     channel_indices: Vec<usize>,
+    channel_labels: Vec<String>,
     running: Arc<AtomicBool>,
     status: Arc<Mutex<String>>,
     last_toggle: Instant,
@@ -397,6 +460,250 @@ impl OpenAudioApp {
             Some("Audio devices and ASIO drivers refreshed.".to_string()),
         );
     }
+
+    fn save_preset(&self) {
+        let Some(path) = file_dialog::choose_save_file() else {
+            return;
+        };
+
+        let preset = self.to_preset();
+        match serde_json::to_string_pretty(&preset)
+            .map_err(|error| error.to_string())
+            .and_then(|json| std::fs::write(&path, json).map_err(|error| error.to_string()))
+        {
+            Ok(()) => set_shared_optional_message(
+                &self.info_banner,
+                Some(format!("Preset saved to {}.", path.display())),
+            ),
+            Err(error) => set_shared_optional_message(
+                &self.error_banner,
+                Some(format!("Could not save preset: {error}")),
+            ),
+        }
+    }
+
+    fn load_preset(&mut self) {
+        let Some(path) = file_dialog::choose_open_file() else {
+            return;
+        };
+
+        let result = std::fs::read_to_string(&path)
+            .map_err(|error| error.to_string())
+            .and_then(|json| serde_json::from_str::<PresetFile>(&json).map_err(|error| error.to_string()))
+            .and_then(|preset| self.apply_preset(preset));
+
+        match result {
+            Ok(()) => set_shared_optional_message(
+                &self.info_banner,
+                Some(format!("Preset loaded from {}.", path.display())),
+            ),
+            Err(error) => set_shared_optional_message(
+                &self.error_banner,
+                Some(format!("Could not load preset: {error}")),
+            ),
+        }
+    }
+
+    fn to_preset(&self) -> PresetFile {
+        PresetFile {
+            format: "OpenAudio preset".to_string(),
+            version: 1,
+            publish_sessions: self
+                .publish_sessions
+                .iter()
+                .map(|session| PublishPreset {
+                    node_name: session.node_name.clone(),
+                    stream_name: session.stream_name.clone(),
+                    stream_id: session.stream_id,
+                    selected_input: session.selected_input.clone(),
+                    is_loopback: session.is_loopback,
+                    record: session.record,
+                    channel_labels: session.channel_labels.clone(),
+                })
+                .collect(),
+            combine_publish_sessions: self
+                .combine_publish_sessions
+                .iter()
+                .map(|session| CombinePublishPreset {
+                    session_tag: session.session_tag.clone(),
+                    node_name: session.node_name.clone(),
+                    stream_name: session.stream_name.clone(),
+                    stream_id: session.stream_id,
+                    channel_count: session.channel_count,
+                    channel_sources: session.channel_sources.clone(),
+                    record: session.record,
+                    channel_labels: session.channel_labels.clone(),
+                })
+                .collect(),
+            asio_publish_sessions: self
+                .asio_publish_sessions
+                .iter()
+                .map(|session| AsioPublishPreset {
+                    node_name: session.node_name.clone(),
+                    stream_name: session.stream_name.clone(),
+                    stream_id: session.stream_id,
+                    selected_driver: session.selected_driver.clone(),
+                    channel_indices: session.channel_indices.clone(),
+                    channel_labels: session.channel_labels.clone(),
+                })
+                .collect(),
+            subscribe_sessions: self
+                .subscribe_sessions
+                .iter()
+                .map(|session| SubscribePreset {
+                    selected_discovered_node_id: session.selected_discovered_node_id.clone(),
+                    bind_port: session.bind_port.clone(),
+                    selected_output: session.selected_output.clone(),
+                    volume: audio_core::get_volume(&session.volume),
+                    record: session.record,
+                })
+                .collect(),
+            split_subscribe_sessions: self
+                .split_subscribe_sessions
+                .iter()
+                .map(|session| SplitSubscribePreset {
+                    session_tag: session.session_tag.clone(),
+                    selected_discovered_node_id: session.selected_discovered_node_id.clone(),
+                    bind_port: session.bind_port.clone(),
+                    channel_devices: session.channel_devices.clone(),
+                    record: session.record,
+                })
+                .collect(),
+            browser: BrowserPreset {
+                access_mode: match self.browser_access_mode {
+                    BrowserAccessMode::PasswordProtected => "password_protected",
+                    BrowserAccessMode::OpenLan => "open_lan",
+                }
+                .to_string(),
+                password: self.browser_password.clone(),
+            },
+        }
+    }
+
+    fn apply_preset(&mut self, preset: PresetFile) -> Result<(), String> {
+        if preset.format != "OpenAudio preset" || preset.version != 1 {
+            return Err("unsupported OpenAudio preset format or version".to_string());
+        }
+
+        let any_running = self.publish_sessions.iter().any(|session| session.running.load(Ordering::Acquire))
+            || self.combine_publish_sessions.iter().any(|session| session.running.load(Ordering::Acquire))
+            || self.asio_publish_sessions.iter().any(|session| session.running.load(Ordering::Acquire))
+            || self.subscribe_sessions.iter().any(|session| session.running.load(Ordering::Acquire))
+            || self.split_subscribe_sessions.iter().any(|session| session.running.load(Ordering::Acquire));
+
+        if any_running {
+            return Err("stop all active audio sessions before loading a preset".to_string());
+        }
+
+        self.publish_sessions.clear();
+        self.combine_publish_sessions.clear();
+        self.asio_publish_sessions.clear();
+        self.subscribe_sessions.clear();
+        self.split_subscribe_sessions.clear();
+
+        for item in preset.publish_sessions {
+            let id = self.take_next_id();
+            self.publish_sessions.push(PublishSession {
+                id,
+                node_name: item.node_name,
+                stream_name: item.stream_name,
+                stream_id: item.stream_id,
+                selected_input: item.selected_input,
+                is_loopback: item.is_loopback,
+                record: item.record,
+                channel_labels: item.channel_labels,
+                running: Arc::new(AtomicBool::new(false)),
+                status: Arc::new(Mutex::new("Not started.".to_string())),
+                last_toggle: Instant::now() - Duration::from_secs(1),
+            });
+        }
+
+        for item in preset.combine_publish_sessions {
+            let id = self.take_next_id();
+            self.combine_publish_sessions.push(CombinePublishSession {
+                id,
+                session_tag: item.session_tag,
+                node_name: item.node_name,
+                stream_name: item.stream_name,
+                stream_id: item.stream_id,
+                channel_count: item.channel_count,
+                channel_sources: item.channel_sources,
+                channel_labels: item.channel_labels,
+                record: item.record,
+                running: Arc::new(AtomicBool::new(false)),
+                status: Arc::new(Mutex::new("Not started.".to_string())),
+                last_toggle: Instant::now() - Duration::from_secs(1),
+            });
+        }
+
+        for item in preset.asio_publish_sessions {
+            let id = self.take_next_id();
+            let driver_channel_count = item
+                .selected_driver
+                .as_ref()
+                .and_then(|name| self.asio_drivers.iter().find(|driver| &driver.name == name))
+                .map(|driver| driver.max_input_channels as usize)
+                .unwrap_or(0);
+            self.asio_publish_sessions.push(AsioPublishSession {
+                id,
+                node_name: item.node_name,
+                stream_name: item.stream_name,
+                stream_id: item.stream_id,
+                selected_driver: item.selected_driver,
+                driver_channel_count,
+                channel_indices: item.channel_indices,
+                channel_labels: item.channel_labels,
+                running: Arc::new(AtomicBool::new(false)),
+                status: Arc::new(Mutex::new("Not started.".to_string())),
+                last_toggle: Instant::now() - Duration::from_secs(1),
+            });
+        }
+
+        for item in preset.subscribe_sessions {
+            let id = self.take_next_id();
+            self.subscribe_sessions.push(SubscribeSession {
+                id,
+                selected_discovered_node_id: item.selected_discovered_node_id,
+                bind_port: item.bind_port,
+                selected_output: item.selected_output,
+                volume: audio_core::new_volume_control(item.volume.clamp(0.0, 2.0)),
+                record: item.record,
+                running: Arc::new(AtomicBool::new(false)),
+                status: Arc::new(Mutex::new("Not started.".to_string())),
+                last_toggle: Instant::now() - Duration::from_secs(1),
+            });
+        }
+
+        for item in preset.split_subscribe_sessions {
+            let id = self.take_next_id();
+            self.split_subscribe_sessions.push(SplitSubscribeSession {
+                id,
+                session_tag: item.session_tag,
+                selected_discovered_node_id: item.selected_discovered_node_id,
+                bind_port: item.bind_port,
+                channel_devices: item.channel_devices,
+                record: item.record,
+                running: Arc::new(AtomicBool::new(false)),
+                status: Arc::new(Mutex::new("Not started.".to_string())),
+                last_toggle: Instant::now() - Duration::from_secs(1),
+            });
+        }
+
+        self.browser_access_mode = if preset.browser.access_mode == "open_lan" {
+            BrowserAccessMode::OpenLan
+        } else {
+            BrowserAccessMode::PasswordProtected
+        };
+        self.browser_password = preset.browser.password;
+        self.browser_password_confirmation.clear();
+        Ok(())
+    }
+
+    fn take_next_id(&mut self) -> u64 {
+        let id = self.next_id;
+        self.next_id = self.next_id.saturating_add(1);
+        id
+    }
 }
 
 // ============================================================================
@@ -726,6 +1033,36 @@ impl OpenAudioApp {
                         .clicked()
                     {
                         self.refresh_devices();
+                    }
+
+                    if ui
+                        .add(
+                            egui::Button::new(
+                                egui::RichText::new("Load Preset")
+                                    .color(Theme::TEXT_PRIMARY),
+                            )
+                            .fill(Theme::BG_CARD)
+                            .rounding(8.0)
+                            .min_size(egui::vec2(105.0, 34.0)),
+                        )
+                        .clicked()
+                    {
+                        self.load_preset();
+                    }
+
+                    if ui
+                        .add(
+                            egui::Button::new(
+                                egui::RichText::new("Save Preset")
+                                    .color(Theme::TEXT_PRIMARY),
+                            )
+                            .fill(Theme::BG_CARD)
+                            .rounding(8.0)
+                            .min_size(egui::vec2(105.0, 34.0)),
+                        )
+                        .clicked()
+                    {
+                        self.save_preset();
                     }
 
                     let active_audio_sessions =
@@ -1475,6 +1812,7 @@ impl OpenAudioApp {
                                         session
                                             .channel_indices
                                             .clear();
+                                        session.channel_labels.clear();
                                     }
 
                                     for driver in asio_drivers {
@@ -1528,6 +1866,10 @@ impl OpenAudioApp {
                                                 .channel_indices =
                                                 (0..session
                                                     .driver_channel_count)
+                                                    .collect();
+                                            session.channel_labels =
+                                                (0..session.driver_channel_count)
+                                                    .map(|index| format!("Channel {}", index + 1))
                                                     .collect();
                                         }
                                     }
@@ -1713,6 +2055,24 @@ impl OpenAudioApp {
                                 }
                             });
 
+                            ui.add_space(6.0);
+                            ui.label(
+                                egui::RichText::new("Channel labels")
+                                    .size(11.0)
+                                    .color(Theme::TEXT_SECONDARY),
+                            );
+                            for channel in session.channel_indices.clone() {
+                                if let Some(label) = session.channel_labels.get_mut(channel) {
+                                    ui.horizontal(|ui| {
+                                        ui.label(format!("ASIO {}", channel + 1));
+                                        ui.add(
+                                            egui::TextEdit::singleline(label)
+                                                .desired_width(180.0),
+                                        );
+                                    });
+                                }
+                            }
+
                             ui.add_space(8.0);
 
                             self::render_asio_bandwidth_estimate(
@@ -1886,6 +2246,18 @@ impl OpenAudioApp {
                                     session
                                         .channel_indices
                                         .clone();
+                                let channel_labels = session
+                                    .channel_indices
+                                    .iter()
+                                    .map(|&index| {
+                                        session
+                                            .channel_labels
+                                            .get(index)
+                                            .filter(|label| !label.trim().is_empty())
+                                            .cloned()
+                                            .unwrap_or_else(|| format!("Channel {}", index + 1))
+                                    })
+                                    .collect::<Vec<_>>();
 
                                 let subscribers =
                                     subscriber_registry
@@ -1921,6 +2293,21 @@ impl OpenAudioApp {
                                     ),
                                 );
 
+                                if let Err(error) = reserve_asio_device(&driver_name) {
+                                    set_shared_optional_message(
+                                        &worker_error_banner,
+                                        Some(error),
+                                    );
+                                    set_shared_status(
+                                        &status,
+                                        "ASIO driver busy.",
+                                    );
+                                    running.store(false, Ordering::Release);
+                                    return;
+                                }
+
+                                let worker_driver_name = driver_name.clone();
+
                                 let spawn_result =
                                     thread::Builder::new()
                                         .name(format!(
@@ -1930,12 +2317,13 @@ impl OpenAudioApp {
                                         .spawn(move || {
                                             let result =
                                                 audio_core::
-                                                capture_asio_with_discovery(
+                                                capture_asio_with_channel_labels(
                                                     node_name,
                                                     stream_name,
                                                     stream_id,
-                                                    driver_name,
+                                                    worker_driver_name.clone(),
                                                     channel_indices,
+                                                    channel_labels,
                                                     subscribers,
                                                     worker_running
                                                         .clone(),
@@ -1971,6 +2359,7 @@ impl OpenAudioApp {
                                                 }
                                             }
 
+                                            release_asio_device(&worker_driver_name);
                                             worker_running.store(
                                                 false,
                                                 Ordering::Release,
@@ -1980,6 +2369,7 @@ impl OpenAudioApp {
                                 if let Err(error) =
                                     spawn_result
                                 {
+                                    release_asio_device(&driver_name);
                                     running.store(
                                         false,
                                         Ordering::Release,
@@ -2140,6 +2530,7 @@ impl OpenAudioApp {
                     selected_driver: None,
                     driver_channel_count: 0,
                     channel_indices: Vec::new(),
+                    channel_labels: Vec::new(),
                     running: Arc::new(
                         AtomicBool::new(false),
                     ),
@@ -2654,6 +3045,47 @@ impl OpenAudioApp {
                             );
                         }
 
+                        let label_count = if session.is_loopback {
+                            output_devices
+                                .iter()
+                                .find(|device| {
+                                    Some(device.name.as_str())
+                                        == session.selected_input.as_deref()
+                                })
+                                .map(|device| device.max_output_channels as usize)
+                        } else {
+                            input_devices
+                                .iter()
+                                .find(|device| {
+                                    Some(device.name.as_str())
+                                        == session.selected_input.as_deref()
+                                })
+                                .map(|device| device.max_input_channels as usize)
+                        }
+                        .unwrap_or(2)
+                        .max(1);
+
+                        while session.channel_labels.len() < label_count {
+                            let index = session.channel_labels.len();
+                            session.channel_labels.push(format!("Channel {}", index + 1));
+                        }
+                        session.channel_labels.truncate(label_count);
+
+                        ui.label(
+                            egui::RichText::new("Channel labels")
+                                .size(11.0)
+                                .color(Theme::TEXT_SECONDARY),
+                        );
+                        for (index, label) in session.channel_labels.iter_mut().enumerate() {
+                            ui.horizontal(|ui| {
+                                ui.label(format!("Channel {}", index + 1));
+                                ui.add(
+                                    egui::TextEdit::singleline(label)
+                                        .desired_width(180.0),
+                                );
+                            });
+                        }
+
                         ui.add_space(10.0);
 
                         ui.columns(3, |columns| {
@@ -2806,6 +3238,8 @@ impl OpenAudioApp {
                                 let is_loopback =
                                     session.is_loopback;
 
+                                let channel_labels = session.channel_labels.clone();
+
                                 let record_path =
                                     if session.record {
                                         Some(
@@ -2862,25 +3296,27 @@ impl OpenAudioApp {
                                             let result =
                                                 if is_loopback {
                                                     audio_core::
-                                                    transmit_loopback_with_discovery(
+                                                    transmit_loopback_with_discovery_labeled(
                                                         node_name,
                                                         stream_name,
                                                         stream_id,
                                                         device_name,
                                                         subscribers,
                                                         record_path,
+                                                        Some(channel_labels),
                                                         worker_running
                                                             .clone(),
                                                     )
                                                 } else {
                                                     audio_core::
-                                                    transmit_with_discovery(
+                                                    transmit_with_discovery_labeled(
                                                         node_name,
                                                         stream_name,
                                                         stream_id,
                                                         device_name,
                                                         subscribers,
                                                         record_path,
+                                                        Some(channel_labels),
                                                         worker_running
                                                             .clone(),
                                                     )
@@ -3063,6 +3499,7 @@ impl OpenAudioApp {
                 selected_input: None,
                 is_loopback: false,
                 record: false,
+                channel_labels: vec!["Channel 1".to_string(), "Channel 2".to_string()],
                 running: Arc::new(AtomicBool::new(false)),
                 status: Arc::new(Mutex::new(
                     "Not started.".to_string(),
@@ -3279,6 +3716,11 @@ impl OpenAudioApp {
                                     channel_count,
                                     (None, false),
                                 );
+                                while session.channel_labels.len() < channel_count {
+                                    let index = session.channel_labels.len();
+                                    session.channel_labels.push(format!("Channel {}", index + 1));
+                                }
+                                session.channel_labels.truncate(channel_count);
                             }
 
                             ui.label(
@@ -3291,6 +3733,21 @@ impl OpenAudioApp {
                                 ),
                             );
                         });
+
+                        ui.label(
+                            egui::RichText::new("Channel labels")
+                                .size(11.0)
+                                .color(Theme::TEXT_SECONDARY),
+                        );
+                        for (index, label) in session.channel_labels.iter_mut().enumerate() {
+                            ui.horizontal(|ui| {
+                                ui.label(format!("Channel {}", index + 1));
+                                ui.add(
+                                    egui::TextEdit::singleline(label)
+                                        .desired_width(180.0),
+                                );
+                            });
+                        }
 
                         ui.add_space(8.0);
 
@@ -3605,6 +4062,8 @@ impl OpenAudioApp {
                                 let record_each =
                                     session.record;
 
+                                let channel_labels = session.channel_labels.clone();
+
                                 let subscribers =
                                     subscriber_registry.clone();
 
@@ -3643,13 +4102,14 @@ impl OpenAudioApp {
                                         ))
                                         .spawn(move || {
                                             let result = audio_core::
-                                                capture_and_combine_with_discovery(
+                                                capture_and_combine_with_labels(
                                                     node_name,
                                                     stream_name,
                                                     stream_id,
                                                     sources,
                                                     subscribers,
                                                     record_each,
+                                                    Some(channel_labels),
                                                     worker_running
                                                         .clone(),
                                                 );
@@ -3864,6 +4324,10 @@ impl OpenAudioApp {
                     channel_sources: vec![
                         (None, false),
                         (None, false),
+                    ],
+                    channel_labels: vec![
+                        "Channel 1".to_string(),
+                        "Channel 2".to_string(),
                     ],
                     record: false,
                     running: Arc::new(
@@ -4440,6 +4904,27 @@ impl OpenAudioApp {
                                                     true,
                                                     Ordering::Release,
                                                 );
+
+                                                let reconnect_running = running.clone();
+                                                let reconnect_ip = node.ip.clone();
+                                                let reconnect_control_port = node.control_port;
+                                                let reconnect_stream_id = node.stream_id;
+                                                thread::spawn(move || {
+                                                    while reconnect_running.load(Ordering::Acquire) {
+                                                        let _ = audio_core::send_subscribe_request(
+                                                            &reconnect_ip,
+                                                            reconnect_control_port,
+                                                            reconnect_stream_id,
+                                                            port,
+                                                        );
+                                                        for _ in 0..10 {
+                                                            if !reconnect_running.load(Ordering::Acquire) {
+                                                                return;
+                                                            }
+                                                            thread::sleep(Duration::from_millis(100));
+                                                        }
+                                                    }
+                                                });
 
                                                 set_shared_status(
                                                     &status,
@@ -5250,6 +5735,27 @@ impl OpenAudioApp {
                                                     true,
                                                     Ordering::Release,
                                                 );
+
+                                                let reconnect_running = running.clone();
+                                                let reconnect_ip = node.ip.clone();
+                                                let reconnect_control_port = node.control_port;
+                                                let reconnect_stream_id = node.stream_id;
+                                                thread::spawn(move || {
+                                                    while reconnect_running.load(Ordering::Acquire) {
+                                                        let _ = audio_core::send_subscribe_request(
+                                                            &reconnect_ip,
+                                                            reconnect_control_port,
+                                                            reconnect_stream_id,
+                                                            port,
+                                                        );
+                                                        for _ in 0..10 {
+                                                            if !reconnect_running.load(Ordering::Acquire) {
+                                                                return;
+                                                            }
+                                                            thread::sleep(Duration::from_millis(100));
+                                                        }
+                                                    }
+                                                });
 
                                                 set_shared_status(
                                                     &status,

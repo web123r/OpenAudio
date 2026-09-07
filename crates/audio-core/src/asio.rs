@@ -15,7 +15,7 @@ pub mod inner {
     use std::sync::{Arc, Mutex};
     use std::time::{Duration, Instant};
 
-    use crate::discovery::{start_advertising, SubscriberRegistry};
+    use crate::discovery::{start_advertising_with_labels, SubscriberRegistry};
     use crate::ensure_realtime_audio_thread;
     use crate::protocol::{
         sample_rate_to_code, AudioPayloadHeader, PacketHeader, SAMPLE_FORMAT_FLOAT32,
@@ -181,6 +181,33 @@ pub mod inner {
         subscribers_by_stream: SubscriberRegistry,
         keep_running: Arc<AtomicBool>,
     ) -> Result<(), String> {
+        let channel_labels = channel_indices
+            .iter()
+            .map(|index| format!("Channel {}", index + 1))
+            .collect();
+
+        capture_asio_with_channel_labels(
+            node_name,
+            stream_name,
+            stream_id,
+            driver_name,
+            channel_indices,
+            channel_labels,
+            subscribers_by_stream,
+            keep_running,
+        )
+    }
+
+    pub fn capture_asio_with_channel_labels(
+        node_name: String,
+        stream_name: String,
+        stream_id: u32,
+        driver_name: String,
+        channel_indices: Vec<usize>,
+        channel_labels: Vec<String>,
+        subscribers_by_stream: SubscriberRegistry,
+        keep_running: Arc<AtomicBool>,
+    ) -> Result<(), String> {
         init_com_for_asio();
         ensure_realtime_audio_thread();
 
@@ -273,11 +300,12 @@ pub mod inner {
         let advertised_channels = selected_channel_count as u8;
 
         std::thread::spawn(move || {
-            if let Err(error) = start_advertising(
+            if let Err(error) = start_advertising_with_labels(
                 advertising_node_name,
                 stream_id,
                 advertising_stream_name,
                 advertised_channels,
+                channel_labels,
                 advertising_flag,
             ) {
                 eprintln!(
@@ -912,7 +940,10 @@ pub mod inner {
 }
 
 #[cfg(feature = "asio")]
-pub use inner::{capture_asio_with_discovery, get_asio_device, list_asio_drivers, AsioDriverInfo};
+pub use inner::{
+    capture_asio_with_channel_labels, capture_asio_with_discovery, get_asio_device,
+    list_asio_drivers, AsioDriverInfo,
+};
 
 // Non-ASIO build stubs.
 
@@ -944,6 +975,22 @@ pub fn capture_asio_with_discovery(
     _stream_id: u32,
     _driver_name: String,
     _channel_indices: Vec<usize>,
+    _subscribers_by_stream: crate::discovery::SubscriberRegistry,
+    _keep_running: std::sync::Arc<std::sync::atomic::AtomicBool>,
+) -> Result<(), String> {
+    Err("ASIO support is not compiled in. Build with \
+         --features asio and set CPAL_ASIO_DIR."
+        .to_string())
+}
+
+#[cfg(not(feature = "asio"))]
+pub fn capture_asio_with_channel_labels(
+    _node_name: String,
+    _stream_name: String,
+    _stream_id: u32,
+    _driver_name: String,
+    _channel_indices: Vec<usize>,
+    _channel_labels: Vec<String>,
     _subscribers_by_stream: crate::discovery::SubscriberRegistry,
     _keep_running: std::sync::Arc<std::sync::atomic::AtomicBool>,
 ) -> Result<(), String> {

@@ -18,6 +18,8 @@
 //! Milestone 13: Route received streams directly to ASIO outputs.
 //! Milestone 14: Synthetic multichannel publishing for network diagnostics.
 
+pub mod backend;
+pub mod cpal_backend;
 mod bus;
 mod capture;
 mod combine;
@@ -31,6 +33,7 @@ mod receive;
 mod recording;
 mod sar_config;
 mod split;
+mod stream_control;
 mod transmit;
 mod util;
 mod web_gateway;
@@ -52,11 +55,14 @@ pub use platform::{
     JITTER_BUFFER_TARGET_SECS,
 };
 
+pub use stream_control::{
+    resample_interleaved_linear, AdaptiveJitterController, ClockSynchronizer,
+};
+
 // ── Standard audio-device discovery ─────────────────────────────────────
 
 pub use devices::{
-    get_input_device, get_output_device, list_input_devices, list_output_devices, DeviceInfo,
-    NONE_DEVICE,
+    list_input_devices, list_output_devices, DeviceInfo, NONE_DEVICE,
 };
 
 // ── Basic capture and receive operations ────────────────────────────────
@@ -68,8 +74,9 @@ pub use receive::receive_to_wav;
 // ── Network publishing ──────────────────────────────────────────────────
 
 pub use transmit::{
-    transmit, transmit_loopback_with_discovery, transmit_multi, transmit_with_control,
-    transmit_with_discovery,
+    transmit, transmit_loopback_with_discovery, transmit_loopback_with_discovery_labeled,
+    transmit_multi, transmit_with_control, transmit_with_discovery,
+    transmit_with_discovery_labeled,
 };
 
 // ── Synthetic diagnostic publishing ─────────────────────────────────────
@@ -92,13 +99,16 @@ pub use bus::{
 // ── Discovery and subscription control ──────────────────────────────────
 
 pub use discovery::{
-    send_subscribe_request, start_advertising, start_control_listener, start_discovery_listener,
+    send_subscribe_request, start_advertising, start_advertising_with_labels,
+    start_control_listener, start_discovery_listener,
     DiscoveredNode, NodeAdvertisement, SubscriberRegistry,
 };
 
 // ── Multichannel standard-device and SAR routing ────────────────────────
 
-pub use combine::{capture_and_combine_with_discovery, ChannelSource};
+pub use combine::{
+    capture_and_combine_with_discovery, capture_and_combine_with_labels, ChannelSource,
+};
 
 pub use split::receive_and_split_to_devices;
 
@@ -122,7 +132,10 @@ pub use recording::{create_wav_writer, finalize as finalize_recording, generate_
 // their stub implementations return descriptive runtime errors, allowing
 // the rest of the application to compile normally.
 
-pub use asio::{capture_asio_with_discovery, list_asio_drivers, AsioDriverInfo};
+pub use asio::{
+    capture_asio_with_channel_labels, capture_asio_with_discovery, list_asio_drivers,
+    AsioDriverInfo,
+};
 
 // ── ASIO subscription and output routing ────────────────────────────────
 

@@ -1,7 +1,7 @@
+use crate::backend::get_backend;
 use crate::ensure_realtime_audio_thread;
 use crate::protocol::parse_packet;
-use crate::JITTER_BUFFER_TARGET_SECS;
-use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
+use crate::{resample_interleaved_linear, JITTER_BUFFER_TARGET_SECS};
 use std::collections::VecDeque;
 use std::net::UdpSocket;
 use std::sync::{Arc, Mutex};
@@ -43,8 +43,7 @@ pub fn receive_and_play(bind_addr: &str, duration_secs: u64) -> Result<(), Strin
     let mut packets_dropped = 0u32;
 
     // Block until the first valid packet arrives, so we know channel
-    // count and sample rate before opening an output stream (cpal
-    // needs an explicit config up front, unlike the lazy WAV writer).
+    // count and sample rate before opening an output stream.
     let (channel_count, sample_rate) = loop {
         let (len, _src) = socket
             .recv_from(&mut buf)
@@ -64,49 +63,48 @@ pub fn receive_and_play(bind_addr: &str, duration_secs: u64) -> Result<(), Strin
 
     println!("Detected {channel_count}ch @ {sample_rate}Hz. Setting up playback...");
 
-    let host = cpal::default_host();
-    let device = host
-        .default_output_device()
-        .ok_or_else(|| "no default output device found".to_string())?;
-    let output_config = device
-        .default_output_config()
-        .map_err(|e| format!("failed to get default output config: {e}"))?;
+    let backend = get_backend();
+    let (_device_label, output_config) = backend.get_output_config(None)?;
 
-    if output_config.channels() != channel_count || output_config.sample_rate().0 != sample_rate {
+    if output_config.channels != channel_count {
         return Err(format!(
-            "output device default format ({}ch @ {}Hz) doesn't match incoming stream ({}ch @ {}Hz). \
-             Resampling isn't implemented yet -- that's a later milestone.",
-            output_config.channels(),
-            output_config.sample_rate().0,
-            channel_count,
-            sample_rate
+            "output device channel count ({}ch) doesn't match incoming stream ({}ch).",
+            output_config.channels,
+            channel_count
         ));
     }
 
-    let stream_config: cpal::StreamConfig = output_config.into();
-    let buffer_for_callback = buffer.clone();
-    let err_fn = |err| eprintln!("audio-core: playback stream error: {err}");
+    let output_sample_rate = output_config.sample_rate;
+    if output_sample_rate != sample_rate {
+        let initial = buffer.lock().unwrap().drain(..).collect::<Vec<_>>();
+        let converted = resample_interleaved_linear(
+            &initial,
+            channel_count as usize,
+            sample_rate,
+            output_sample_rate,
+        );
+        buffer.lock().unwrap().extend(converted);
+    }
 
-    let stream = device
-        .build_output_stream(
-            &stream_config,
-            move |data: &mut [f32], _| {
-                ensure_realtime_audio_thread();
-                let mut buf = buffer_for_callback.lock().unwrap();
-                for sample in data.iter_mut() {
-                    *sample = buf.pop_front().unwrap_or(0.0); // underrun -> silence
-                }
-            },
-            err_fn,
-            None,
-        )
-        .map_err(|e| format!("failed to build output stream: {e}"))?;
+    let buffer_for_callback = buffer.clone();
+
+    let stream = backend.build_output_stream(
+        None,
+        Box::new(move |data: &mut [f32]| {
+            ensure_realtime_audio_thread();
+            let mut buf = buffer_for_callback.lock().unwrap();
+            for sample in data.iter_mut() {
+                *sample = buf.pop_front().unwrap_or(0.0); // underrun -> silence
+            }
+        }),
+    )?;
 
     // Prime the jitter buffer toward the spec's 6ms default target
     // before starting playback, so the callback isn't starved
     // immediately (protocol spec section 6.1).
     let target_samples =
-        ((sample_rate as f64 * JITTER_BUFFER_TARGET_SECS) as usize) * channel_count as usize;
+        ((output_sample_rate as f64 * JITTER_BUFFER_TARGET_SECS) as usize)
+            * channel_count as usize;
     let prime_deadline = Instant::now() + Duration::from_millis(500);
     while buffer.lock().unwrap().len() < target_samples && Instant::now() < prime_deadline {
         if let Ok((len, _src)) = socket.recv_from(&mut buf) {
@@ -122,10 +120,17 @@ pub fn receive_and_play(bind_addr: &str, duration_secs: u64) -> Result<(), Strin
                 let sample_count =
                     parsed.samples_per_channel as usize * parsed.channel_count as usize;
                 let payload = &buf[parsed.payload_offset..parsed.payload_offset + sample_count * 4];
-                let mut jitter_buf = buffer.lock().unwrap();
-                for chunk in payload.chunks_exact(4) {
-                    jitter_buf.push_back(f32::from_le_bytes(chunk.try_into().unwrap()));
-                }
+                let input = payload
+                    .chunks_exact(4)
+                    .map(|chunk| f32::from_le_bytes(chunk.try_into().unwrap()))
+                    .collect::<Vec<_>>();
+                let converted = resample_interleaved_linear(
+                    &input,
+                    channel_count as usize,
+                    sample_rate,
+                    output_sample_rate,
+                );
+                buffer.lock().unwrap().extend(converted);
             }
         }
     }
@@ -160,13 +165,22 @@ pub fn receive_and_play(bind_addr: &str, duration_secs: u64) -> Result<(), Strin
         let sample_count = parsed.samples_per_channel as usize * parsed.channel_count as usize;
         let payload = &buf[parsed.payload_offset..parsed.payload_offset + sample_count * 4];
 
+        let input = payload
+            .chunks_exact(4)
+            .map(|chunk| f32::from_le_bytes(chunk.try_into().unwrap()))
+            .collect::<Vec<_>>();
+        let converted = resample_interleaved_linear(
+            &input,
+            channel_count as usize,
+            sample_rate,
+            output_sample_rate,
+        );
         let mut jitter_buf = buffer.lock().unwrap();
-        for chunk in payload.chunks_exact(4) {
-            jitter_buf.push_back(f32::from_le_bytes(chunk.try_into().unwrap()));
-        }
+        jitter_buf.extend(converted);
 
         // Cap buffer growth at ~200ms in case playback ever falls behind.
-        let max_samples = ((sample_rate as f64 * 0.2) as usize) * channel_count as usize;
+        let max_samples = ((output_sample_rate as f64 * 0.2) as usize)
+            * channel_count as usize;
         while jitter_buf.len() > max_samples {
             jitter_buf.pop_front();
         }

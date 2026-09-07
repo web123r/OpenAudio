@@ -18,6 +18,7 @@ struct AsioSubscribeSession {
     selected_node_id: Option<String>,
     selected_driver: Option<String>,
     incoming_channel_count: usize,
+    channel_labels: Vec<String>,
     driver_output_count: usize,
     output_routes: Vec<Option<usize>>,
     bind_port: String,
@@ -34,6 +35,7 @@ struct DiscoveredStream {
     stream_name: String,
     stream_id: u32,
     channel_count: usize,
+    channel_labels: Vec<String>,
     ip: String,
     control_port: u16,
 }
@@ -274,6 +276,7 @@ impl AsioSubscribePanel {
             selected_node_id: None,
             selected_driver: None,
             incoming_channel_count: 0,
+            channel_labels: Vec::new(),
             driver_output_count: 0,
             output_routes: Vec::new(),
             bind_port: (7050u64.saturating_add(id)).to_string(),
@@ -325,6 +328,7 @@ fn render_stream_selector(
 
             if is_selected && !was_selected {
                 session.incoming_channel_count = stream.channel_count;
+                session.channel_labels = stream.channel_labels.clone();
                 session.output_routes =
                     default_routes(stream.channel_count, session.driver_output_count);
             }
@@ -488,7 +492,9 @@ fn render_routing_grid(ui: &mut egui::Ui, session: &mut AsioSubscribeSession, is
 
             for incoming_index in 0..session.incoming_channel_count {
                 ui.label(
-                    egui::RichText::new(format!("Channel {}", incoming_index + 1))
+                    egui::RichText::new(
+                        session_channel_label(session, incoming_index),
+                    )
                         .color(egui::Color32::WHITE),
                 );
 
@@ -545,6 +551,14 @@ fn render_routing_grid(ui: &mut egui::Ui, session: &mut AsioSubscribeSession, is
             egui::Color32::from_rgb(255, 69, 58)
         }),
     );
+}
+
+fn session_channel_label(session: &AsioSubscribeSession, channel_index: usize) -> String {
+    session
+        .channel_labels
+        .get(channel_index)
+        .cloned()
+        .unwrap_or_else(|| format!("Channel {}", channel_index + 1))
 }
 
 fn validate_session(
@@ -660,9 +674,15 @@ fn start_session(
         return;
     }
 
+    if let Err(error) = crate::reserve_asio_device(&driver_name) {
+        set_error(error_banner, &error);
+        return;
+    }
+
     if let Err(error) =
         audio_core::send_subscribe_request(&stream.ip, stream.control_port, stream.stream_id, port)
     {
+        crate::release_asio_device(&driver_name);
         set_error(
             error_banner,
             &format!("Failed to subscribe to the publisher: {error}"),
@@ -692,6 +712,32 @@ fn start_session(
 
     running.store(true, Ordering::Relaxed);
 
+    let reconnect_running = running.clone();
+    let reconnect_ip = stream.ip.clone();
+    let reconnect_control_port = stream.control_port;
+    let reconnect_stream_id = stream.stream_id;
+    thread::spawn(move || {
+        while reconnect_running.load(Ordering::Acquire) {
+            if let Err(error) = audio_core::send_subscribe_request(
+                &reconnect_ip,
+                reconnect_control_port,
+                reconnect_stream_id,
+                port,
+            ) {
+                eprintln!(
+                    "audio-core: ASIO subscription renewal failed: {error}"
+                );
+            }
+
+            for _ in 0..10 {
+                if !reconnect_running.load(Ordering::Acquire) {
+                    return;
+                }
+                thread::sleep(Duration::from_millis(100));
+            }
+        }
+    });
+
     set_status(
         session,
         &format!("Starting '{}' → '{}'...", stream.stream_name, driver_name),
@@ -700,7 +746,7 @@ fn start_session(
     thread::spawn(move || {
         let result = audio_core::receive_and_play_asio(
             &bind_addr,
-            driver_name,
+            driver_name.clone(),
             output_routes,
             record_path,
             worker_running.clone(),
@@ -721,6 +767,7 @@ fn start_session(
             }
         }
 
+        crate::release_asio_device(&driver_name);
         worker_running.store(false, Ordering::Relaxed);
     });
 }
@@ -737,6 +784,7 @@ fn snapshot_discovered_streams(
                 stream_name: node.stream_name.clone(),
                 stream_id: node.stream_id,
                 channel_count: node.channel_count as usize,
+                channel_labels: node.channel_labels.clone(),
                 ip: node.ip.clone(),
                 control_port: node.control_port,
             })
@@ -750,6 +798,7 @@ fn snapshot_discovered_streams(
                 stream_name: node.stream_name.clone(),
                 stream_id: node.stream_id,
                 channel_count: node.channel_count as usize,
+                channel_labels: node.channel_labels.clone(),
                 ip: node.ip.clone(),
                 control_port: node.control_port,
             })

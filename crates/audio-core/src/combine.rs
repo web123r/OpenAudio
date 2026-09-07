@@ -1,5 +1,6 @@
-use crate::devices::{get_input_device, get_output_device, is_skip};
-use crate::discovery::{start_advertising, SubscriberRegistry};
+use crate::backend::get_backend;
+use crate::devices::is_skip;
+use crate::discovery::SubscriberRegistry;
 use crate::ensure_realtime_audio_thread;
 use crate::protocol::{
     sample_rate_to_code, AudioPayloadHeader, PacketHeader, SAMPLE_FORMAT_FLOAT32,
@@ -10,7 +11,6 @@ use crate::recording::{
 };
 use crate::util::safe_lock;
 use crate::{register_scoped_signal_meter, SignalDirection};
-use cpal::traits::{DeviceTrait, StreamTrait};
 use std::collections::VecDeque;
 use std::net::UdpSocket;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
@@ -27,7 +27,7 @@ pub struct ChannelSource {
 
 struct OpenedChannel {
     buffer: Arc<Mutex<VecDeque<f32>>>,
-    _stream: cpal::Stream,
+    _stream: Box<dyn crate::backend::AudioStream>,
     sample_rate: u32,
     label: String,
     writer: Option<SharedWavWriter>,
@@ -51,6 +51,28 @@ pub fn capture_and_combine_with_discovery(
     record_each_channel: bool,
     keep_running: Arc<AtomicBool>,
 ) -> Result<(), String> {
+    capture_and_combine_with_labels(
+        node_name,
+        stream_name,
+        stream_id,
+        sources,
+        subscribers_by_stream,
+        record_each_channel,
+        None,
+        keep_running,
+    )
+}
+
+pub fn capture_and_combine_with_labels(
+    node_name: String,
+    stream_name: String,
+    stream_id: u32,
+    sources: Vec<ChannelSource>,
+    subscribers_by_stream: SubscriberRegistry,
+    record_each_channel: bool,
+    channel_labels: Option<Vec<String>>,
+    keep_running: Arc<AtomicBool>,
+) -> Result<(), String> {
     ensure_realtime_audio_thread();
 
     let channel_count = sources.len();
@@ -64,6 +86,7 @@ pub fn capture_and_combine_with_discovery(
     }
 
     let mut slots = Vec::<ChannelSlot>::with_capacity(channel_count);
+    let backend = get_backend();
 
     for (channel_index, source) in sources.iter().enumerate() {
         if is_skip(&source.device_name) {
@@ -87,51 +110,16 @@ pub fn capture_and_combine_with_discovery(
             label_base
         };
 
-        let (device, input_channels, sample_rate, stream_config): (
-            cpal::Device,
-            usize,
-            u32,
-            cpal::StreamConfig,
-        ) = if source.is_loopback {
-            let device = get_output_device(source.device_name.as_deref()).map_err(|error| {
-                format!(
-                    "channel {channel_index} ('{label}'): \
-                     {error}"
-                )
+        let (device_label, input_channels, sample_rate) = if source.is_loopback {
+            let (lbl, config) = backend.get_loopback_config(source.device_name.as_deref()).map_err(|error| {
+                format!("channel {channel_index} ('{label}'): {error}")
             })?;
-
-            let config = device.default_output_config().map_err(|error| {
-                format!(
-                    "channel {channel_index} \
-                         ('{label}'): failed to get output \
-                         config: {error}"
-                )
-            })?;
-
-            let input_channels = config.channels() as usize;
-            let sample_rate = config.sample_rate().0;
-
-            (device, input_channels, sample_rate, config.into())
+            (lbl, config.channels as usize, config.sample_rate)
         } else {
-            let device = get_input_device(source.device_name.as_deref()).map_err(|error| {
-                format!(
-                    "channel {channel_index} ('{label}'): \
-                     {error}"
-                )
+            let (lbl, config) = backend.get_input_config(source.device_name.as_deref()).map_err(|error| {
+                format!("channel {channel_index} ('{label}'): {error}")
             })?;
-
-            let config = device.default_input_config().map_err(|error| {
-                format!(
-                    "channel {channel_index} \
-                         ('{label}'): failed to get input \
-                         config: {error}"
-                )
-            })?;
-
-            let input_channels = config.channels() as usize;
-            let sample_rate = config.sample_rate().0;
-
-            (device, input_channels, sample_rate, config.into())
+            (lbl, config.channels as usize, config.sample_rate)
         };
 
         if input_channels == 0 {
@@ -153,19 +141,11 @@ pub fn capture_and_combine_with_discovery(
 
         let buffer_for_callback = buffer.clone();
         let writer_for_callback = writer.clone();
-        let error_channel_label = label.clone();
 
-        let error_callback = move |error| {
-            eprintln!(
-                "audio-core: combine capture error \
-                 ({error_channel_label}): {error}"
-            );
-        };
-
-        let stream = device
-            .build_input_stream(
-                &stream_config,
-                move |data: &[f32], _| {
+        let stream = if source.is_loopback {
+            backend.build_loopback_stream(
+                source.device_name.as_deref(),
+                Box::new(move |data: &[f32]| {
                     ensure_realtime_audio_thread();
 
                     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -179,23 +159,36 @@ pub fn capture_and_combine_with_discovery(
 
                     if result.is_err() {
                         eprintln!(
-                            "audio-core: panic caught in \
-                             combine capture callback — \
-                             dropping this cycle"
+                            "audio-core: panic caught in combine \
+                             loopback callback"
                         );
                     }
-                },
-                error_callback,
-                None,
+                }),
             )
-            .map_err(|error| {
-                format!(
-                    "channel {channel_index} ('{label}'): \
-                     failed to build input stream \
-                     (loopback devices must support WASAPI \
-                     loopback): {error}"
-                )
-            })?;
+        } else {
+            backend.build_input_stream(
+                source.device_name.as_deref(),
+                Box::new(move |data: &[f32]| {
+                    ensure_realtime_audio_thread();
+
+                    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        capture_first_channel(
+                            data,
+                            input_channels,
+                            &buffer_for_callback,
+                            writer_for_callback.as_ref(),
+                        );
+                    }));
+
+                    if result.is_err() {
+                        eprintln!(
+                            "audio-core: panic caught in combine \
+                             input callback"
+                        );
+                    }
+                }),
+            )
+        }.map_err(|error| format!("channel {channel_index} ('{label}'): failed to build stream: {error}"))?;
 
         stream.play().map_err(|error| {
             format!(
@@ -259,13 +252,19 @@ pub fn capture_and_combine_with_discovery(
 
     let advertising_keep_running = keep_running.clone();
     let advertised_channel_count = channel_count as u8;
+    let labels = channel_labels.unwrap_or_else(|| {
+        (0..channel_count)
+            .map(|index| format!("Channel {}", index + 1))
+            .collect()
+    });
 
     std::thread::spawn(move || {
-        if let Err(error) = start_advertising(
+        if let Err(error) = crate::discovery::start_advertising_with_labels(
             node_name,
             stream_id,
             stream_name,
             advertised_channel_count,
+            labels,
             advertising_keep_running,
         ) {
             eprintln!("audio-core: advertising stopped: {error}");

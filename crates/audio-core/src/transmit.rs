@@ -1,4 +1,5 @@
-use crate::devices::{get_input_device, get_output_device, is_skip};
+use crate::backend::get_backend;
+use crate::devices::is_skip;
 use crate::discovery::{start_advertising, SubscriberRegistry};
 use crate::ensure_realtime_audio_thread;
 use crate::protocol::{
@@ -9,7 +10,6 @@ use crate::recording::{
 };
 use crate::util::safe_lock;
 use crate::{register_scoped_signal_meter, SignalDirection};
-use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use std::net::{ToSocketAddrs, UdpSocket};
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::Arc;
@@ -31,22 +31,11 @@ pub fn transmit_multi(
     dest_addrs: &[&str],
     stream_id: u32,
 ) -> Result<(), String> {
-    let host = cpal::default_host();
+    let backend = get_backend();
+    let (device_label, config) = backend.get_input_config(None)?;
 
-    let device = host
-        .default_input_device()
-        .ok_or_else(|| "no default input device found".to_string())?;
-
-    let device_label = device
-        .name()
-        .unwrap_or_else(|_| "Default Input".to_string());
-
-    let config = device
-        .default_input_config()
-        .map_err(|error| format!("failed to get default input config: {error}"))?;
-
-    let channels = config.channels();
-    let sample_rate = config.sample_rate().0;
+    let channels = config.channels;
+    let sample_rate = config.sample_rate;
     let rate_code = sample_rate_to_code(sample_rate);
 
     if rate_code == 0 {
@@ -81,72 +70,62 @@ pub fn transmit_multi(
     let signal_meter_for_callback = signal_meter.clone();
     let start = Instant::now();
 
-    let stream_config: cpal::StreamConfig = config.into();
+    let stream = backend.build_input_stream(
+        None,
+        Box::new(move |data: &[f32]| {
+            signal_meter_for_callback.observe_interleaved(data, channels as usize);
 
-    let err_fn = |error| {
-        eprintln!("audio-core: input stream error: {error}");
-    };
+            let frame_count = data.len() / channels as usize;
+            let mut frame_offset = 0usize;
 
-    let stream = device
-        .build_input_stream(
-            &stream_config,
-            move |data: &[f32], _| {
-                signal_meter_for_callback.observe_interleaved(data, channels as usize);
+            while frame_offset < frame_count {
+                let frames_this_packet =
+                    (frame_count - frame_offset).min(MAX_FRAMES_PER_PACKET);
 
-                let frame_count = data.len() / channels as usize;
-                let mut frame_offset = 0usize;
+                let sequence_number = sequence_clone.fetch_add(1, Ordering::Relaxed);
 
-                while frame_offset < frame_count {
-                    let frames_this_packet =
-                        (frame_count - frame_offset).min(MAX_FRAMES_PER_PACKET);
+                let timestamp_ns = start.elapsed().as_nanos() as u64;
 
-                    let sequence_number = sequence_clone.fetch_add(1, Ordering::Relaxed);
+                let header = PacketHeader {
+                    sub_stream_index: 0,
+                    stream_id,
+                    sequence_number,
+                    presentation_timestamp_ns: timestamp_ns,
+                };
 
-                    let timestamp_ns = start.elapsed().as_nanos() as u64;
+                let payload_header = AudioPayloadHeader {
+                    channel_count: channels as u8,
+                    sample_format: SAMPLE_FORMAT_FLOAT32,
+                    sample_rate_code: rate_code,
+                    samples_per_channel: frames_this_packet as u16,
+                };
 
-                    let header = PacketHeader {
-                        sub_stream_index: 0,
-                        stream_id,
-                        sequence_number,
-                        presentation_timestamp_ns: timestamp_ns,
-                    };
+                let mut packet =
+                    Vec::with_capacity(24 + 8 + frames_this_packet * channels as usize * 4);
 
-                    let payload_header = AudioPayloadHeader {
-                        channel_count: channels as u8,
-                        sample_format: SAMPLE_FORMAT_FLOAT32,
-                        sample_rate_code: rate_code,
-                        samples_per_channel: frames_this_packet as u16,
-                    };
+                packet.extend_from_slice(&header.to_bytes());
+                packet.extend_from_slice(&payload_header.to_bytes());
 
-                    let mut packet =
-                        Vec::with_capacity(24 + 8 + frames_this_packet * channels as usize * 4);
+                let sample_start = frame_offset * channels as usize;
+                let sample_end = (frame_offset + frames_this_packet) * channels as usize;
 
-                    packet.extend_from_slice(&header.to_bytes());
-                    packet.extend_from_slice(&payload_header.to_bytes());
-
-                    let sample_start = frame_offset * channels as usize;
-                    let sample_end = (frame_offset + frames_this_packet) * channels as usize;
-
-                    for &sample in &data[sample_start..sample_end] {
-                        packet.extend_from_slice(&sample.to_le_bytes());
-                    }
-
-                    for address in &resolved_addrs {
-                        if let Err(error) = socket.send_to(&packet, address) {
-                            eprintln!(
-                                "audio-core: send to \
-                                 {address} failed: {error}"
-                            );
-                        }
-                    }
-
-                    frame_offset += frames_this_packet;
+                for &sample in &data[sample_start..sample_end] {
+                    packet.extend_from_slice(&sample.to_le_bytes());
                 }
-            },
-            err_fn,
-            None,
-        )
-        .map_err(|error| format!("failed to build input stream: {error}"))?;
+
+                for address in &resolved_addrs {
+                    if let Err(error) = socket.send_to(&packet, address) {
+                        eprintln!(
+                            "audio-core: send to \
+                             {address} failed: {error}"
+                        );
+                    }
+                }
+
+                frame_offset += frames_this_packet;
+            }
+        }),
+    )?;
 
     stream
         .play()
@@ -176,20 +155,11 @@ pub fn transmit_with_control(
     device_name: Option<String>,
     keep_running: Arc<AtomicBool>,
 ) -> Result<(), String> {
-    let device = get_input_device(device_name.as_deref())?;
+    let backend = get_backend();
+    let (device_label, config) = backend.get_input_config(device_name.as_deref())?;
 
-    let device_label = device.name().unwrap_or_else(|_| {
-        device_name
-            .clone()
-            .unwrap_or_else(|| "System Default Input".to_string())
-    });
-
-    let config = device
-        .default_input_config()
-        .map_err(|error| format!("failed to get default input config: {error}"))?;
-
-    let channels = config.channels();
-    let sample_rate = config.sample_rate().0;
+    let channels = config.channels;
+    let sample_rate = config.sample_rate;
     let rate_code = sample_rate_to_code(sample_rate);
 
     if rate_code == 0 {
@@ -221,17 +191,405 @@ pub fn transmit_with_control(
     let signal_meter_for_callback = signal_meter.clone();
     let start = Instant::now();
 
-    let stream_config: cpal::StreamConfig = config.into();
+    let stream = backend.build_input_stream(
+        device_name.as_deref(),
+        Box::new(move |data: &[f32]| {
+            signal_meter_for_callback.observe_interleaved(data, channels as usize);
 
-    let err_fn = |error| {
-        eprintln!("audio-core: input stream error: {error}");
+            let frame_count = data.len() / channels as usize;
+            let mut frame_offset = 0usize;
+
+            while frame_offset < frame_count {
+                let frames_this_packet =
+                    (frame_count - frame_offset).min(MAX_FRAMES_PER_PACKET);
+
+                let sequence_number = sequence_clone.fetch_add(1, Ordering::Relaxed);
+
+                let timestamp_ns = start.elapsed().as_nanos() as u64;
+
+                let header = PacketHeader {
+                    sub_stream_index: 0,
+                    stream_id,
+                    sequence_number,
+                    presentation_timestamp_ns: timestamp_ns,
+                };
+
+                let payload_header = AudioPayloadHeader {
+                    channel_count: channels as u8,
+                    sample_format: SAMPLE_FORMAT_FLOAT32,
+                    sample_rate_code: rate_code,
+                    samples_per_channel: frames_this_packet as u16,
+                };
+
+                let mut packet =
+                    Vec::with_capacity(24 + 8 + frames_this_packet * channels as usize * 4);
+
+                packet.extend_from_slice(&header.to_bytes());
+                packet.extend_from_slice(&payload_header.to_bytes());
+
+                let sample_start = frame_offset * channels as usize;
+                let sample_end = (frame_offset + frames_this_packet) * channels as usize;
+
+                for &sample in &data[sample_start..sample_end] {
+                    packet.extend_from_slice(&sample.to_le_bytes());
+                }
+
+                if let Err(error) = socket.send(&packet) {
+                    eprintln!("audio-core: send failed: {error}");
+                }
+
+                frame_offset += frames_this_packet;
+            }
+        }),
+    )?;
+
+    stream
+        .play()
+        .map_err(|error| format!("failed to start stream: {error}"))?;
+
+    while keep_running.load(Ordering::Relaxed) {
+        std::thread::sleep(Duration::from_millis(100));
+    }
+
+    drop(stream);
+    Ok(())
+}
+
+pub fn transmit_with_discovery(
+    node_name: String,
+    stream_name: String,
+    stream_id: u32,
+    device_name: Option<String>,
+    subscribers_by_stream: SubscriberRegistry,
+    record_path: Option<String>,
+    keep_running: Arc<AtomicBool>,
+) -> Result<(), String> {
+    transmit_with_discovery_labeled(
+        node_name,
+        stream_name,
+        stream_id,
+        device_name,
+        subscribers_by_stream,
+        record_path,
+        None,
+        keep_running,
+    )
+}
+
+pub fn transmit_with_discovery_labeled(
+    node_name: String,
+    stream_name: String,
+    stream_id: u32,
+    device_name: Option<String>,
+    subscribers_by_stream: SubscriberRegistry,
+    record_path: Option<String>,
+    channel_labels: Option<Vec<String>>,
+    keep_running: Arc<AtomicBool>,
+) -> Result<(), String> {
+    ensure_realtime_audio_thread();
+
+    if is_skip(&device_name) {
+        println!(
+            "Publish: input set to None — transmitting \
+             silence, no device opened"
+        );
+
+        return transmit_silence(
+            node_name,
+            stream_name,
+            stream_id,
+            subscribers_by_stream,
+            record_path,
+            keep_running,
+        );
+    }
+
+    let backend = get_backend();
+    let (device_label, config) = backend.get_input_config(device_name.as_deref())?;
+
+    let channels = config.channels;
+    let sample_rate = config.sample_rate;
+    let rate_code = sample_rate_to_code(sample_rate);
+
+    if rate_code == 0 {
+        return Err(format!("unsupported sample rate: {sample_rate}"));
+    }
+
+    let meter_label = format!("{node_name} — {stream_name} — {device_label}");
+
+    let (signal_meter, _signal_meter_guard) = register_scoped_signal_meter(
+        format!("wasapi-publish:{stream_id}"),
+        meter_label,
+        SignalDirection::Input,
+        channels as usize,
+    );
+
+    let writer: Option<SharedWavWriter> = match &record_path {
+        Some(path) => Some(create_wav_writer(path, channels, sample_rate)?),
+        None => None,
     };
 
-    let stream = device
-        .build_input_stream(
-            &stream_config,
-            move |data: &[f32], _| {
+    let advertise_keep_running = keep_running.clone();
+    let channels_u8 = channels as u8;
+
+    let labels = channel_labels.unwrap_or_else(|| {
+        (0..channels).map(|index| format!("Channel {}", index + 1)).collect()
+    });
+
+    std::thread::spawn(move || {
+        if let Err(error) = crate::discovery::start_advertising_with_labels(
+            node_name,
+            stream_id,
+            stream_name,
+            channels_u8,
+            labels,
+            advertise_keep_running,
+        ) {
+            eprintln!("audio-core: advertising stopped: {error}");
+        }
+    });
+
+    let socket =
+        UdpSocket::bind("0.0.0.0:0").map_err(|error| format!("failed to bind socket: {error}"))?;
+
+    let sequence = Arc::new(AtomicU32::new(0));
+    let sequence_clone = sequence.clone();
+    let start = Instant::now();
+
+    let writer_for_callback = writer.clone();
+    let signal_meter_for_callback = signal_meter.clone();
+    let stream = backend.build_input_stream(
+        device_name.as_deref(),
+        Box::new(move |data: &[f32]| {
+            ensure_realtime_audio_thread();
+
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                // Observe before subscriber lookup. The meter
+                // therefore works even when nobody subscribes.
                 signal_meter_for_callback.observe_interleaved(data, channels as usize);
+
+                if let Some(writer) = &writer_for_callback {
+                    write_samples(writer, data);
+                }
+
+                let destinations = {
+                    let map = safe_lock(&subscribers_by_stream);
+
+                    match map.get(&stream_id) {
+                        Some(list) if !list.is_empty() => list.clone(),
+                        _ => return,
+                    }
+                };
+
+                let frame_count = data.len() / channels as usize;
+                let mut frame_offset = 0usize;
+
+                while frame_offset < frame_count {
+                    let frames_this_packet =
+                        (frame_count - frame_offset).min(MAX_FRAMES_PER_PACKET);
+
+                    let sequence_number = sequence_clone.fetch_add(1, Ordering::Relaxed);
+
+                    let timestamp_ns = start.elapsed().as_nanos() as u64;
+
+                    let header = PacketHeader {
+                        sub_stream_index: 0,
+                        stream_id,
+                        sequence_number,
+                        presentation_timestamp_ns: timestamp_ns,
+                    };
+
+                    let payload_header = AudioPayloadHeader {
+                        channel_count: channels as u8,
+                        sample_format: SAMPLE_FORMAT_FLOAT32,
+                        sample_rate_code: rate_code,
+                        samples_per_channel: frames_this_packet as u16,
+                    };
+
+                    let mut packet =
+                        Vec::with_capacity(24 + 8 + frames_this_packet * channels as usize * 4);
+
+                    packet.extend_from_slice(&header.to_bytes());
+
+                    packet.extend_from_slice(&payload_header.to_bytes());
+
+                    let sample_start = frame_offset * channels as usize;
+
+                    let sample_end = (frame_offset + frames_this_packet) * channels as usize;
+
+                    for &sample in &data[sample_start..sample_end] {
+                        packet.extend_from_slice(&sample.to_le_bytes());
+                    }
+
+                    for address in &destinations {
+                        if let Err(error) = socket.send_to(&packet, address) {
+                            eprintln!(
+                                "audio-core: send to \
+                                     {address} failed: \
+                                     {error}"
+                            );
+                        }
+                    }
+
+                    frame_offset += frames_this_packet;
+                }
+            }));
+
+            if result.is_err() {
+                eprintln!(
+                    "audio-core: panic caught in transmit \
+                     callback — dropping this cycle's audio"
+                );
+            }
+        }),
+    )?;
+
+    stream
+        .play()
+        .map_err(|error| format!("failed to start stream: {error}"))?;
+
+    while keep_running.load(Ordering::Relaxed) {
+        std::thread::sleep(Duration::from_millis(100));
+    }
+
+    drop(stream);
+
+    if let Some(writer) = &writer {
+        finalize_recording(writer);
+    }
+
+    Ok(())
+}
+
+pub fn transmit_loopback_with_discovery(
+    node_name: String,
+    stream_name: String,
+    stream_id: u32,
+    device_name: Option<String>,
+    subscribers_by_stream: SubscriberRegistry,
+    record_path: Option<String>,
+    keep_running: Arc<AtomicBool>,
+) -> Result<(), String> {
+    transmit_loopback_with_discovery_labeled(
+        node_name,
+        stream_name,
+        stream_id,
+        device_name,
+        subscribers_by_stream,
+        record_path,
+        None,
+        keep_running,
+    )
+}
+
+pub fn transmit_loopback_with_discovery_labeled(
+    node_name: String,
+    stream_name: String,
+    stream_id: u32,
+    device_name: Option<String>,
+    subscribers_by_stream: SubscriberRegistry,
+    record_path: Option<String>,
+    channel_labels: Option<Vec<String>>,
+    keep_running: Arc<AtomicBool>,
+) -> Result<(), String> {
+    ensure_realtime_audio_thread();
+
+    if is_skip(&device_name) {
+        println!(
+            "Publish (loopback): output set to None — \
+             transmitting silence, no device opened"
+        );
+
+        return transmit_silence(
+            node_name,
+            stream_name,
+            stream_id,
+            subscribers_by_stream,
+            record_path,
+            keep_running,
+        );
+    }
+
+    let backend = get_backend();
+    let (device_label, config) = backend.get_loopback_config(device_name.as_deref())?;
+
+    let channels = config.channels;
+    let sample_rate = config.sample_rate;
+    let rate_code = sample_rate_to_code(sample_rate);
+
+    if rate_code == 0 {
+        return Err(format!("unsupported sample rate: {sample_rate}"));
+    }
+
+    let meter_label = format!(
+        "{node_name} — {stream_name} — \
+         {device_label} (loopback)"
+    );
+
+    let (signal_meter, _signal_meter_guard) = register_scoped_signal_meter(
+        format!("wasapi-loopback-publish:{stream_id}"),
+        meter_label,
+        SignalDirection::Input,
+        channels as usize,
+    );
+
+    let writer: Option<SharedWavWriter> = match &record_path {
+        Some(path) => Some(create_wav_writer(path, channels, sample_rate)?),
+        None => None,
+    };
+
+    let advertise_keep_running = keep_running.clone();
+    let channels_u8 = channels as u8;
+    let labels = channel_labels.unwrap_or_else(|| {
+        (0..channels)
+            .map(|index| format!("Channel {}", index + 1))
+            .collect()
+    });
+
+    std::thread::spawn(move || {
+        if let Err(error) = crate::discovery::start_advertising_with_labels(
+            node_name,
+            stream_id,
+            stream_name,
+            channels_u8,
+            labels,
+            advertise_keep_running,
+        ) {
+            eprintln!("audio-core: advertising stopped: {error}");
+        }
+    });
+
+    let socket =
+        UdpSocket::bind("0.0.0.0:0").map_err(|error| format!("failed to bind socket: {error}"))?;
+
+    let sequence = Arc::new(AtomicU32::new(0));
+    let sequence_clone = sequence.clone();
+    let start = Instant::now();
+
+    let writer_for_callback = writer.clone();
+    let signal_meter_for_callback = signal_meter.clone();
+
+    let stream = backend.build_loopback_stream(
+        device_name.as_deref(),
+        Box::new(move |data: &[f32]| {
+            ensure_realtime_audio_thread();
+
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                // Observe before subscriber lookup.
+                signal_meter_for_callback.observe_interleaved(data, channels as usize);
+
+                if let Some(writer) = &writer_for_callback {
+                    write_samples(writer, data);
+                }
+
+                let destinations = {
+                    let map = safe_lock(&subscribers_by_stream);
+
+                    match map.get(&stream_id) {
+                        Some(list) if !list.is_empty() => list.clone(),
+                        _ => return,
+                    }
+                };
 
                 let frame_count = data.len() / channels as usize;
                 let mut frame_offset = 0usize;
@@ -271,421 +629,35 @@ pub fn transmit_with_control(
                         packet.extend_from_slice(&sample.to_le_bytes());
                     }
 
-                    if let Err(error) = socket.send(&packet) {
-                        eprintln!("audio-core: send failed: {error}");
+                    for address in &destinations {
+                        if let Err(error) = socket.send_to(&packet, address) {
+                            eprintln!(
+                                "audio-core: send to \
+                                     {address} failed: \
+                                     {error}"
+                            );
+                        }
                     }
 
                     frame_offset += frames_this_packet;
                 }
-            },
-            err_fn,
-            None,
-        )
-        .map_err(|error| format!("failed to build input stream: {error}"))?;
+            }));
 
-    stream
-        .play()
-        .map_err(|error| format!("failed to start stream: {error}"))?;
-
-    while keep_running.load(Ordering::Relaxed) {
-        std::thread::sleep(Duration::from_millis(100));
-    }
-
-    drop(stream);
-    Ok(())
-}
-
-pub fn transmit_with_discovery(
-    node_name: String,
-    stream_name: String,
-    stream_id: u32,
-    device_name: Option<String>,
-    subscribers_by_stream: SubscriberRegistry,
-    record_path: Option<String>,
-    keep_running: Arc<AtomicBool>,
-) -> Result<(), String> {
-    ensure_realtime_audio_thread();
-
-    if is_skip(&device_name) {
-        println!(
-            "Publish: input set to None — transmitting \
-             silence, no device opened"
-        );
-
-        return transmit_silence(
-            node_name,
-            stream_name,
-            stream_id,
-            subscribers_by_stream,
-            record_path,
-            keep_running,
-        );
-    }
-
-    let device = get_input_device(device_name.as_deref())?;
-
-    let device_label = device.name().unwrap_or_else(|_| {
-        device_name
-            .clone()
-            .unwrap_or_else(|| "System Default Input".to_string())
-    });
-
-    let config = device
-        .default_input_config()
-        .map_err(|error| format!("failed to get default input config: {error}"))?;
-
-    let channels = config.channels();
-    let sample_rate = config.sample_rate().0;
-    let rate_code = sample_rate_to_code(sample_rate);
-
-    if rate_code == 0 {
-        return Err(format!("unsupported sample rate: {sample_rate}"));
-    }
-
-    let meter_label = format!("{node_name} — {stream_name} — {device_label}");
-
-    let (signal_meter, _signal_meter_guard) = register_scoped_signal_meter(
-        format!("wasapi-publish:{stream_id}"),
-        meter_label,
-        SignalDirection::Input,
-        channels as usize,
-    );
-
-    let writer: Option<SharedWavWriter> = match &record_path {
-        Some(path) => Some(create_wav_writer(path, channels, sample_rate)?),
-        None => None,
-    };
-
-    let advertise_keep_running = keep_running.clone();
-    let channels_u8 = channels as u8;
-
-    std::thread::spawn(move || {
-        if let Err(error) = start_advertising(
-            node_name,
-            stream_id,
-            stream_name,
-            channels_u8,
-            advertise_keep_running,
-        ) {
-            eprintln!("audio-core: advertising stopped: {error}");
-        }
-    });
-
-    let socket =
-        UdpSocket::bind("0.0.0.0:0").map_err(|error| format!("failed to bind socket: {error}"))?;
-
-    let sequence = Arc::new(AtomicU32::new(0));
-    let sequence_clone = sequence.clone();
-    let start = Instant::now();
-
-    let stream_config: cpal::StreamConfig = config.into();
-
-    let err_fn = |error| {
-        eprintln!("audio-core: input stream error: {error}");
-    };
-
-    let writer_for_callback = writer.clone();
-    let signal_meter_for_callback = signal_meter.clone();
-
-    let stream = device
-        .build_input_stream(
-            &stream_config,
-            move |data: &[f32], _| {
-                ensure_realtime_audio_thread();
-
-                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    // Observe before subscriber lookup. The meter
-                    // therefore works even when nobody subscribes.
-                    signal_meter_for_callback.observe_interleaved(data, channels as usize);
-
-                    if let Some(writer) = &writer_for_callback {
-                        write_samples(writer, data);
-                    }
-
-                    let destinations = {
-                        let map = safe_lock(&subscribers_by_stream);
-
-                        match map.get(&stream_id) {
-                            Some(list) if !list.is_empty() => list.clone(),
-                            _ => return,
-                        }
-                    };
-
-                    let frame_count = data.len() / channels as usize;
-                    let mut frame_offset = 0usize;
-
-                    while frame_offset < frame_count {
-                        let frames_this_packet =
-                            (frame_count - frame_offset).min(MAX_FRAMES_PER_PACKET);
-
-                        let sequence_number = sequence_clone.fetch_add(1, Ordering::Relaxed);
-
-                        let timestamp_ns = start.elapsed().as_nanos() as u64;
-
-                        let header = PacketHeader {
-                            sub_stream_index: 0,
-                            stream_id,
-                            sequence_number,
-                            presentation_timestamp_ns: timestamp_ns,
-                        };
-
-                        let payload_header = AudioPayloadHeader {
-                            channel_count: channels as u8,
-                            sample_format: SAMPLE_FORMAT_FLOAT32,
-                            sample_rate_code: rate_code,
-                            samples_per_channel: frames_this_packet as u16,
-                        };
-
-                        let mut packet =
-                            Vec::with_capacity(24 + 8 + frames_this_packet * channels as usize * 4);
-
-                        packet.extend_from_slice(&header.to_bytes());
-
-                        packet.extend_from_slice(&payload_header.to_bytes());
-
-                        let sample_start = frame_offset * channels as usize;
-
-                        let sample_end = (frame_offset + frames_this_packet) * channels as usize;
-
-                        for &sample in &data[sample_start..sample_end] {
-                            packet.extend_from_slice(&sample.to_le_bytes());
-                        }
-
-                        for address in &destinations {
-                            if let Err(error) = socket.send_to(&packet, address) {
-                                eprintln!(
-                                    "audio-core: send to \
-                                         {address} failed: \
-                                         {error}"
-                                );
-                            }
-                        }
-
-                        frame_offset += frames_this_packet;
-                    }
-                }));
-
-                if result.is_err() {
-                    eprintln!(
-                        "audio-core: panic caught in transmit \
-                         callback — dropping this cycle's audio"
-                    );
-                }
-            },
-            err_fn,
-            None,
-        )
-        .map_err(|error| format!("failed to build input stream: {error}"))?;
-
-    stream
-        .play()
-        .map_err(|error| format!("failed to start stream: {error}"))?;
-
-    while keep_running.load(Ordering::Relaxed) {
-        std::thread::sleep(Duration::from_millis(100));
-    }
-
-    drop(stream);
-
-    if let Some(writer) = &writer {
-        finalize_recording(writer);
-    }
-
-    Ok(())
-}
-
-pub fn transmit_loopback_with_discovery(
-    node_name: String,
-    stream_name: String,
-    stream_id: u32,
-    device_name: Option<String>,
-    subscribers_by_stream: SubscriberRegistry,
-    record_path: Option<String>,
-    keep_running: Arc<AtomicBool>,
-) -> Result<(), String> {
-    ensure_realtime_audio_thread();
-
-    if is_skip(&device_name) {
-        println!(
-            "Publish (loopback): output set to None — \
-             transmitting silence, no device opened"
-        );
-
-        return transmit_silence(
-            node_name,
-            stream_name,
-            stream_id,
-            subscribers_by_stream,
-            record_path,
-            keep_running,
-        );
-    }
-
-    let device = get_output_device(device_name.as_deref())?;
-
-    let device_label = device.name().unwrap_or_else(|_| {
-        device_name
-            .clone()
-            .unwrap_or_else(|| "System Default Output".to_string())
-    });
-
-    let config = device.default_output_config().map_err(|error| {
+            if result.is_err() {
+                eprintln!(
+                    "audio-core: panic caught in loopback \
+                     callback — dropping this cycle's audio"
+                );
+            }
+        }),
+    )
+    .map_err(|error| {
         format!(
-            "failed to get default output config for \
-                 loopback device: {error}"
+            "failed to build loopback input stream \
+             (device may not support WASAPI loopback): \
+             {error}"
         )
     })?;
-
-    let channels = config.channels();
-    let sample_rate = config.sample_rate().0;
-    let rate_code = sample_rate_to_code(sample_rate);
-
-    if rate_code == 0 {
-        return Err(format!("unsupported sample rate: {sample_rate}"));
-    }
-
-    let meter_label = format!(
-        "{node_name} — {stream_name} — \
-         {device_label} (loopback)"
-    );
-
-    let (signal_meter, _signal_meter_guard) = register_scoped_signal_meter(
-        format!("wasapi-loopback-publish:{stream_id}"),
-        meter_label,
-        SignalDirection::Input,
-        channels as usize,
-    );
-
-    let writer: Option<SharedWavWriter> = match &record_path {
-        Some(path) => Some(create_wav_writer(path, channels, sample_rate)?),
-        None => None,
-    };
-
-    let advertise_keep_running = keep_running.clone();
-    let channels_u8 = channels as u8;
-
-    std::thread::spawn(move || {
-        if let Err(error) = start_advertising(
-            node_name,
-            stream_id,
-            stream_name,
-            channels_u8,
-            advertise_keep_running,
-        ) {
-            eprintln!("audio-core: advertising stopped: {error}");
-        }
-    });
-
-    let socket =
-        UdpSocket::bind("0.0.0.0:0").map_err(|error| format!("failed to bind socket: {error}"))?;
-
-    let sequence = Arc::new(AtomicU32::new(0));
-    let sequence_clone = sequence.clone();
-    let start = Instant::now();
-
-    let stream_config: cpal::StreamConfig = config.into();
-
-    let err_fn = |error| {
-        eprintln!("audio-core: loopback stream error: {error}");
-    };
-
-    let writer_for_callback = writer.clone();
-    let signal_meter_for_callback = signal_meter.clone();
-
-    let stream = device
-        .build_input_stream(
-            &stream_config,
-            move |data: &[f32], _| {
-                ensure_realtime_audio_thread();
-
-                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    signal_meter_for_callback.observe_interleaved(data, channels as usize);
-
-                    if let Some(writer) = &writer_for_callback {
-                        write_samples(writer, data);
-                    }
-
-                    let destinations = {
-                        let map = safe_lock(&subscribers_by_stream);
-
-                        match map.get(&stream_id) {
-                            Some(list) if !list.is_empty() => list.clone(),
-                            _ => return,
-                        }
-                    };
-
-                    let frame_count = data.len() / channels as usize;
-                    let mut frame_offset = 0usize;
-
-                    while frame_offset < frame_count {
-                        let frames_this_packet =
-                            (frame_count - frame_offset).min(MAX_FRAMES_PER_PACKET);
-
-                        let sequence_number = sequence_clone.fetch_add(1, Ordering::Relaxed);
-
-                        let timestamp_ns = start.elapsed().as_nanos() as u64;
-
-                        let header = PacketHeader {
-                            sub_stream_index: 0,
-                            stream_id,
-                            sequence_number,
-                            presentation_timestamp_ns: timestamp_ns,
-                        };
-
-                        let payload_header = AudioPayloadHeader {
-                            channel_count: channels as u8,
-                            sample_format: SAMPLE_FORMAT_FLOAT32,
-                            sample_rate_code: rate_code,
-                            samples_per_channel: frames_this_packet as u16,
-                        };
-
-                        let mut packet =
-                            Vec::with_capacity(24 + 8 + frames_this_packet * channels as usize * 4);
-
-                        packet.extend_from_slice(&header.to_bytes());
-
-                        packet.extend_from_slice(&payload_header.to_bytes());
-
-                        let sample_start = frame_offset * channels as usize;
-
-                        let sample_end = (frame_offset + frames_this_packet) * channels as usize;
-
-                        for &sample in &data[sample_start..sample_end] {
-                            packet.extend_from_slice(&sample.to_le_bytes());
-                        }
-
-                        for address in &destinations {
-                            if let Err(error) = socket.send_to(&packet, address) {
-                                eprintln!(
-                                    "audio-core: send to \
-                                         {address} failed: \
-                                         {error}"
-                                );
-                            }
-                        }
-
-                        frame_offset += frames_this_packet;
-                    }
-                }));
-
-                if result.is_err() {
-                    eprintln!(
-                        "audio-core: panic caught in loopback \
-                         transmit callback — dropping this cycle's \
-                         audio"
-                    );
-                }
-            },
-            err_fn,
-            None,
-        )
-        .map_err(|error| {
-            format!(
-                "failed to build loopback input stream \
-                 (device may not support WASAPI loopback): \
-                 {error}"
-            )
-        })?;
 
     stream
         .play()

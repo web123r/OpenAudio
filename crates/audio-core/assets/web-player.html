@@ -678,6 +678,7 @@
   let usingWorklet = false;
 
   let totalChannels = 2;
+  let channelLabels = [];
   let sampleRate = 48000;
   let streamDisplayName = "";
 
@@ -1056,8 +1057,9 @@
   }
 
   // Original channel grid.
-  function buildChannelGrid(channelTotal) {
+  function buildChannelGrid(channelTotal, labels = []) {
     chGrid.innerHTML = "";
+    channelLabels = labels;
 
     activeChannels = new Set(
       Array.from(
@@ -1091,7 +1093,7 @@
         </span>
 
         <span class="ch-label">
-          ${channelTotal <= 2 ? side : pair + side}
+          ${channelLabels[index] || (channelTotal <= 2 ? side : pair + side)}
         </span>
       `;
 
@@ -1351,8 +1353,15 @@
         this.prebufferSamples = Math.floor(
           sampleRate * prebufferSeconds
         );
+        this.minimumPrebufferSamples = Math.floor(
+          sampleRate * 0.08
+        );
+        this.maximumPrebufferSamples = Math.floor(
+          sampleRate * 0.5
+        );
 
         this.underrunCount = 0;
+        this.lastReportedUnderruns = 0;
         this.statsCounter = 0;
 
         this.port.onmessage = event => {
@@ -1405,10 +1414,24 @@
         if (++this.statsCounter >= 20) {
           this.statsCounter = 0;
 
+          if (this.underrunCount > this.lastReportedUnderruns) {
+            this.prebufferSamples = Math.min(
+              this.maximumPrebufferSamples,
+              Math.floor(this.prebufferSamples * 1.15)
+            );
+          } else {
+            this.prebufferSamples = Math.max(
+              this.minimumPrebufferSamples,
+              Math.floor(this.prebufferSamples * 0.995)
+            );
+          }
+          this.lastReportedUnderruns = this.underrunCount;
+
           this.port.postMessage({
             type: "stats",
             available: this.available,
-            underruns: this.underrunCount
+            underruns: this.underrunCount,
+            target: this.prebufferSamples
           });
         }
 
@@ -1533,7 +1556,8 @@
               statsEl.textContent =
                 `Buffered: ${milliseconds}ms · ` +
                 `Underruns: ` +
-                `${event.data.underruns}`;
+                `${event.data.underruns} · ` +
+                `Target: ${(event.data.target / audioCtx.sampleRate * 1000).toFixed(0)}ms`;
             }
           };
 
@@ -1564,10 +1588,10 @@
     ringAvailable = 0;
     fallbackUnderruns = 0;
 
-    const prebuffer =
-      Math.floor(
-        audioCtx.sampleRate * 0.15
-      );
+    let prebuffer = Math.floor(
+      audioCtx.sampleRate * 0.15
+    );
+    let stableCallbacks = 0;
 
     let started = false;
 
@@ -1605,6 +1629,11 @@
 
         if (ringAvailable < needed) {
           fallbackUnderruns++;
+          prebuffer = Math.min(
+            audioCtx.sampleRate * 0.5,
+            Math.floor(prebuffer * 1.15)
+          );
+          stableCallbacks = 0;
           outputLeft.fill(0);
           outputRight.fill(0);
 
@@ -1612,6 +1641,15 @@
             ringAvailable >= prebuffer;
 
           return;
+        }
+
+        stableCallbacks++;
+        if (stableCallbacks >= 200) {
+          prebuffer = Math.max(
+            audioCtx.sampleRate * 0.08,
+            Math.floor(prebuffer * 0.995)
+          );
+          stableCallbacks = 0;
         }
 
         for (
@@ -1639,7 +1677,8 @@
             audioCtx.sampleRate *
             1000
           ).toFixed(0)}ms · ` +
-          `Underruns: ${fallbackUnderruns}`;
+          `Underruns: ${fallbackUnderruns} · ` +
+          `Target: ${(prebuffer / audioCtx.sampleRate * 1000).toFixed(0)}ms`;
       };
 
     processorNode.connect(
@@ -1817,6 +1856,10 @@
               totalChannels =
                 Number(message.channels);
 
+              channelLabels = Array.isArray(message.channelLabels)
+                ? message.channelLabels
+                : [];
+
               sampleRate =
                 Number(message.sampleRate);
 
@@ -1846,7 +1889,8 @@
               }
 
               buildChannelGrid(
-                totalChannels
+                totalChannels,
+                channelLabels
               );
 
               await setupPlaybackEngine();

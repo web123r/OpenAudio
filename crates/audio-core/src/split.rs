@@ -1,5 +1,6 @@
-use crate::devices::get_output_device;
+use crate::backend::get_backend;
 use crate::ensure_realtime_audio_thread;
+use crate::resample_interleaved_linear;
 use crate::protocol::parse_packet;
 use crate::recording::{
     create_wav_writer, finalize as finalize_recording, generate_record_path, write_samples,
@@ -7,7 +8,6 @@ use crate::recording::{
 };
 use crate::util::safe_lock;
 use crate::{register_scoped_signal_meter, SignalDirection};
-use cpal::traits::{DeviceTrait, StreamTrait};
 use std::collections::VecDeque;
 use std::net::UdpSocket;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -124,119 +124,84 @@ pub fn receive_and_split_to_devices(
         .map(|_| Arc::new(Mutex::new(VecDeque::new())))
         .collect();
 
-    demux_into_buffers(
-        &per_channel_buffers,
-        &writers,
-        &packet_buffer[..first_packet_length],
-        first_payload_offset,
-        channel_count,
-    );
-
     println!("Opening {channel_count} output device(s)...");
 
+    let backend = get_backend();
     let mut streams = Vec::with_capacity(channel_count);
+    let mut output_sample_rates = Vec::with_capacity(channel_count);
 
     for (channel_index, target) in device_targets.iter().enumerate() {
         let label = target
             .clone()
             .unwrap_or_else(|| "System Default".to_string());
 
-        let device = get_output_device(target.as_deref()).map_err(|error| {
-            format!(
-                "channel {channel_index} ('{label}'): \
-                 {error}"
-            )
+        let (_device_label, output_config) = backend.get_output_config(target.as_deref()).map_err(|error| {
+            format!("channel {channel_index} ('{label}'): {error}")
         })?;
 
-        let output_config = device.default_output_config().map_err(|error| {
-            format!(
-                "channel {channel_index} ('{label}'): \
-                     failed to get output config: {error}"
-            )
-        })?;
-
-        if output_config.sample_rate().0 != sample_rate {
-            return Err(format!(
-                "channel {channel_index} ('{label}'): device \
-                 sample rate {}Hz does not match incoming \
-                 stream's {sample_rate}Hz -- resampling is not \
-                 implemented yet",
-                output_config.sample_rate().0
-            ));
-        }
-
-        let output_channels = output_config.channels() as usize;
-
-        if output_channels == 0 {
-            return Err(format!(
-                "channel {channel_index} ('{label}'): output \
-                 device exposes zero channels"
-            ));
-        }
-
-        let stream_config: cpal::StreamConfig = output_config.into();
+        let output_channels = output_config.channels as usize;
+        let output_sample_rate = output_config.sample_rate;
+        output_sample_rates.push(output_sample_rate);
 
         let buffer_for_callback = per_channel_buffers[channel_index].clone();
 
         let signal_meter_for_callback = signal_meter.clone();
-
         let logical_meter_channel = channel_index;
-        let error_channel_label = label.clone();
 
-        let error_callback = move |error| {
-            eprintln!(
-                "audio-core: split output stream error \
-                 ({error_channel_label}): {error}"
-            );
-        };
+        let stream = backend.build_output_stream(
+            target.as_deref(),
+            Box::new(move |data: &mut [f32]| {
+                ensure_realtime_audio_thread();
 
-        let stream = device
-            .build_output_stream(
-                &stream_config,
-                move |data: &mut [f32], _| {
-                    ensure_realtime_audio_thread();
+                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    let mut buffer = safe_lock(&buffer_for_callback);
 
-                    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                        render_split_channel(data, output_channels, &buffer_for_callback);
-
-                        // The same mono source may be
-                        // duplicated across several physical
-                        // device channels. It is recorded as
-                        // one logical incoming channel.
-                        signal_meter_for_callback.observe_channel(logical_meter_channel, data);
-                    }));
-
-                    if result.is_err() {
-                        eprintln!(
-                            "audio-core: panic caught in split \
-                             output callback -- outputting silence \
-                             this cycle"
-                        );
-
-                        data.fill(0.0);
-
-                        signal_meter_for_callback.observe_channel(logical_meter_channel, data);
+                    // We ignore `output_channels` and output mono
+                    // (the same sample duplicated) across all channels
+                    // the device natively exposes.
+                    for frame in data.chunks_mut(output_channels) {
+                        let sample = buffer.pop_front().unwrap_or(0.0);
+                        for out_sample in frame {
+                            *out_sample = sample;
+                        }
                     }
-                },
-                error_callback,
-                None,
-            )
-            .map_err(|error| {
-                format!(
-                    "channel {channel_index} ('{label}'): \
-                     failed to build output stream: {error}"
-                )
-            })?;
 
-        stream.play().map_err(|error| {
+                    signal_meter_for_callback.observe_channel(logical_meter_channel, data);
+                }));
+
+                if result.is_err() {
+                    eprintln!(
+                        "audio-core: panic caught in split \
+                         callback — outputting silence this cycle"
+                    );
+                    data.fill(0.0);
+                    signal_meter_for_callback.observe_channel(logical_meter_channel, data);
+                }
+            }),
+        )
+        .map_err(|error| {
             format!(
                 "channel {channel_index} ('{label}'): \
-                 failed to start output stream: {error}"
+                 failed to build stream: {error}"
             )
         })?;
 
+        stream
+            .play()
+            .map_err(|error| format!("failed to start split stream: {error}"))?;
+
         streams.push(stream);
     }
+
+    demux_into_buffers(
+        &per_channel_buffers,
+        &writers,
+        &packet_buffer[..first_packet_length],
+        first_payload_offset,
+        channel_count,
+        sample_rate,
+        &output_sample_rates,
+    );
 
     println!("All {channel_count} channel(s) playing. Streaming...");
 
@@ -281,14 +246,16 @@ pub fn receive_and_split_to_devices(
             packet,
             parsed.payload_offset,
             channel_count,
+            sample_rate,
+            &output_sample_rates,
         );
 
         // Keep no more than 200ms per logical channel. Dropping the
         // oldest samples prevents network or device stalls from
         // creating unbounded latency.
-        let maximum_samples = ((sample_rate as f64 * 0.2) as usize).max(1);
-
-        for channel_buffer in &per_channel_buffers {
+        for (channel_index, channel_buffer) in per_channel_buffers.iter().enumerate() {
+            let maximum_samples = ((output_sample_rates[channel_index] as f64 * 0.2) as usize)
+                .max(1);
             let mut buffer = safe_lock(channel_buffer);
 
             while buffer.len() > maximum_samples {
@@ -358,10 +325,13 @@ fn demux_into_buffers(
     packet: &[u8],
     payload_offset: usize,
     channel_count: usize,
+    input_sample_rate: u32,
+    output_sample_rates: &[u32],
 ) {
     if channel_count == 0
         || per_channel_buffers.len() < channel_count
         || writers.len() < channel_count
+        || output_sample_rates.len() < channel_count
     {
         return;
     }
@@ -407,10 +377,17 @@ fn demux_into_buffers(
     }
 
     for channel_index in 0..channel_count {
+        let converted = resample_interleaved_linear(
+            &channel_samples[channel_index],
+            1,
+            input_sample_rate,
+            output_sample_rates[channel_index],
+        );
+
         {
             let mut destination = safe_lock(&per_channel_buffers[channel_index]);
 
-            destination.extend(channel_samples[channel_index].iter().copied());
+            destination.extend(converted.iter().copied());
         }
 
         if let Some(writer) = &writers[channel_index] {

@@ -1,5 +1,4 @@
 // At the top of combine.rs, transmit.rs, receive.rs, split.rs, web.rs, etc.
-use crate::ensure_realtime_audio_thread;
 use crate::protocol::parse_packet;
 use std::net::UdpSocket;
 use std::time::{Duration, Instant};

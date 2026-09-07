@@ -27,7 +27,8 @@ mod inner {
     };
     use crate::util::safe_lock;
     use crate::{
-        register_scoped_signal_meter, SignalDirection, SignalMeter, JITTER_BUFFER_TARGET_SECS,
+        register_scoped_signal_meter, AdaptiveJitterController, ClockSynchronizer,
+        resample_interleaved_linear, SignalDirection, SignalMeter,
     };
 
     use cpal::traits::{DeviceTrait, StreamTrait};
@@ -116,6 +117,10 @@ mod inner {
         let mut last_sequence = Some(first.sequence_number);
         let mut packets_received = 1u64;
         let mut packets_dropped = 0u64;
+        let mut jitter_controller = AdaptiveJitterController::new(sample_rate);
+        let receive_clock_start = Instant::now();
+        let mut clock_synchronizer = ClockSynchronizer::default();
+        let mut last_clock_adjustment = Instant::now();
 
         if incoming_channels == 0 {
             return Err("incoming OpenAudio stream reports zero channels".to_string());
@@ -142,6 +147,16 @@ mod inner {
             .map_err(|error| format!("ASIO driver '{driver_name}': {error}"))?;
 
         let output_channels = output_config.channels() as usize;
+        let output_sample_rate = output_config.sample_rate().0;
+
+        if output_sample_rate != sample_rate {
+            resample_buffer(
+                &audio_buffer,
+                incoming_channels,
+                sample_rate,
+                output_sample_rate,
+            );
+        }
 
         validate_routes(
             &output_routes,
@@ -165,7 +180,7 @@ mod inner {
             Some(path) => Some(create_wav_writer(
                 path,
                 output_channels as u16,
-                sample_rate,
+                output_sample_rate,
             )?),
             None => None,
         };
@@ -190,6 +205,8 @@ mod inner {
             subscribed_stream_id,
             incoming_channels,
             sample_rate,
+            output_sample_rate,
+            &jitter_controller,
             keep_running.clone(),
             &mut last_sequence,
             &mut packets_received,
@@ -236,10 +253,15 @@ mod inner {
             subscribed_stream_id,
             incoming_channels,
             sample_rate,
+            output_sample_rate,
             keep_running,
             &mut last_sequence,
             &mut packets_received,
             &mut packets_dropped,
+            &mut jitter_controller,
+            &mut clock_synchronizer,
+            receive_clock_start,
+            &mut last_clock_adjustment,
         );
 
         // Stop the callback before finalizing the recording writer.
@@ -307,7 +329,7 @@ mod inner {
                 continue;
             }
 
-            append_packet_samples(audio_buffer, packet, &parsed)?;
+            append_packet_samples(audio_buffer, packet, &parsed, parsed.sample_rate)?;
 
             return Ok(parsed);
         }
@@ -321,12 +343,14 @@ mod inner {
         stream_id: u32,
         incoming_channels: usize,
         sample_rate: u32,
+        output_sample_rate: u32,
+        jitter_controller: &AdaptiveJitterController,
         keep_running: Arc<AtomicBool>,
         last_sequence: &mut Option<u32>,
         packets_received: &mut u64,
         packets_dropped: &mut u64,
     ) -> Result<(), String> {
-        let target_frames = (sample_rate as f64 * JITTER_BUFFER_TARGET_SECS).ceil() as usize;
+        let target_frames = jitter_controller.target_frames();
 
         let target_samples = target_frames.saturating_mul(incoming_channels);
 
@@ -376,7 +400,12 @@ mod inner {
 
             update_sequence_statistics(parsed.sequence_number, last_sequence, packets_dropped);
 
-            append_packet_samples(audio_buffer, packet, &parsed)?;
+            append_packet_samples(
+                audio_buffer,
+                packet,
+                &parsed,
+                output_sample_rate,
+            )?;
 
             *packets_received = packets_received.saturating_add(1);
         }
@@ -399,14 +428,17 @@ mod inner {
         stream_id: u32,
         incoming_channels: usize,
         sample_rate: u32,
+        output_sample_rate: u32,
         keep_running: Arc<AtomicBool>,
         last_sequence: &mut Option<u32>,
         packets_received: &mut u64,
         packets_dropped: &mut u64,
+        jitter_controller: &mut AdaptiveJitterController,
+        clock_synchronizer: &mut ClockSynchronizer,
+        receive_clock_start: Instant,
+        last_clock_adjustment: &mut Instant,
     ) -> Result<(), String> {
         let max_buffered_frames = (sample_rate as f64 * MAX_BUFFER_SECS) as usize;
-
-        let max_buffered_samples = max_buffered_frames.saturating_mul(incoming_channels);
 
         while keep_running.load(Ordering::Relaxed) {
             let (length, _) = match socket.recv_from(udp_buffer) {
@@ -448,7 +480,7 @@ mod inner {
                      {}ch @ {}Hz",
                     stream_id,
                     incoming_channels,
-                    sample_rate,
+                    output_sample_rate,
                     parsed.channel_count,
                     parsed.sample_rate
                 );
@@ -458,11 +490,49 @@ mod inner {
 
             validate_packet_payload(packet, &parsed)?;
 
+            clock_synchronizer.observe(
+                parsed.presentation_timestamp_ns,
+                receive_clock_start.elapsed(),
+            );
+
             update_sequence_statistics(parsed.sequence_number, last_sequence, packets_dropped);
 
-            append_packet_samples(audio_buffer, packet, &parsed)?;
+            append_packet_samples(
+                audio_buffer,
+                packet,
+                &parsed,
+                output_sample_rate,
+            )?;
+
+            apply_clock_correction(
+                audio_buffer,
+                incoming_channels,
+                clock_synchronizer.correction_ppm(),
+                last_clock_adjustment,
+            );
 
             *packets_received = packets_received.saturating_add(1);
+
+            let buffered_frames = buffered_samples(audio_buffer) / incoming_channels.max(1);
+            let target_frames = jitter_controller.target_frames();
+            jitter_controller.observe(
+                buffered_frames,
+                buffered_frames < target_frames / 2,
+                buffered_frames > target_frames.saturating_mul(2),
+            );
+
+            let max_buffered_samples = max_buffered_frames
+                .min(jitter_controller.target_frames().saturating_mul(4))
+                .saturating_mul(incoming_channels);
+
+            if *packets_received % 500 == 0 {
+                println!(
+                    "ASIO Subscribe timing: target={:.1}ms, buffered={:.1}ms, clock correction={:.2}ppm",
+                    jitter_controller.target_duration().as_secs_f64() * 1_000.0,
+                    buffered_frames as f64 / sample_rate as f64 * 1_000.0,
+                    clock_synchronizer.correction_ppm(),
+                );
+            }
 
             let mut guard = safe_lock(audio_buffer);
 
@@ -525,17 +595,6 @@ mod inner {
                          not be read: {error}"
             )
         })?;
-
-        if default.sample_rate().0 != sample_rate {
-            return Err(format!(
-                "sample-rate mismatch: incoming stream is \
-                 {sample_rate}Hz, but the ASIO driver's \
-                 available/default output rate is {}Hz. \
-                 Set the ASIO driver and publisher to the \
-                 same rate.",
-                default.sample_rate().0
-            ));
-        }
 
         Ok(default)
     }
@@ -949,6 +1008,7 @@ mod inner {
         audio_buffer: &SharedAudioBuffer,
         packet: &[u8],
         parsed: &ParsedPacket,
+        output_sample_rate: u32,
     ) -> Result<(), String> {
         validate_packet_payload(packet, parsed)?;
 
@@ -969,15 +1029,63 @@ mod inner {
             .get(parsed.payload_offset..payload_end)
             .ok_or_else(|| "OpenAudio packet payload is truncated".to_string())?;
 
+        let samples = payload
+            .chunks_exact(4)
+            .map(|bytes| f32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
+            .collect::<Vec<_>>();
+        let samples = resample_interleaved_linear(
+            &samples,
+            parsed.channel_count as usize,
+            parsed.sample_rate,
+            output_sample_rate,
+        );
+
         let mut guard = safe_lock(audio_buffer);
-
-        guard.reserve(sample_count);
-
-        for bytes in payload.chunks_exact(4) {
-            guard.push_back(f32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]));
-        }
+        guard.reserve(samples.len());
+        guard.extend(samples);
 
         Ok(())
+    }
+
+    fn resample_buffer(
+        audio_buffer: &SharedAudioBuffer,
+        channels: usize,
+        input_rate: u32,
+        output_rate: u32,
+    ) {
+        let mut guard = safe_lock(audio_buffer);
+        let input = guard.drain(..).collect::<Vec<_>>();
+        let output = resample_interleaved_linear(&input, channels, input_rate, output_rate);
+        guard.extend(output);
+    }
+
+    fn apply_clock_correction(
+        audio_buffer: &SharedAudioBuffer,
+        channels: usize,
+        correction_ppm: f64,
+        last_adjustment: &mut Instant,
+    ) {
+        const CORRECTION_THRESHOLD_PPM: f64 = 200.0;
+        const ADJUSTMENT_INTERVAL: Duration = Duration::from_millis(250);
+
+        if channels == 0
+            || correction_ppm.abs() < CORRECTION_THRESHOLD_PPM
+            || last_adjustment.elapsed() < ADJUSTMENT_INTERVAL
+        {
+            return;
+        }
+
+        let mut buffer = safe_lock(audio_buffer);
+        if correction_ppm > 0.0 {
+            for _ in 0..channels {
+                buffer.pop_front();
+            }
+        } else if buffer.len() >= channels {
+            let frame = buffer.iter().take(channels).copied().collect::<Vec<_>>();
+            buffer.extend(frame);
+        }
+
+        *last_adjustment = Instant::now();
     }
 
     fn update_sequence_statistics(

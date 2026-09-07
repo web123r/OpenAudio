@@ -2,7 +2,9 @@
 resolver = "2"
 members = [
     "crates/audio-core",
+    "crates/network-core",
     "apps/sender",
+    "apps/receiver",
 ]
 
 # Future milestones will add:
