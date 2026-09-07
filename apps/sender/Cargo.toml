@@ -20,3 +20,6 @@ icon = ["icon.ico"]
 version = "0.1.0"
 copyright = "Copyright (c) OpenAudio"
 short_description = "Cross-platform Audio Over IP"
+
+[features]
+asio = ["audio-core/asio"]
