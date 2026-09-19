@@ -35,6 +35,14 @@ pub struct AudioPayloadHeader {
 pub const SAMPLE_FORMAT_FLOAT32: u8 = 0x03;
 pub const SAMPLE_RATE_48000: u16 = 0x01;
 pub const SAMPLE_RATE_44100: u16 = 0x02;
+pub const SAMPLE_RATE_88200: u16 = 0x03;
+pub const SAMPLE_RATE_96000: u16 = 0x04;
+pub const SAMPLE_RATE_176400: u16 = 0x05;
+pub const SAMPLE_RATE_192000: u16 = 0x06;
+pub const SAMPLE_RATE_8000: u16 = 0x07;
+pub const SAMPLE_RATE_16000: u16 = 0x08;
+pub const SAMPLE_RATE_24000: u16 = 0x09;
+pub const SAMPLE_RATE_32000: u16 = 0x0A;
 
 impl AudioPayloadHeader {
     pub fn to_bytes(&self) -> [u8; 8] {
@@ -51,6 +59,14 @@ pub fn sample_rate_to_code(rate: u32) -> u16 {
     match rate {
         48000 => SAMPLE_RATE_48000,
         44100 => SAMPLE_RATE_44100,
+        88200 => SAMPLE_RATE_88200,
+        96000 => SAMPLE_RATE_96000,
+        176400 => SAMPLE_RATE_176400,
+        192000 => SAMPLE_RATE_192000,
+        8000 => SAMPLE_RATE_8000,
+        16000 => SAMPLE_RATE_16000,
+        24000 => SAMPLE_RATE_24000,
+        32000 => SAMPLE_RATE_32000,
         _ => 0,
     }
 }
@@ -70,6 +86,14 @@ pub fn code_to_sample_rate(code: u16) -> u32 {
     match code {
         SAMPLE_RATE_48000 => 48000,
         SAMPLE_RATE_44100 => 44100,
+        SAMPLE_RATE_88200 => 88200,
+        SAMPLE_RATE_96000 => 96000,
+        SAMPLE_RATE_176400 => 176400,
+        SAMPLE_RATE_192000 => 192000,
+        SAMPLE_RATE_8000 => 8000,
+        SAMPLE_RATE_16000 => 16000,
+        SAMPLE_RATE_24000 => 24000,
+        SAMPLE_RATE_32000 => 32000,
         _ => 0,
     }
 }

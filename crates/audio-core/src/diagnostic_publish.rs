@@ -221,6 +221,7 @@ pub fn publish_diagnostic_stream_with_discovery(
             advertising_stream_id,
             advertising_stream_name,
             advertised_channels,
+            crate::discovery::CONTROL_PORT,
             advertising_flag,
         ) {
             eprintln!(

@@ -306,6 +306,7 @@ pub mod inner {
                 advertising_stream_name,
                 advertised_channels,
                 channel_labels,
+                crate::discovery::CONTROL_PORT,
                 advertising_flag,
             ) {
                 eprintln!(

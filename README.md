@@ -2,6 +2,12 @@
 
 A cross-platform, ultra-low latency, multi-channel audio over IP solution designed to seamlessly bridge realtime audio streams across Windows, macOS, and Linux without the complexity of traditional broadcast hardware.
 
+## Features
+- **Mobile Web Publishing:** Stream microphone audio directly from any smartphone or browser via high-performance WebSockets (`/publish`), without installing any apps.
+- **ASIO Routing Integration:** Seamlessly route incoming network streams (including browser-based streams) directly into professional ASIO audio hardware.
+- **Cross-Platform:** Native audio bridging across Windows (WASAPI/ASIO), macOS (CoreAudio), and Linux (ALSA/PulseAudio/PipeWire).
+- **Zero-Configuration Discovery:** Multicast-based automatic discovery of streams across your local network.
+
 ## Building and Compiling
 
 OpenAudio relies on native audio hardware access via `cpal` to provide minimal latency playback and capture.

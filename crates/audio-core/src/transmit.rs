@@ -343,6 +343,7 @@ pub fn transmit_with_discovery_labeled(
             stream_name,
             channels_u8,
             labels,
+            crate::discovery::CONTROL_PORT,
             advertise_keep_running,
         ) {
             eprintln!("audio-core: advertising stopped: {error}");
@@ -553,6 +554,7 @@ pub fn transmit_loopback_with_discovery_labeled(
             stream_name,
             channels_u8,
             labels,
+            crate::discovery::CONTROL_PORT,
             advertise_keep_running,
         ) {
             eprintln!("audio-core: advertising stopped: {error}");
@@ -719,8 +721,9 @@ fn transmit_silence(
         if let Err(error) = start_advertising(
             node_name,
             stream_id,
-            stream_name,
+            stream_name.clone(),
             channels_u8,
+            crate::discovery::CONTROL_PORT,
             advertise_keep_running,
         ) {
             eprintln!("audio-core: advertising stopped: {error}");

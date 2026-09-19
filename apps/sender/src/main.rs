@@ -21,6 +21,16 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant};
 
+fn hardware_api_name() -> &'static str {
+    if cfg!(target_os = "windows") {
+        "WASAPI"
+    } else if cfg!(target_os = "macos") {
+        "CoreAudio"
+    } else {
+        "Hardware"
+    }
+}
+
 static ASIO_DEVICE_LOCKS: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
 
 pub(crate) fn reserve_asio_device(driver_name: &str) -> Result<(), String> {
@@ -2860,7 +2870,7 @@ impl OpenAudioApp {
             ui.horizontal(|ui| {
                 ui.label(
                     egui::RichText::new(
-                        "WASAPI Publish Streams",
+                        format!("{} Publish Streams", hardware_api_name()),
                     )
                     .size(18.0)
                     .strong()
@@ -3460,7 +3470,10 @@ impl OpenAudioApp {
                 .add(
                     egui::Button::new(
                         egui::RichText::new(
-                            "+ Add WASAPI Publish Stream",
+                            format!(
+                                "+ Add {} Publish Stream",
+                                hardware_api_name()
+                            ),
                         )
                         .color(egui::Color32::WHITE),
                     )
@@ -4454,7 +4467,7 @@ impl OpenAudioApp {
             ui.horizontal(|ui| {
                 ui.label(
                     egui::RichText::new(
-                        "WASAPI Mixed Playback",
+                        format!("{} Mixed Playback", hardware_api_name()),
                     )
                     .size(18.0)
                     .strong()
@@ -5120,7 +5133,10 @@ impl OpenAudioApp {
                 .add(
                     egui::Button::new(
                         egui::RichText::new(
-                            "+ Add WASAPI Playback",
+                            format!(
+                                "+ Add {} Playback",
+                                hardware_api_name()
+                            ),
                         )
                         .color(egui::Color32::WHITE),
                     )

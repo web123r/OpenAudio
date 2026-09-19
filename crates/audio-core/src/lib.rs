@@ -37,6 +37,7 @@ mod stream_control;
 mod transmit;
 mod util;
 mod web_gateway;
+pub mod web_publish;
 mod web_stream;
 
 pub mod asio;

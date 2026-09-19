@@ -1,0 +1,178 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>OpenAudio Mobile Publisher</title>
+    <style>
+        :root {
+            --bg: #0f172a;
+            --surface: #1e293b;
+            --primary: #3b82f6;
+            --text: #f8fafc;
+            --danger: #ef4444;
+        }
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+            background-color: var(--bg);
+            color: var(--text);
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            height: 100vh;
+            margin: 0;
+        }
+        .container {
+            background-color: var(--surface);
+            padding: 2rem;
+            border-radius: 1rem;
+            box-shadow: 0 10px 15px -3px rgba(0, 0, 0, 0.5);
+            text-align: center;
+            width: 100%;
+            max-width: 400px;
+        }
+        h1 { margin-top: 0; }
+        input {
+            width: 100%;
+            padding: 0.75rem;
+            margin-bottom: 1rem;
+            border-radius: 0.5rem;
+            border: 1px solid #334155;
+            background: #0f172a;
+            color: white;
+            box-sizing: border-box;
+        }
+        button {
+            width: 100%;
+            padding: 1rem;
+            border-radius: 0.5rem;
+            border: none;
+            background-color: var(--primary);
+            color: white;
+            font-weight: bold;
+            cursor: pointer;
+            font-size: 1.1rem;
+        }
+        button:hover { opacity: 0.9; }
+        button.stop { background-color: var(--danger); }
+        .status { margin-top: 1rem; color: #94a3b8; font-size: 0.9rem; }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>🎙️ Go Live</h1>
+        <input type="text" id="streamName" placeholder="Enter stream name (e.g. My Phone)" value="Mobile Mic">
+        <button id="toggleBtn">Start Publishing</button>
+        <div class="status" id="statusText">Waiting to start...</div>
+    </div>
+
+    <script>
+        let isPublishing = false;
+        let ws = null;
+        let audioContext = null;
+        let mediaStream = null;
+        let processor = null;
+
+        const toggleBtn = document.getElementById('toggleBtn');
+        const statusText = document.getElementById('statusText');
+        const nameInput = document.getElementById('streamName');
+
+        toggleBtn.addEventListener('click', async () => {
+            if (isPublishing) {
+                stopPublishing();
+            } else {
+                startPublishing();
+            }
+        });
+
+        async function startPublishing() {
+            try {
+                mediaStream = await navigator.mediaDevices.getUserMedia({ audio: {
+                    echoCancellation: false,
+                    noiseSuppression: false,
+                    autoGainControl: false
+                } });
+                
+                audioContext = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: 48000 });
+                const source = audioContext.createMediaStreamSource(mediaStream);
+                
+                const sampleRate = audioContext.sampleRate;
+                const channels = source.channelCount || 1;
+
+                // Using ScriptProcessor for max mobile compatibility right now
+                processor = audioContext.createScriptProcessor(4096, channels, 1);
+                
+                const wsProtocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+                // Note: In OpenAudio, WebSocket usually runs on HTTP port + 1
+                const wsPort = parseInt(window.location.port) + 1;
+                ws = new WebSocket(`${wsProtocol}//${window.location.hostname}:${wsPort}/publish-ws`);
+                
+                ws.binaryType = "arraybuffer";
+
+                ws.onopen = () => {
+                    const handshake = {
+                        type: "publish",
+                        streamName: nameInput.value || "Mobile Mic",
+                        channels: channels,
+                        sampleRate: sampleRate
+                    };
+                    ws.send(JSON.stringify(handshake));
+                    statusText.innerText = `Live at ${sampleRate}Hz`;
+                    toggleBtn.innerText = "Stop Publishing";
+                    toggleBtn.className = "stop";
+                    isPublishing = true;
+                };
+
+                ws.onerror = (e) => {
+                    console.error("WS Error", e);
+                    statusText.innerText = "Connection Error";
+                    stopPublishing();
+                };
+
+                ws.onclose = () => {
+                    stopPublishing();
+                };
+
+                processor.onaudioprocess = (e) => {
+                    if (!isPublishing || ws.readyState !== WebSocket.OPEN) return;
+                    
+                    const inputBuffer = e.inputBuffer;
+                    const numChannels = inputBuffer.numberOfChannels;
+                    const length = inputBuffer.length;
+                    
+                    // Interleave channels
+                    const interleaved = new Float32Array(length * numChannels);
+                    
+                    for (let ch = 0; ch < numChannels; ch++) {
+                        const channelData = inputBuffer.getChannelData(ch);
+                        for (let i = 0; i < length; i++) {
+                            interleaved[i * numChannels + ch] = channelData[i];
+                        }
+                    }
+                    
+                    ws.send(interleaved.buffer);
+                };
+
+                source.connect(processor);
+                processor.connect(audioContext.destination); // Required by some browsers to fire events
+
+            } catch (err) {
+                console.error(err);
+                statusText.innerText = "Failed to access microphone. Did you grant permission?";
+            }
+        }
+
+        function stopPublishing() {
+            isPublishing = false;
+            if (processor) processor.disconnect();
+            if (audioContext) audioContext.close();
+            if (mediaStream) mediaStream.getTracks().forEach(t => t.stop());
+            if (ws) ws.close();
+            
+            toggleBtn.innerText = "Start Publishing";
+            toggleBtn.className = "";
+            statusText.innerText = "Stopped.";
+        }
+    </script>
+</body>
+</html>

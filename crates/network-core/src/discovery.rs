@@ -91,6 +91,7 @@ pub fn start_advertising(
     stream_id: u32,
     stream_name: String,
     channel_count: u8,
+    control_port: u16,
     keep_running: Arc<AtomicBool>,
 ) -> Result<(), String> {
     start_advertising_with_labels(
@@ -99,6 +100,7 @@ pub fn start_advertising(
         stream_name,
         channel_count,
         default_channel_labels(channel_count),
+        control_port,
         keep_running,
     )
 }
@@ -109,6 +111,7 @@ pub fn start_advertising_with_labels(
     stream_name: String,
     channel_count: u8,
     channel_labels: Vec<String>,
+    control_port: u16,
     keep_running: Arc<AtomicBool>,
 ) -> Result<(), String> {
     let dest: SocketAddr = format!("{DISCOVERY_MULTICAST_ADDR}:{DISCOVERY_PORT}")
@@ -121,7 +124,7 @@ pub fn start_advertising_with_labels(
         node_name,
         stream_id,
         stream_name,
-        control_port: CONTROL_PORT,
+        control_port,
         channel_count,
         channel_labels: normalize_channel_labels(channel_count, channel_labels),
     };

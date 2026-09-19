@@ -265,6 +265,7 @@ pub fn capture_and_combine_with_labels(
             stream_name,
             advertised_channel_count,
             labels,
+            crate::discovery::CONTROL_PORT,
             advertising_keep_running,
         ) {
             eprintln!("audio-core: advertising stopped: {error}");

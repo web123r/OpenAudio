@@ -30,6 +30,9 @@ use tungstenite::{accept_hdr, Message};
 const PLAYER_HTML: &str =
     include_str!("../assets/web-player.html");
 
+const PUBLISH_HTML: &str =
+    include_str!("../assets/web-publisher.html");
+
 const MAX_HTTP_REQUEST_BYTES: usize = 16 * 1024;
 const MAX_HTTP_HEADERS: usize = 64;
 const MAX_HTTP_PATH_BYTES: usize = 2048;
@@ -680,6 +683,16 @@ fn handle_http_request(
             )
         }
 
+        ("GET", "/publish") => {
+            write_http_response(
+                &mut stream,
+                "200 OK",
+                "text/html; charset=utf-8",
+                PUBLISH_HTML.as_bytes(),
+                &[],
+            )
+        }
+
         ("GET", "/favicon.ico") => {
             write_http_response(
                 &mut stream,
@@ -1284,13 +1297,15 @@ fn handle_ws_client(
         .map_err(|error| error.to_string())?;
 
     let auth_state = state.clone();
+    let mut request_path = String::new();
 
     let mut ws = accept_hdr(
         stream,
-        move |
+        |
             request: &WebSocketRequest,
             response: WebSocketResponse,
         | {
+            request_path = request.uri().path().to_string();
             let token = websocket_cookie(request);
 
             if auth_state
@@ -1309,6 +1324,10 @@ fn handle_ws_client(
             "WebSocket handshake failed: {error}"
         )
     })?;
+
+    if request_path == "/publish-ws" {
+        return crate::web_publish::handle_publish_ws(ws, global_keep_running);
+    }
 
     let node = wait_for_stream_selection(
         &mut ws,

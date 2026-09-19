@@ -1888,6 +1888,13 @@
                 );
               }
 
+              if (audioCtx && audioCtx.sampleRate !== sampleRate) {
+                audioCtx.close().catch(() => {});
+                const AudioContextClass = window.AudioContext || window.webkitAudioContext;
+                audioCtx = new AudioContextClass({ sampleRate });
+                await audioCtx.resume().catch(() => {});
+              }
+
               buildChannelGrid(
                 totalChannels,
                 channelLabels
