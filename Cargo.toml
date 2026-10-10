@@ -5,6 +5,7 @@ members = [
     "crates/network-core",
     "apps/sender",
     "apps/receiver",
+    "apps/plugin",
 ]
 
 # Future milestones will add:

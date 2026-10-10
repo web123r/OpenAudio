@@ -1,7 +1,11 @@
 [package]
-name = "OpenAudio"
+name = "openaudio-gui"
 version = "0.1.0"
 edition = "2021"
+
+[[bin]]
+name = "OpenAudio"
+path = "src/main.rs"
 
 [dependencies]
 audio-core = { path = "../../crates/audio-core" }

@@ -28,6 +28,7 @@ socket2 = { version = "0.5", features = ["all"] }
 if-addrs = "0.10"
 argon2 = "0.5"
 rand = "0.8"
+aes-gcm = "0.10"
 httparse = "1"
 
 

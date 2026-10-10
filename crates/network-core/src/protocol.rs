@@ -33,6 +33,9 @@ pub struct AudioPayloadHeader {
 }
 
 pub const SAMPLE_FORMAT_FLOAT32: u8 = 0x03;
+pub const SAMPLE_FORMAT_OPUS: u8 = 0x10;
+pub const SAMPLE_FORMAT_FLAC: u8 = 0x11;
+
 pub const SAMPLE_RATE_48000: u16 = 0x01;
 pub const SAMPLE_RATE_44100: u16 = 0x02;
 pub const SAMPLE_RATE_88200: u16 = 0x03;
@@ -77,6 +80,7 @@ pub struct ParsedPacket {
     pub sequence_number: u32,
     pub presentation_timestamp_ns: u64,
     pub channel_count: u8,
+    pub sample_format: u8,
     pub sample_rate: u32,
     pub samples_per_channel: u16,
     pub payload_offset: usize,
@@ -107,7 +111,8 @@ pub fn parse_packet(buf: &[u8]) -> Option<ParsedPacket> {
     let sequence_number = u32::from_be_bytes(buf[12..16].try_into().ok()?);
     let presentation_timestamp_ns = u64::from_be_bytes(buf[16..24].try_into().ok()?);
     let channel_count = buf[24];
-    if buf[25] != SAMPLE_FORMAT_FLOAT32 {
+    let sample_format = buf[25];
+    if sample_format != SAMPLE_FORMAT_FLOAT32 && sample_format != SAMPLE_FORMAT_OPUS && sample_format != SAMPLE_FORMAT_FLAC {
         return None;
     }
 
@@ -116,6 +121,7 @@ pub fn parse_packet(buf: &[u8]) -> Option<ParsedPacket> {
         sequence_number,
         presentation_timestamp_ns,
         channel_count,
+        sample_format,
         sample_rate: code_to_sample_rate(u16::from_be_bytes(buf[26..28].try_into().ok()?)),
         samples_per_channel: u16::from_be_bytes(buf[28..30].try_into().ok()?),
         payload_offset: 32,
@@ -209,5 +215,36 @@ mod tests {
         
         let parsed = parse_packet(&full_packet).unwrap();
         assert_eq!(parsed.payload_offset, 32);
+    }
+
+    #[test]
+    fn test_opus_flac_packet_headers() {
+        use super::{SAMPLE_FORMAT_FLAC, SAMPLE_FORMAT_OPUS};
+
+        for &fmt in &[SAMPLE_FORMAT_OPUS, SAMPLE_FORMAT_FLAC] {
+            let mut packet = Vec::from(
+                PacketHeader {
+                    sub_stream_index: 0,
+                    stream_id: 42,
+                    sequence_number: 100,
+                    presentation_timestamp_ns: 12345,
+                }
+                .to_bytes(),
+            );
+            packet.extend(
+                AudioPayloadHeader {
+                    channel_count: 2,
+                    sample_format: fmt,
+                    sample_rate_code: 1,
+                    samples_per_channel: 480,
+                }
+                .to_bytes(),
+            );
+            packet.extend([0u8; 64]);
+
+            let parsed = parse_packet(&packet).expect("valid opus/flac header");
+            assert_eq!(parsed.sample_format, fmt);
+            assert_eq!(parsed.stream_id, 42);
+        }
     }
 }

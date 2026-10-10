@@ -1,6 +1,6 @@
 use crate::discovery::send_subscribe_request;
 use crate::protocol::{parse_packet, ParsedPacket};
-use std::collections::VecDeque;
+use std::collections::{BTreeMap, VecDeque};
 use std::net::{Ipv4Addr, UdpSocket};
 use std::time::{Duration, Instant};
 
@@ -13,6 +13,89 @@ pub enum ReceiveEvent {
     Reconnected,
 }
 
+#[derive(Debug)]
+pub struct PacketReorderWindow {
+    capacity: usize,
+    next_expected_seq: Option<u32>,
+    buffer: BTreeMap<u32, (ParsedPacket, Vec<f32>)>,
+}
+
+impl PacketReorderWindow {
+    pub fn new(capacity: usize) -> Self {
+        Self {
+            capacity,
+            next_expected_seq: None,
+            buffer: BTreeMap::new(),
+        }
+    }
+
+    pub fn push(&mut self, packet: ParsedPacket, pcm: Vec<f32>) -> Vec<ReceiveEvent> {
+        let mut events = Vec::new();
+        let seq = packet.sequence_number;
+
+        let expected = match self.next_expected_seq {
+            Some(e) => e,
+            None => {
+                self.next_expected_seq = Some(seq.wrapping_add(1));
+                events.push(ReceiveEvent::Packet(packet, pcm));
+                return events;
+            }
+        };
+
+        if seq == expected {
+            self.next_expected_seq = Some(seq.wrapping_add(1));
+            events.push(ReceiveEvent::Packet(packet, pcm));
+
+            while let Some(next_exp) = self.next_expected_seq {
+                if let Some((next_pkt, next_pcm)) = self.buffer.remove(&next_exp) {
+                    self.next_expected_seq = Some(next_exp.wrapping_add(1));
+                    events.push(ReceiveEvent::Packet(next_pkt, next_pcm));
+                } else {
+                    break;
+                }
+            }
+        } else {
+            let diff = seq.wrapping_sub(expected);
+            if diff > 0x8000_0000 {
+                return events;
+            }
+
+            if diff > 1_000_000 {
+                self.buffer.clear();
+                self.next_expected_seq = Some(seq.wrapping_add(1));
+                events.push(ReceiveEvent::Packet(packet, pcm));
+                return events;
+            }
+
+            if diff > 2 {
+                events.push(ReceiveEvent::Dropped(diff));
+                self.next_expected_seq = Some(seq.wrapping_add(1));
+                events.push(ReceiveEvent::Packet(packet, pcm));
+                return events;
+            }
+
+            self.buffer.insert(seq, (packet, pcm));
+
+            while self.buffer.len() > self.capacity {
+                if let Some(&oldest_seq) = self.buffer.keys().next() {
+                    if let Some(curr_exp) = self.next_expected_seq {
+                        if oldest_seq > curr_exp {
+                            let dropped_count = oldest_seq.wrapping_sub(curr_exp);
+                            events.push(ReceiveEvent::Dropped(dropped_count));
+                        }
+                    }
+                    if let Some((pkt, pcm)) = self.buffer.remove(&oldest_seq) {
+                        self.next_expected_seq = Some(oldest_seq.wrapping_add(1));
+                        events.push(ReceiveEvent::Packet(pkt, pcm));
+                    }
+                }
+            }
+        }
+
+        events
+    }
+}
+
 pub struct StreamReceiver {
     socket: UdpSocket,
     publisher_ip: String,
@@ -20,7 +103,7 @@ pub struct StreamReceiver {
     stream_id: u32,
     my_receive_port: u16,
 
-    last_sequence: Option<u32>,
+    reorder_window: PacketReorderWindow,
     last_receive: Instant,
     current_format: Option<(u8, u32)>,
     is_connected: bool,
@@ -47,8 +130,8 @@ impl StreamReceiver {
             control_port,
             stream_id,
             my_receive_port,
-            last_sequence: None,
-            last_receive: Instant::now() - Duration::from_secs(10), // force immediate subscribe
+            reorder_window: PacketReorderWindow::new(32),
+            last_receive: Instant::now() - Duration::from_secs(10),
             current_format: None,
             is_connected: false,
             event_queue: VecDeque::new(),
@@ -116,22 +199,6 @@ impl StreamReceiver {
             });
         }
 
-        // Add packet reordering policy and gap detection
-        if let Some(prev) = self.last_sequence {
-            let expected = prev.wrapping_add(1);
-            if packet.sequence_number != expected {
-                let gap = packet.sequence_number.wrapping_sub(expected);
-                // If the gap is massive (e.g. > 2^31), it's likely a late packet or sender restart.
-                // To prevent locking up forever on restart, we will unconditionally accept the packet
-                // but only report 'Dropped' if the gap is reasonably positive.
-                if gap > 0 && gap < 1_000_000 {
-                    self.event_queue.push_back(ReceiveEvent::Dropped(gap));
-                }
-            }
-        }
-        
-        self.last_sequence = Some(packet.sequence_number);
-
         let sample_count = packet.samples_per_channel as usize * packet.channel_count as usize;
         let mut pcm = Vec::with_capacity(sample_count);
         let payload = &buf[packet.payload_offset..packet.payload_offset + sample_count * 4];
@@ -139,7 +206,10 @@ impl StreamReceiver {
             pcm.push(f32::from_le_bytes(chunk.try_into().unwrap()));
         }
 
-        self.event_queue.push_back(ReceiveEvent::Packet(packet, pcm));
+        let events = self.reorder_window.push(packet, pcm);
+        for ev in events {
+            self.event_queue.push_back(ev);
+        }
 
         Ok(self.event_queue.pop_front())
     }
@@ -255,5 +325,41 @@ mod tests {
             thread::sleep(Duration::from_millis(10));
         }
         assert!(saw_reconnect);
+    }
+
+    #[test]
+    fn test_packet_reorder_window_out_of_order() {
+        use crate::protocol::ParsedPacket;
+
+        let mut window = PacketReorderWindow::new(8);
+        let dummy_pkt = |seq: u32| ParsedPacket {
+            stream_id: 1,
+            sequence_number: seq,
+            presentation_timestamp_ns: 0,
+            channel_count: 2,
+            sample_format: crate::protocol::SAMPLE_FORMAT_FLOAT32,
+            sample_rate: 48000,
+            samples_per_channel: 64,
+            payload_offset: 32,
+        };
+
+        // Push seq 10
+        let evs = window.push(dummy_pkt(10), vec![0.0; 128]);
+        assert_eq!(evs.len(), 1);
+        if let ReceiveEvent::Packet(p, _) = &evs[0] {
+            assert_eq!(p.sequence_number, 10);
+        }
+
+        // Push seq 12 out-of-order (buffered)
+        let evs = window.push(dummy_pkt(12), vec![0.0; 128]);
+        assert_eq!(evs.len(), 0);
+
+        // Push seq 11 (completes gap 11, then drains 12)
+        let evs = window.push(dummy_pkt(11), vec![0.0; 128]);
+        assert_eq!(evs.len(), 2);
+        if let (ReceiveEvent::Packet(p1, _), ReceiveEvent::Packet(p2, _)) = (&evs[0], &evs[1]) {
+            assert_eq!(p1.sequence_number, 11);
+            assert_eq!(p2.sequence_number, 12);
+        }
     }
 }

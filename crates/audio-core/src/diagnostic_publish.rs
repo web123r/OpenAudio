@@ -763,7 +763,7 @@ mod tests {
             stream_name: "Test Stream".to_string(),
             stream_id: 9_001,
             channel_count: 32,
-            sample_rate: 96_000,
+            sample_rate: 123_456,
         };
 
         assert!(config.validate().is_err());

@@ -1,6 +1,7 @@
 mod asio_subscribe_ui;
 mod diagnostic_panel;
 mod file_dialog;
+mod patchbay;
 mod preset;
 mod signal_monitor;
 mod ui_shell;
