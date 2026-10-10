@@ -1,0 +1,71 @@
+name: Publish Multi-Platform Release Binaries
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  publish_release_binaries:
+    name: Build Release Binary (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            binary_name: openaudio-linux-x64
+            asset_name: openaudio-linux-x64
+          - os: macos-latest
+            target: x86_64-apple-darwin
+            binary_name: OpenAudio
+            asset_name: openaudio-macos-x64
+          - os: macos-latest
+            target: aarch64-apple-darwin
+            binary_name: OpenAudio
+            asset_name: openaudio-macos-arm64
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            binary_name: OpenAudio.exe
+            asset_name: OpenAudio-windows-x64.exe
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust Toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Install Linux Audio Dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libasound2-dev pkg-config libgtk-3-dev
+
+      - name: Build Release Binary
+        run: cargo build --release -p openaudio-gui --target ${{ matrix.target }}
+
+      - name: Prepare Binary Artifact
+        shell: bash
+        run: |
+          mkdir -p staging
+          if [ "${{ runner.os }}" = "Windows" ]; then
+            cp "target/${{ matrix.target }}/release/OpenAudio.exe" "staging/${{ matrix.asset_name }}"
+          elif [ "${{ runner.os }}" = "macOS" ]; then
+            cp "target/${{ matrix.target }}/release/OpenAudio" "staging/${{ matrix.asset_name }}"
+          else
+            cp "target/${{ matrix.target }}/release/OpenAudio" "staging/${{ matrix.asset_name }}"
+          fi
+
+      - name: Upload Binaries to GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: staging/${{ matrix.asset_name }}
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
