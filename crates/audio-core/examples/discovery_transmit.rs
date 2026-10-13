@@ -1,6 +1,5 @@
-use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::Duration;
 
 fn main() {
@@ -11,8 +10,7 @@ fn main() {
 
     println!("=== OpenAudio: Discovery Transmit (CLI) ===\n");
 
-    let subscribers_by_stream: Arc<Mutex<HashMap<u32, Vec<std::net::SocketAddr>>>> =
-        Arc::new(Mutex::new(HashMap::new()));
+    let subscribers_by_stream: audio_core::SubscriberRegistry = Default::default();
 
     let control_keep_running = Arc::new(AtomicBool::new(true));
     let control_flag = control_keep_running.clone();
@@ -38,6 +36,7 @@ fn main() {
         stream_id,
         None,
         subscribers_by_stream,
+        None,
         keep_running,
     ) {
         eprintln!("Error: {e}");

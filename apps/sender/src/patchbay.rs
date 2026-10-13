@@ -33,7 +33,13 @@ impl PatchbayMatrix {
         Self::default()
     }
 
-    pub fn add_publisher(&mut self, id: impl Into<String>, name: impl Into<String>, channels: usize, ip: impl Into<String>) {
+    pub fn add_publisher(
+        &mut self,
+        id: impl Into<String>,
+        name: impl Into<String>,
+        channels: usize,
+        ip: impl Into<String>,
+    ) {
         self.publishers.push(PatchbayNode {
             id: id.into(),
             name: name.into(),
@@ -43,7 +49,13 @@ impl PatchbayMatrix {
         });
     }
 
-    pub fn add_receiver(&mut self, id: impl Into<String>, name: impl Into<String>, channels: usize, ip: impl Into<String>) {
+    pub fn add_receiver(
+        &mut self,
+        id: impl Into<String>,
+        name: impl Into<String>,
+        channels: usize,
+        ip: impl Into<String>,
+    ) {
         self.receivers.push(PatchbayNode {
             id: id.into(),
             name: name.into(),
@@ -65,7 +77,8 @@ impl PatchbayMatrix {
     }
 
     pub fn is_patched(&self, pub_id: &str, rec_id: &str) -> bool {
-        self.active_patches.contains(&(pub_id.to_string(), rec_id.to_string()))
+        self.active_patches
+            .contains(&(pub_id.to_string(), rec_id.to_string()))
     }
 }
 

@@ -492,9 +492,7 @@ fn render_routing_grid(ui: &mut egui::Ui, session: &mut AsioSubscribeSession, is
 
             for incoming_index in 0..session.incoming_channel_count {
                 ui.label(
-                    egui::RichText::new(
-                        session_channel_label(session, incoming_index),
-                    )
+                    egui::RichText::new(session_channel_label(session, incoming_index))
                         .color(egui::Color32::WHITE),
                 );
 
@@ -724,9 +722,7 @@ fn start_session(
                 reconnect_stream_id,
                 port,
             ) {
-                eprintln!(
-                    "audio-core: ASIO subscription renewal failed: {error}"
-                );
+                eprintln!("audio-core: ASIO subscription renewal failed: {error}");
             }
 
             for _ in 0..10 {

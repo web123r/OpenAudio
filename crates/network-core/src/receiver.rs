@@ -1,8 +1,12 @@
 use crate::discovery::send_subscribe_request;
-use crate::protocol::{parse_packet, ParsedPacket};
+use crate::protocol::{
+    decode_float32, parse_packet, sample_format_name, ParsedPacket, SAMPLE_FORMAT_FLOAT32,
+};
 use std::collections::{BTreeMap, VecDeque};
 use std::net::{Ipv4Addr, UdpSocket};
 use std::time::{Duration, Instant};
+
+const REORDER_GAP_TIMEOUT: Duration = Duration::from_millis(20);
 
 #[derive(Debug)]
 pub enum ReceiveEvent {
@@ -18,6 +22,7 @@ pub struct PacketReorderWindow {
     capacity: usize,
     next_expected_seq: Option<u32>,
     buffer: BTreeMap<u32, (ParsedPacket, Vec<f32>)>,
+    gap_started: Option<Instant>,
 }
 
 impl PacketReorderWindow {
@@ -26,7 +31,64 @@ impl PacketReorderWindow {
             capacity,
             next_expected_seq: None,
             buffer: BTreeMap::new(),
+            gap_started: None,
         }
+    }
+
+    fn flush_expired_gap(&mut self) -> Vec<ReceiveEvent> {
+        let Some(gap_started) = self.gap_started else {
+            return Vec::new();
+        };
+        if gap_started.elapsed() < REORDER_GAP_TIMEOUT {
+            return Vec::new();
+        }
+
+        let Some(expected) = self.next_expected_seq else {
+            self.buffer.clear();
+            self.gap_started = None;
+            return Vec::new();
+        };
+
+        let next_packet = self
+            .buffer
+            .keys()
+            .copied()
+            .filter_map(|sequence| {
+                let distance = sequence.wrapping_sub(expected);
+                (distance < 0x8000_0000).then_some((distance, sequence))
+            })
+            .min_by_key(|(distance, _)| *distance);
+
+        let Some((missing, sequence)) = next_packet else {
+            self.buffer.clear();
+            self.gap_started = None;
+            return Vec::new();
+        };
+
+        let mut events = Vec::new();
+        if missing > 0 {
+            events.push(ReceiveEvent::Dropped(missing));
+        }
+        if let Some((packet, pcm)) = self.buffer.remove(&sequence) {
+            self.next_expected_seq = Some(sequence.wrapping_add(1));
+            events.push(ReceiveEvent::Packet(packet, pcm));
+        }
+
+        while let Some(next_expected) = self.next_expected_seq {
+            if let Some((packet, pcm)) = self.buffer.remove(&next_expected) {
+                self.next_expected_seq = Some(next_expected.wrapping_add(1));
+                events.push(ReceiveEvent::Packet(packet, pcm));
+            } else {
+                break;
+            }
+        }
+
+        self.gap_started = if self.buffer.is_empty() {
+            None
+        } else {
+            Some(Instant::now())
+        };
+        events
     }
 
     pub fn push(&mut self, packet: ParsedPacket, pcm: Vec<f32>) -> Vec<ReceiveEvent> {
@@ -54,6 +116,11 @@ impl PacketReorderWindow {
                     break;
                 }
             }
+            self.gap_started = if self.buffer.is_empty() {
+                None
+            } else {
+                Some(Instant::now())
+            };
         } else {
             let diff = seq.wrapping_sub(expected);
             if diff > 0x8000_0000 {
@@ -75,6 +142,7 @@ impl PacketReorderWindow {
             }
 
             self.buffer.insert(seq, (packet, pcm));
+            self.gap_started.get_or_insert_with(Instant::now);
 
             while self.buffer.len() > self.capacity {
                 if let Some(&oldest_seq) = self.buffer.keys().next() {
@@ -89,6 +157,9 @@ impl PacketReorderWindow {
                         events.push(ReceiveEvent::Packet(pkt, pcm));
                     }
                 }
+            }
+            if self.buffer.is_empty() {
+                self.gap_started = None;
             }
         }
 
@@ -121,7 +192,7 @@ impl StreamReceiver {
         let socket = UdpSocket::bind((Ipv4Addr::UNSPECIFIED, my_receive_port))
             .map_err(|e| format!("failed to bind receive port {my_receive_port}: {e}"))?;
         socket
-            .set_read_timeout(Some(Duration::from_millis(100)))
+            .set_read_timeout(Some(Duration::from_millis(10)))
             .map_err(|e| format!("failed to set read timeout: {e}"))?;
 
         let mut receiver = Self {
@@ -157,6 +228,12 @@ impl StreamReceiver {
             return Ok(Some(event));
         }
 
+        self.event_queue
+            .extend(self.reorder_window.flush_expired_gap());
+        if let Some(event) = self.event_queue.pop_front() {
+            return Ok(Some(event));
+        }
+
         if self.last_receive.elapsed() > Duration::from_secs(1) {
             let was_connected = self.is_connected;
             self.is_connected = false;
@@ -169,7 +246,10 @@ impl StreamReceiver {
         let mut buf = [0u8; 65536];
         let (len, _src) = match self.socket.recv_from(&mut buf) {
             Ok(value) => value,
-            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock || e.kind() == std::io::ErrorKind::TimedOut => {
+            Err(e)
+                if e.kind() == std::io::ErrorKind::WouldBlock
+                    || e.kind() == std::io::ErrorKind::TimedOut =>
+            {
                 return Ok(None);
             }
             Err(e) => return Err(format!("receive error: {e}")),
@@ -182,6 +262,18 @@ impl StreamReceiver {
         if packet.stream_id != self.stream_id {
             return Ok(None);
         }
+
+        if packet.sample_format != SAMPLE_FORMAT_FLOAT32 {
+            let format = sample_format_name(packet.sample_format).unwrap_or("unknown");
+            return Err(format!(
+                "unsupported audio format {format} (0x{:02x}); this receiver currently supports Float32 PCM only",
+                packet.sample_format
+            ));
+        }
+
+        let Some(pcm) = decode_float32(&buf[..len], &packet) else {
+            return Err("invalid or truncated Float32 PCM payload".to_string());
+        };
 
         if !self.is_connected {
             self.is_connected = true;
@@ -197,13 +289,6 @@ impl StreamReceiver {
                 channels: packet.channel_count,
                 sample_rate: packet.sample_rate,
             });
-        }
-
-        let sample_count = packet.samples_per_channel as usize * packet.channel_count as usize;
-        let mut pcm = Vec::with_capacity(sample_count);
-        let payload = &buf[packet.payload_offset..packet.payload_offset + sample_count * 4];
-        for chunk in payload.chunks_exact(4) {
-            pcm.push(f32::from_le_bytes(chunk.try_into().unwrap()));
         }
 
         let events = self.reorder_window.push(packet, pcm);
@@ -253,11 +338,13 @@ mod tests {
         let mut receiver = StreamReceiver::new("127.0.0.1", 17052, 1, receive_port).unwrap();
 
         let sender = UdpSocket::bind("127.0.0.1:0").unwrap();
-        sender.connect(format!("127.0.0.1:{}", receive_port)).unwrap();
+        sender
+            .connect(format!("127.0.0.1:{}", receive_port))
+            .unwrap();
 
         // Send seq 1
         sender.send(&make_packet(1, 1)).unwrap();
-        
+
         let mut found_packet = false;
         for _ in 0..10 {
             if let Ok(Some(ReceiveEvent::Packet(_, _))) = receiver.next_event() {
@@ -297,14 +384,16 @@ mod tests {
         let mut receiver = StreamReceiver::new("127.0.0.1", 17054, 2, receive_port).unwrap();
 
         let sender = UdpSocket::bind("127.0.0.1:0").unwrap();
-        sender.connect(format!("127.0.0.1:{}", receive_port)).unwrap();
+        sender
+            .connect(format!("127.0.0.1:{}", receive_port))
+            .unwrap();
 
         sender.send(&make_packet(2, 100)).unwrap();
         while !matches!(receiver.next_event(), Ok(Some(ReceiveEvent::Packet(_, _)))) {}
 
         // Stream stops for 1.5 seconds, then restarts at seq 1
         thread::sleep(Duration::from_millis(1500));
-        
+
         let mut saw_disconnect = false;
         while let Ok(Some(event)) = receiver.next_event() {
             if matches!(event, ReceiveEvent::Disconnected) {
@@ -361,5 +450,81 @@ mod tests {
             assert_eq!(p1.sequence_number, 11);
             assert_eq!(p2.sequence_number, 12);
         }
+    }
+
+    #[test]
+    fn reorder_window_releases_packet_after_gap_timeout() {
+        use crate::protocol::ParsedPacket;
+
+        let mut window = PacketReorderWindow::new(8);
+        let packet = |sequence_number| ParsedPacket {
+            stream_id: 1,
+            sequence_number,
+            presentation_timestamp_ns: 0,
+            channel_count: 2,
+            sample_format: crate::protocol::SAMPLE_FORMAT_FLOAT32,
+            sample_rate: 48_000,
+            samples_per_channel: 1,
+            payload_offset: 32,
+        };
+
+        assert!(matches!(
+            window.push(packet(10), vec![0.0; 2]).as_slice(),
+            [ReceiveEvent::Packet(_, _)]
+        ));
+        assert!(window.push(packet(12), vec![0.0; 2]).is_empty());
+        window.gap_started = Some(Instant::now() - REORDER_GAP_TIMEOUT);
+
+        let events = window.flush_expired_gap();
+        assert!(matches!(
+            events.as_slice(),
+            [ReceiveEvent::Dropped(1), ReceiveEvent::Packet(packet, _)]
+                if packet.sequence_number == 12
+        ));
+    }
+
+    #[test]
+    fn receiver_reports_unsupported_compressed_and_truncated_pcm_errors() {
+        use crate::protocol::{AudioPayloadHeader, PacketHeader, SAMPLE_FORMAT_OPUS};
+
+        let receive_port = 0;
+        let mut receiver = StreamReceiver::new("127.0.0.1", 17054, 3, receive_port).unwrap();
+        let receive_port = receiver.socket.local_addr().unwrap().port();
+        let sender = UdpSocket::bind("127.0.0.1:0").unwrap();
+
+        let mut compressed = Vec::from(
+            PacketHeader {
+                sub_stream_index: 0,
+                stream_id: 3,
+                sequence_number: 1,
+                presentation_timestamp_ns: 0,
+            }
+            .to_bytes(),
+        );
+        compressed.extend(
+            AudioPayloadHeader {
+                channel_count: 2,
+                sample_format: SAMPLE_FORMAT_OPUS,
+                sample_rate_code: 1,
+                samples_per_channel: 1,
+            }
+            .to_bytes(),
+        );
+        compressed.extend([0; 4]);
+        sender
+            .send_to(&compressed, ("127.0.0.1", receive_port))
+            .unwrap();
+
+        let mut truncated = make_packet(3, 2);
+        truncated.pop();
+        sender
+            .send_to(&truncated, ("127.0.0.1", receive_port))
+            .unwrap();
+
+        let error = receiver.next_event().unwrap_err();
+        assert!(error.contains("unsupported audio format Opus"));
+        let error = receiver.next_event().unwrap_err();
+        assert!(error.contains("invalid or truncated Float32 PCM payload"));
+        assert!(!receiver.is_connected);
     }
 }

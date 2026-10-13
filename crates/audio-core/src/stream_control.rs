@@ -134,8 +134,8 @@ pub fn resample_interleaved_linear(
         return input.to_vec();
     }
 
-    let output_frames = ((input_frames as u64 * output_rate as u64) / input_rate as u64)
-        .max(1) as usize;
+    let output_frames =
+        ((input_frames as u64 * output_rate as u64) / input_rate as u64).max(1) as usize;
     let ratio = input_rate as f64 / output_rate as f64;
     let mut output = Vec::with_capacity(output_frames * channels);
 
@@ -155,9 +155,92 @@ pub fn resample_interleaved_linear(
     output
 }
 
+/// Stateful linear resampler for packetized streams. Keeps the fractional
+/// source-frame position and the final source frame between calls so packet
+/// boundaries do not discard fractional output frames or repeat edge samples.
+#[derive(Debug, Clone)]
+pub struct StreamingLinearResampler {
+    channels: usize,
+    input_rate: u32,
+    output_rate: u32,
+    phase: f64,
+    pending: Vec<f32>,
+}
+
+impl StreamingLinearResampler {
+    pub fn new(channels: usize, input_rate: u32, output_rate: u32) -> Result<Self, String> {
+        if channels == 0 {
+            return Err("resampler channel count must be greater than zero".to_string());
+        }
+        if input_rate == 0 || output_rate == 0 {
+            return Err("resampler sample rates must be greater than zero".to_string());
+        }
+
+        Ok(Self {
+            channels,
+            input_rate,
+            output_rate,
+            phase: 0.0,
+            pending: Vec::new(),
+        })
+    }
+
+    pub fn process(&mut self, input: &[f32]) -> Result<Vec<f32>, String> {
+        if input.len() % self.channels != 0 {
+            return Err(format!(
+                "resampler input has {} samples, not aligned to {} channels",
+                input.len(),
+                self.channels
+            ));
+        }
+        if input.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        if self.input_rate == self.output_rate && self.pending.is_empty() {
+            return Ok(input.to_vec());
+        }
+
+        self.pending.extend_from_slice(input);
+
+        let input_frames = self.pending.len() / self.channels;
+        let step = self.input_rate as f64 / self.output_rate as f64;
+        let mut output = Vec::new();
+
+        loop {
+            let first_frame = self.phase.floor() as usize;
+            let fraction = self.phase - first_frame as f64;
+            if first_frame >= input_frames
+                || (first_frame + 1 >= input_frames && fraction > f64::EPSILON)
+            {
+                break;
+            }
+
+            let second_frame = (first_frame + 1).min(input_frames - 1);
+            for channel in 0..self.channels {
+                let first = self.pending[first_frame * self.channels + channel];
+                let second = self.pending[second_frame * self.channels + channel];
+                output.push(first + (second - first) * fraction as f32);
+            }
+            self.phase += step;
+        }
+
+        let frames_to_consume = (self.phase.floor() as usize).min(input_frames.saturating_sub(1));
+        if frames_to_consume > 0 {
+            self.pending.drain(..frames_to_consume * self.channels);
+            self.phase -= frames_to_consume as f64;
+        }
+
+        Ok(output)
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{resample_interleaved_linear, AdaptiveJitterController, ClockSynchronizer};
+    use super::{
+        resample_interleaved_linear, AdaptiveJitterController, ClockSynchronizer,
+        StreamingLinearResampler,
+    };
     use std::time::Duration;
 
     #[test]
@@ -167,6 +250,33 @@ mod tests {
         assert_eq!(output.len(), 12);
         assert_eq!(&output[..2], &[0.0, 1.0]);
         assert_eq!(&output[10..], &[2.0, 3.0]);
+    }
+
+    #[test]
+    fn streaming_resampler_preserves_fractional_frames_across_packets() {
+        let mut resampler = StreamingLinearResampler::new(2, 48_000, 44_100).unwrap();
+        let mut output = Vec::new();
+        let input = (0..48_000)
+            .flat_map(|frame| [frame as f32, -(frame as f32)])
+            .collect::<Vec<_>>();
+
+        for chunk in input.chunks(58 * 2) {
+            output.extend(resampler.process(chunk).unwrap());
+        }
+
+        let expected = resample_interleaved_linear(&input, 2, 48_000, 44_100);
+        assert_eq!(output.len() / 2, 44_100);
+        assert!(output.chunks_exact(2).all(|frame| frame[1] == -frame[0]));
+        assert!(output
+            .iter()
+            .zip(expected)
+            .all(|(actual, expected)| (actual - expected).abs() < 0.01));
+    }
+
+    #[test]
+    fn streaming_resampler_rejects_partial_interleaved_frames() {
+        let mut resampler = StreamingLinearResampler::new(2, 48_000, 44_100).unwrap();
+        assert!(resampler.process(&[0.0]).is_err());
     }
 
     #[test]

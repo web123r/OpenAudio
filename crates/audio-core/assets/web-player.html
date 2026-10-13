@@ -577,19 +577,19 @@
 
       <div id="mixRow">
         <div
-          class="mix-btn active"
+          class="mix-btn"
           data-mix="downmix"
           onclick="setMix(this)"
         >
-          🔀 Downmix
+          🔀 Alternate L/R average
         </div>
 
         <div
-          class="mix-btn"
+          class="mix-btn active"
           data-mix="first2"
           onclick="setMix(this)"
         >
-          1–2 only
+          Selected pair
         </div>
 
         <div
@@ -682,9 +682,9 @@
   let sampleRate = 48000;
   let streamDisplayName = "";
 
-  // Original channel-selection behavior.
+  // A selected pair is safer than guessing a multichannel speaker layout.
   let activeChannels = new Set();
-  let mixMode = "downmix";
+  let mixMode = "first2";
 
   // Original fallback ring buffer.
   let ringCapacity = 0;
@@ -1204,7 +1204,7 @@
     .getElementById("chSelectAll")
     .addEventListener("click", selectAll);
 
-  // Original downmix implementation.
+  // The alternate matrix assumes interleaved channels alternate L/R.
   function downmixToStereo(interleaved) {
     const frames =
       interleaved.length / totalChannels;
@@ -1339,25 +1339,27 @@
         const {
           capacitySamples,
           prebufferSeconds,
-          sampleRate
+          sourceSampleRate
         } = options.processorOptions;
 
         this.capacity = capacitySamples;
+        this.sourceSampleRate = sourceSampleRate;
         this.bufL = new Float32Array(this.capacity);
         this.bufR = new Float32Array(this.capacity);
         this.writeIndex = 0;
         this.readIndex = 0;
+        this.phase = 0;
         this.available = 0;
         this.started = false;
 
         this.prebufferSamples = Math.floor(
-          sampleRate * prebufferSeconds
+          sourceSampleRate * prebufferSeconds
         );
         this.minimumPrebufferSamples = Math.floor(
-          sampleRate * 0.08
+          sourceSampleRate * 0.08
         );
         this.maximumPrebufferSamples = Math.floor(
-          sampleRate * 0.5
+          sourceSampleRate * 0.5
         );
 
         this.underrunCount = 0;
@@ -1370,6 +1372,12 @@
               event.data.l,
               event.data.r
             );
+          } else if (event.data.type === "reset") {
+            this.writeIndex = 0;
+            this.readIndex = 0;
+            this.phase = 0;
+            this.available = 0;
+            this.started = false;
           }
         };
       }
@@ -1410,6 +1418,18 @@
           outputs[0][1] || outputs[0][0];
 
         const needed = outputLeft.length;
+        const occupancyError =
+          (this.available - this.prebufferSamples) /
+          this.sourceSampleRate;
+        const correction = Math.max(
+          -0.005,
+          Math.min(0.005, occupancyError * 0.01)
+        );
+        const step =
+          (this.sourceSampleRate / sampleRate) *
+          (1 + correction);
+        const sourceNeeded =
+          Math.floor(this.phase + (needed - 1) * step) + 2;
 
         if (++this.statsCounter >= 20) {
           this.statsCounter = 0;
@@ -1448,7 +1468,7 @@
           }
         }
 
-        if (this.available < needed) {
+        if (this.available < sourceNeeded) {
           this.underrunCount++;
           outputLeft.fill(0);
           outputRight.fill(0);
@@ -1465,17 +1485,26 @@
           frame < needed;
           frame++
         ) {
-          outputLeft[frame] =
-            this.bufL[this.readIndex];
+          const nextIndex =
+            (this.readIndex + 1) % this.capacity;
+          const left =
+            this.bufL[this.readIndex] +
+            (this.bufL[nextIndex] - this.bufL[this.readIndex]) *
+              this.phase;
+          const right =
+            this.bufR[this.readIndex] +
+            (this.bufR[nextIndex] - this.bufR[this.readIndex]) *
+              this.phase;
 
-          outputRight[frame] =
-            this.bufR[this.readIndex];
+          outputLeft[frame] = left;
+          outputRight[frame] = right;
 
+          this.phase += step;
+          const consumed = Math.floor(this.phase);
           this.readIndex =
-            (this.readIndex + 1) %
-            this.capacity;
-
-          this.available--;
+            (this.readIndex + consumed) % this.capacity;
+          this.available -= consumed;
+          this.phase -= consumed;
         }
 
         return true;
@@ -1533,9 +1562,9 @@
               numberOfOutputs: 1,
               outputChannelCount: [2],
               processorOptions: {
-                sampleRate,
+                sourceSampleRate: sampleRate,
                 capacitySamples:
-                  audioCtx.sampleRate * 2,
+                  Math.ceil(sampleRate * 2),
                 prebufferSeconds: 0.15
               }
             }
@@ -1546,10 +1575,10 @@
             if (
               event.data.type === "stats"
             ) {
-              const milliseconds =
+                  const milliseconds =
                 (
                   event.data.available /
-                  audioCtx.sampleRate *
+                      sampleRate *
                   1000
                 ).toFixed(0);
 
@@ -1557,7 +1586,7 @@
                 `Buffered: ${milliseconds}ms · ` +
                 `Underruns: ` +
                 `${event.data.underruns} · ` +
-                `Target: ${(event.data.target / audioCtx.sampleRate * 1000).toFixed(0)}ms`;
+                `Target: ${(event.data.target / sampleRate * 1000).toFixed(0)}ms`;
             }
           };
 
@@ -1576,7 +1605,7 @@
     }
 
     ringCapacity =
-      audioCtx.sampleRate * 2;
+      Math.ceil(sampleRate * 2);
 
     ringBuffers = [
       new Float32Array(ringCapacity),
@@ -1585,11 +1614,12 @@
 
     ringWrite = 0;
     ringRead = 0;
+    let ringPhase = 0;
     ringAvailable = 0;
     fallbackUnderruns = 0;
 
     let prebuffer = Math.floor(
-      audioCtx.sampleRate * 0.15
+      sampleRate * 0.15
     );
     let stableCallbacks = 0;
 
@@ -1614,6 +1644,17 @@
 
         const needed =
           outputLeft.length;
+        const occupancyError =
+          (ringAvailable - prebuffer) / sampleRate;
+        const correction = Math.max(
+          -0.005,
+          Math.min(0.005, occupancyError * 0.01)
+        );
+        const step =
+          (sampleRate / audioCtx.sampleRate) *
+          (1 + correction);
+        const sourceNeeded =
+          Math.floor(ringPhase + (needed - 1) * step) + 2;
 
         if (!started) {
           if (
@@ -1627,10 +1668,10 @@
           }
         }
 
-        if (ringAvailable < needed) {
+        if (ringAvailable < sourceNeeded) {
           fallbackUnderruns++;
           prebuffer = Math.min(
-            audioCtx.sampleRate * 0.5,
+            sampleRate * 0.5,
             Math.floor(prebuffer * 1.15)
           );
           stableCallbacks = 0;
@@ -1646,7 +1687,7 @@
         stableCallbacks++;
         if (stableCallbacks >= 200) {
           prebuffer = Math.max(
-            audioCtx.sampleRate * 0.08,
+            sampleRate * 0.08,
             Math.floor(prebuffer * 0.995)
           );
           stableCallbacks = 0;
@@ -1657,28 +1698,38 @@
           frame < needed;
           frame++
         ) {
-          outputLeft[frame] =
-            ringBuffers[0][ringRead];
+          const nextIndex =
+            (ringRead + 1) % ringCapacity;
+          const left =
+            ringBuffers[0][ringRead] +
+            (ringBuffers[0][nextIndex] - ringBuffers[0][ringRead]) *
+              ringPhase;
+          const right =
+            ringBuffers[1][ringRead] +
+            (ringBuffers[1][nextIndex] - ringBuffers[1][ringRead]) *
+              ringPhase;
 
-          outputRight[frame] =
-            ringBuffers[1][ringRead];
+          outputLeft[frame] = left;
+          outputRight[frame] = right;
 
+          ringPhase += step;
+          const consumed = Math.floor(ringPhase);
           ringRead =
-            (ringRead + 1) %
+            (ringRead + consumed) %
             ringCapacity;
-
-          ringAvailable--;
+          ringAvailable -= consumed;
+          ringPhase -= consumed;
         }
 
         statsEl.textContent =
           `Buffered: ` +
           `${(
             ringAvailable /
-            audioCtx.sampleRate *
+            sampleRate *
             1000
           ).toFixed(0)}ms · ` +
           `Underruns: ${fallbackUnderruns} · ` +
-          `Target: ${(prebuffer / audioCtx.sampleRate * 1000).toFixed(0)}ms`;
+          `Target: ${(prebuffer / sampleRate * 1000).toFixed(0)}ms`;
       };
 
     processorNode.connect(
@@ -1690,8 +1741,25 @@
 
   // Original incoming PCM handling.
   function handleBinaryChunk(buffer) {
-    const raw =
-      new Float32Array(buffer);
+    if (
+      !(buffer instanceof ArrayBuffer) ||
+      buffer.byteLength % 4 !== 0 ||
+      !Number.isInteger(totalChannels) ||
+      totalChannels < 1 ||
+      buffer.byteLength % (4 * totalChannels) !== 0
+    ) {
+      throw new Error("Received malformed Float32 PCM audio.");
+    }
+
+    const data = new DataView(buffer);
+    const raw = new Float32Array(buffer.byteLength / 4);
+    for (let index = 0; index < raw.length; index++) {
+      raw[index] = data.getFloat32(index * 4, true);
+    }
+
+    if (raw.some(sample => !Number.isFinite(sample))) {
+      throw new Error("Received non-finite Float32 PCM audio.");
+    }
 
     const stereo =
       downmixToStereo(raw);
@@ -1760,6 +1828,18 @@
         }
       }
     }
+  }
+
+  function resetPlaybackBuffer() {
+    if (usingWorklet && workletNode) {
+      workletNode.port.postMessage({
+        type: "reset"
+      });
+    }
+
+    ringWrite = 0;
+    ringRead = 0;
+    ringAvailable = 0;
   }
 
   function teardown() {
@@ -1852,7 +1932,27 @@
             const message =
               JSON.parse(event.data);
 
-            if (message.type === "format") {
+            if (
+              message.type === "stream-status" &&
+              message.status === "disconnected"
+            ) {
+              resetPlaybackBuffer();
+              setLive(false);
+              setStatus(
+                "Audio stream interrupted — waiting for the publisher…",
+                "warn-st"
+              );
+            } else if (
+              message.type === "stream-status" &&
+              message.status === "reconnected"
+            ) {
+              resetPlaybackBuffer();
+              setLive(true);
+              setStatus(
+                "Stream recovered — buffering audio…",
+                "warn-st"
+              );
+            } else if (message.type === "format") {
               totalChannels =
                 Number(message.channels);
 
@@ -1880,7 +1980,7 @@
               }
 
               if (
-                !Number.isFinite(sampleRate) ||
+                !Number.isInteger(sampleRate) ||
                 sampleRate <= 0
               ) {
                 throw new Error(
@@ -1888,11 +1988,8 @@
                 );
               }
 
-              if (audioCtx && audioCtx.sampleRate !== sampleRate) {
-                audioCtx.close().catch(() => {});
-                const AudioContextClass = window.AudioContext || window.webkitAudioContext;
-                audioCtx = new AudioContextClass({ sampleRate });
-                await audioCtx.resume().catch(() => {});
+              if (message.sampleFormat !== "float32le") {
+                throw new Error("This browser player only supports Float32 PCM streams.");
               }
 
               buildChannelGrid(
@@ -1914,7 +2011,10 @@
                 .getElementById("npFormat")
                 .textContent =
                   `${totalChannels}ch @ ` +
-                  `${sampleRate}Hz`;
+                `${sampleRate}Hz` +
+                (audioCtx.sampleRate === sampleRate
+                  ? ""
+                  : ` → ${audioCtx.sampleRate}Hz output`);
 
               document
                 .getElementById("npEngine")

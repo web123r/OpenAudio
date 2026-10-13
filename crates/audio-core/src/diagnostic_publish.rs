@@ -17,7 +17,6 @@ use crate::ensure_realtime_audio_thread;
 use crate::protocol::{
     sample_rate_to_code, AudioPayloadHeader, PacketHeader, SAMPLE_FORMAT_FLOAT32,
 };
-use crate::util::safe_lock;
 use crate::{register_scoped_signal_meter, SignalDirection};
 
 use socket2::SockRef;
@@ -25,15 +24,18 @@ use std::f64::consts::TAU;
 use std::net::UdpSocket;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::thread;
 use std::time::{Duration, Instant};
 
-const SAFE_UDP_PAYLOAD_BYTES: usize = 1_200;
-const OPENAUDIO_HEADER_BYTES: usize = 32;
+const SAFE_UDP_PAYLOAD_BYTES: usize = network_core::protocol::MAX_SAFE_UDP_PAYLOAD_BYTES;
+const OPENAUDIO_HEADER_BYTES: usize = network_core::protocol::OPENAUDIO_HEADER_BYTES;
 const BYTES_PER_SAMPLE: usize = std::mem::size_of::<f32>();
 
 const UDP_SEND_BUFFER_BYTES: usize = 4 * 1024 * 1024;
 
 const IDLE_SLEEP: Duration = Duration::from_micros(250);
+const HIGH_RESOLUTION_WAIT_THRESHOLD: Duration = Duration::from_millis(2);
+const HIGH_RESOLUTION_SPIN_WINDOW: Duration = Duration::from_micros(500);
 
 /// Prevents a large transmission burst if the process is suspended,
 /// paused in a debugger, or delayed by heavy system load.
@@ -119,6 +121,7 @@ impl DiagnosticPublishConfig {
 #[derive(Debug, Clone, Default)]
 pub struct DiagnosticPublishReport {
     pub elapsed: Duration,
+    pub subscriber_elapsed: Duration,
     pub generated_frames: u64,
     pub packets_built: u64,
     pub datagrams_sent: u64,
@@ -149,6 +152,26 @@ impl DiagnosticPublishReport {
 
     pub fn average_datagrams_per_second(&self) -> f64 {
         let seconds = self.elapsed.as_secs_f64();
+
+        if seconds <= 0.0 {
+            return 0.0;
+        }
+
+        self.datagrams_sent as f64 / seconds
+    }
+
+    pub fn subscriber_packets_per_second(&self) -> f64 {
+        let seconds = self.subscriber_elapsed.as_secs_f64();
+
+        if seconds <= 0.0 {
+            return 0.0;
+        }
+
+        self.packets_built as f64 / seconds
+    }
+
+    pub fn subscriber_datagrams_per_second(&self) -> f64 {
+        let seconds = self.subscriber_elapsed.as_secs_f64();
 
         if seconds <= 0.0 {
             return 0.0;
@@ -242,6 +265,7 @@ pub fn publish_diagnostic_stream_with_discovery(
 
     let mut sequence_number = 0u32;
     let mut generated_timeline_frames = 0u64;
+    let mut subscriber_started_at: Option<Instant> = None;
 
     let mut oscillators = create_channel_oscillators(config.channel_count, config.sample_rate);
 
@@ -275,18 +299,17 @@ pub fn publish_diagnostic_stream_with_discovery(
     let mut had_subscriber = false;
 
     while keep_running.load(Ordering::Relaxed) {
-        let destinations = {
-            let subscribers = safe_lock(&subscribers_by_stream);
-
-            subscribers
-                .get(&config.stream_id)
-                .filter(|addresses| !addresses.is_empty())
-                .cloned()
-        };
+        let destinations =
+            crate::discovery::active_subscribers(&subscribers_by_stream, config.stream_id)
+                .filter(|addresses| !addresses.is_empty());
 
         let elapsed_target_frames = elapsed_frames(start.elapsed(), config.sample_rate);
 
         if destinations.is_none() {
+            if let Some(subscriber_start) = subscriber_started_at.take() {
+                report.subscriber_elapsed += subscriber_start.elapsed();
+            }
+
             // Keep the logical generator clock aligned with real time
             // while no receiver is subscribed. This avoids sending a
             // large catch-up burst when a subscriber appears.
@@ -303,7 +326,12 @@ pub fn publish_diagnostic_stream_with_discovery(
             }
 
             if last_report.elapsed() >= Duration::from_secs(5) {
-                print_periodic_report(&config, &report, start.elapsed());
+                print_periodic_report(
+                    &config,
+                    &report,
+                    start.elapsed(),
+                    current_subscriber_elapsed(&report, subscriber_started_at),
+                );
 
                 last_report = Instant::now();
             }
@@ -320,12 +348,13 @@ pub fn publish_diagnostic_stream_with_discovery(
             );
 
             had_subscriber = true;
+            subscriber_started_at = Some(Instant::now());
         }
 
         let destinations = destinations.unwrap_or_default();
 
         if elapsed_target_frames <= generated_timeline_frames {
-            std::thread::sleep(IDLE_SLEEP);
+            wait_for_next_audio_frame(start, generated_timeline_frames, config.sample_rate);
             continue;
         }
 
@@ -435,30 +464,66 @@ pub fn publish_diagnostic_stream_with_discovery(
         sequence_number = sequence_number.wrapping_add(1);
 
         if last_report.elapsed() >= Duration::from_secs(5) {
-            print_periodic_report(&config, &report, start.elapsed());
+            print_periodic_report(
+                &config,
+                &report,
+                start.elapsed(),
+                current_subscriber_elapsed(&report, subscriber_started_at),
+            );
 
             last_report = Instant::now();
         }
     }
 
     report.elapsed = start.elapsed();
+    if let Some(subscriber_start) = subscriber_started_at {
+        report.subscriber_elapsed += subscriber_start.elapsed();
+    }
 
     println!(
         "Diagnostic Publish stopped: {}ch @ {}Hz, \
-         {:.2}s elapsed, {} generated frame(s), {} \
+         {:.2}s elapsed, {:.2}s subscriber-active, \
+         {} generated frame(s), {} \
          packet(s), {} datagram(s), {} send error(s), \
-         {} skipped catch-up frame(s).",
+         {} skipped catch-up frame(s); active rates \
+         {:.0} packets/s and {:.0} datagrams/s.",
         config.channel_count,
         config.sample_rate,
         report.elapsed.as_secs_f64(),
+        report.subscriber_elapsed.as_secs_f64(),
         report.generated_frames,
         report.packets_built,
         report.datagrams_sent,
         report.send_errors,
-        report.skipped_catch_up_frames
+        report.skipped_catch_up_frames,
+        report.subscriber_packets_per_second(),
+        report.subscriber_datagrams_per_second()
     );
 
     Ok(report)
+}
+
+fn wait_for_next_audio_frame(start: Instant, current_frame: u64, sample_rate: u32) {
+    if sample_rate == 0 {
+        thread::sleep(IDLE_SLEEP);
+        return;
+    }
+
+    let next_frame_ns = frames_to_nanoseconds(current_frame.saturating_add(1), sample_rate);
+    loop {
+        let elapsed_ns = start.elapsed().as_nanos().min(u64::MAX as u128) as u64;
+        let remaining_ns = next_frame_ns.saturating_sub(elapsed_ns);
+        if remaining_ns == 0 {
+            return;
+        }
+
+        let remaining = Duration::from_nanos(remaining_ns);
+        if remaining >= HIGH_RESOLUTION_WAIT_THRESHOLD {
+            thread::sleep(remaining.saturating_sub(HIGH_RESOLUTION_SPIN_WINDOW));
+        } else {
+            std::hint::spin_loop();
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -588,36 +653,7 @@ fn build_audio_packet(
 }
 
 fn calculate_max_frames_per_packet(channel_count: usize) -> Result<usize, String> {
-    if channel_count == 0 {
-        return Err("cannot calculate diagnostic packet size \
-             for zero channels"
-            .to_string());
-    }
-
-    let audio_payload_budget = SAFE_UDP_PAYLOAD_BYTES
-        .checked_sub(OPENAUDIO_HEADER_BYTES)
-        .ok_or_else(|| {
-            "configured UDP payload limit is smaller \
-                 than the OpenAudio headers"
-                .to_string()
-        })?;
-
-    let bytes_per_frame = channel_count
-        .checked_mul(BYTES_PER_SAMPLE)
-        .ok_or_else(|| "diagnostic bytes-per-frame overflow".to_string())?;
-
-    let frames = audio_payload_budget / bytes_per_frame;
-
-    if frames == 0 {
-        return Err(format!(
-            "one {channel_count}-channel Float32 frame \
-             cannot fit inside the configured \
-             {SAFE_UDP_PAYLOAD_BYTES}-byte UDP payload \
-             limit"
-        ));
-    }
-
-    Ok(frames.min(u16::MAX as usize))
+    network_core::protocol::max_float32_frames_per_packet(channel_count)
 }
 
 fn configure_send_socket(socket: &UdpSocket) {
@@ -669,14 +705,18 @@ fn print_periodic_report(
     config: &DiagnosticPublishConfig,
     report: &DiagnosticPublishReport,
     elapsed: Duration,
+    subscriber_elapsed: Duration,
 ) {
     let seconds = elapsed.as_secs_f64().max(f64::EPSILON);
+    let subscriber_seconds = subscriber_elapsed.as_secs_f64().max(f64::EPSILON);
 
     println!(
         "Diagnostic Publish metrics: {}ch, \
          elapsed={:.1}s, generated={} frames, \
          packets={} ({:.0}/s), datagrams={} \
-         ({:.0}/s), send-errors={}, \
+         ({:.0}/s), subscriber-active={:.1}s, \
+         active-packets/s={:.0}, active-datagrams/s={:.0}, \
+         send-errors={}, \
          skipped-catch-up={}",
         config.channel_count,
         seconds,
@@ -685,14 +725,44 @@ fn print_periodic_report(
         report.packets_built as f64 / seconds,
         report.datagrams_sent,
         report.datagrams_sent as f64 / seconds,
+        subscriber_elapsed.as_secs_f64(),
+        report.packets_built as f64 / subscriber_seconds,
+        report.datagrams_sent as f64 / subscriber_seconds,
         report.send_errors,
         report.skipped_catch_up_frames
     );
 }
 
+fn current_subscriber_elapsed(
+    report: &DiagnosticPublishReport,
+    subscriber_started_at: Option<Instant>,
+) -> Duration {
+    report.subscriber_elapsed
+        + subscriber_started_at
+            .map(|started_at| started_at.elapsed())
+            .unwrap_or_default()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use network_core::protocol::{decode_float32, parse_packet};
+
+    #[test]
+    fn report_separates_wall_clock_and_subscriber_active_rates() {
+        let report = DiagnosticPublishReport {
+            elapsed: Duration::from_secs(10),
+            subscriber_elapsed: Duration::from_secs(2),
+            packets_built: 24_000,
+            datagrams_sent: 48_000,
+            ..DiagnosticPublishReport::default()
+        };
+
+        assert_eq!(report.average_packets_per_second(), 2_400.0);
+        assert_eq!(report.average_datagrams_per_second(), 4_800.0);
+        assert_eq!(report.subscriber_packets_per_second(), 12_000.0);
+        assert_eq!(report.subscriber_datagrams_per_second(), 24_000.0);
+    }
 
     #[test]
     fn thirty_two_channels_fit_below_safe_udp_limit() {
@@ -754,6 +824,56 @@ mod tests {
         );
 
         assert!(packet.len() <= SAFE_UDP_PAYLOAD_BYTES);
+    }
+
+    #[test]
+    fn one_second_64_channel_packetization_preserves_samples_and_sequence() {
+        const CHANNELS: usize = 64;
+        const SAMPLE_RATE: usize = 48_000;
+        const FRAMES_PER_PACKET: usize = 4;
+
+        let mut packet = Vec::with_capacity(SAFE_UDP_PAYLOAD_BYTES);
+        let mut samples = Vec::with_capacity(CHANNELS * FRAMES_PER_PACKET);
+        let mut expected_sequence = 0u32;
+        let mut total_frames = 0usize;
+
+        for packet_index in 0..(SAMPLE_RATE / FRAMES_PER_PACKET) {
+            samples.clear();
+            for frame in 0..FRAMES_PER_PACKET {
+                let frame_number = packet_index * FRAMES_PER_PACKET + frame;
+                for channel in 0..CHANNELS {
+                    samples.push((frame_number * CHANNELS + channel) as f32);
+                }
+            }
+
+            build_audio_packet(
+                &mut packet,
+                123,
+                expected_sequence,
+                (total_frames as u64 * 1_000_000_000) / SAMPLE_RATE as u64,
+                CHANNELS,
+                sample_rate_to_code(SAMPLE_RATE as u32),
+                FRAMES_PER_PACKET,
+                &samples,
+            )
+            .unwrap();
+
+            assert!(packet.len() <= SAFE_UDP_PAYLOAD_BYTES);
+            let parsed = parse_packet(&packet).expect("generated packet parses");
+            assert_eq!(parsed.sequence_number, expected_sequence);
+            assert_eq!(parsed.channel_count as usize, CHANNELS);
+            assert_eq!(parsed.samples_per_channel as usize, FRAMES_PER_PACKET);
+            assert_eq!(
+                decode_float32(&packet, &parsed).expect("complete float payload"),
+                samples
+            );
+
+            expected_sequence = expected_sequence.wrapping_add(1);
+            total_frames += FRAMES_PER_PACKET;
+        }
+
+        assert_eq!(total_frames, SAMPLE_RATE);
+        assert_eq!(expected_sequence, 12_000);
     }
 
     #[test]

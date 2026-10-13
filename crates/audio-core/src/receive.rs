@@ -1,5 +1,5 @@
 // At the top of combine.rs, transmit.rs, receive.rs, split.rs, web.rs, etc.
-use crate::protocol::parse_packet;
+use crate::protocol::{float32_payload, parse_packet};
 use std::net::UdpSocket;
 use std::time::{Duration, Instant};
 
@@ -22,7 +22,7 @@ pub fn receive_to_wav(
     println!("Listening on {bind_addr} for {duration_secs}s...");
 
     let mut writer: Option<hound::WavWriter<std::io::BufWriter<std::fs::File>>> = None;
-    let mut buf = [0u8; 1500];
+    let mut buf = [0u8; 65_536];
     let mut packets_received = 0u32;
     let mut packets_dropped = 0u32;
     let mut last_sequence: Option<u32> = None;
@@ -38,6 +38,9 @@ pub fn receive_to_wav(
 
         let Some(parsed) = parse_packet(&buf[..len]) else {
             continue; // not a recognized OpenAudio audio packet, skip
+        };
+        let Some(payload) = float32_payload(&buf[..len], &parsed) else {
+            continue;
         };
 
         // Detect gaps for visibility (spec section 7: log, don't crash).
@@ -66,9 +69,6 @@ pub fn receive_to_wav(
         }
 
         let w = writer.as_mut().unwrap();
-        let sample_count = parsed.samples_per_channel as usize * parsed.channel_count as usize;
-        let payload = &buf[parsed.payload_offset..parsed.payload_offset + sample_count * 4];
-
         for chunk in payload.chunks_exact(4) {
             let sample = f32::from_le_bytes(chunk.try_into().unwrap());
             let _ = w.write_sample(sample);

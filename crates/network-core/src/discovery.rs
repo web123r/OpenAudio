@@ -9,6 +9,15 @@ use std::time::{Duration, Instant};
 pub const DISCOVERY_MULTICAST_ADDR: &str = "239.19.84.1";
 pub const DISCOVERY_PORT: u16 = 5450;
 pub const CONTROL_PORT: u16 = 7000;
+const MAX_DISCOVERED_NODES: usize = 256;
+const MAX_SUBSCRIBER_STREAMS: usize = 1_024;
+const MAX_SUBSCRIBERS_PER_STREAM: usize = 64;
+const SUBSCRIBER_LEASE: Duration = Duration::from_secs(15);
+const MAX_NODE_ID_BYTES: usize = 128;
+const MAX_NODE_NAME_BYTES: usize = 128;
+const MAX_STREAM_NAME_BYTES: usize = 128;
+const MAX_CHANNEL_LABEL_BYTES: usize = 128;
+const MAX_SUPPORTED_CHANNELS: u8 = 64;
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct NodeAdvertisement {
@@ -28,6 +37,12 @@ pub struct SubscribeRequest {
     pub receiver_port: u16,
 }
 
+#[derive(Clone)]
+pub struct Subscriber {
+    pub address: SocketAddr,
+    last_seen: Instant,
+}
+
 pub fn default_channel_labels(channel_count: u8) -> Vec<String> {
     (0..channel_count)
         .map(|index| format!("Channel {}", index + 1))
@@ -45,7 +60,53 @@ pub fn normalize_channel_labels(channel_count: u8, mut labels: Vec<String>) -> V
     labels
 }
 
-pub type SubscriberRegistry = Arc<Mutex<HashMap<u32, Vec<SocketAddr>>>>;
+fn valid_advertisement(advert: &NodeAdvertisement) -> bool {
+    let valid_text = |value: &str, maximum_bytes: usize| {
+        !value.trim().is_empty()
+            && value.len() <= maximum_bytes
+            && !value.chars().any(char::is_control)
+    };
+
+    valid_text(&advert.node_id, MAX_NODE_ID_BYTES)
+        && valid_text(&advert.node_name, MAX_NODE_NAME_BYTES)
+        && valid_text(&advert.stream_name, MAX_STREAM_NAME_BYTES)
+        && advert.control_port != 0
+        && (1..=MAX_SUPPORTED_CHANNELS).contains(&advert.channel_count)
+        && advert.channel_labels.len() <= advert.channel_count as usize
+        && advert
+            .channel_labels
+            .iter()
+            .all(|label| valid_text(label, MAX_CHANNEL_LABEL_BYTES))
+}
+
+fn valid_subscription_request(request: &SubscribeRequest) -> bool {
+    request.receiver_port != 0
+}
+
+pub type SubscriberRegistry = Arc<Mutex<HashMap<u32, Vec<Subscriber>>>>;
+
+pub fn active_subscribers(
+    subscribers_by_stream: &SubscriberRegistry,
+    stream_id: u32,
+) -> Option<Vec<SocketAddr>> {
+    let now = Instant::now();
+    let mut registry = subscribers_by_stream
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+
+    for subscribers in registry.values_mut() {
+        subscribers
+            .retain(|subscriber| now.duration_since(subscriber.last_seen) < SUBSCRIBER_LEASE);
+    }
+    registry.retain(|_, subscribers| !subscribers.is_empty());
+
+    registry.get(&stream_id).map(|subscribers| {
+        subscribers
+            .iter()
+            .map(|subscriber| subscriber.address)
+            .collect()
+    })
+}
 
 #[derive(Clone, Debug)]
 pub struct DiscoveredNode {
@@ -221,21 +282,29 @@ pub fn start_discovery_listener(
         match socket.recv_from(&mut buf) {
             Ok((len, src)) => {
                 if let Ok(advert) = serde_json::from_slice::<NodeAdvertisement>(&buf[..len]) {
-                    let node = DiscoveredNode {
-                        node_id: advert.node_id.clone(),
-                        node_name: advert.node_name,
-                        stream_id: advert.stream_id,
-                        stream_name: advert.stream_name,
-                        ip: src.ip().to_string(),
-                        control_port: advert.control_port,
-                        channel_count: advert.channel_count,
-                        channel_labels: normalize_channel_labels(
-                            advert.channel_count,
-                            advert.channel_labels,
-                        ),
-                        last_seen: Instant::now(),
-                    };
-                    directory.lock().unwrap().insert(advert.node_id, node);
+                    if valid_advertisement(&advert) {
+                        let node = DiscoveredNode {
+                            node_id: advert.node_id.clone(),
+                            node_name: advert.node_name,
+                            stream_id: advert.stream_id,
+                            stream_name: advert.stream_name,
+                            ip: src.ip().to_string(),
+                            control_port: advert.control_port,
+                            channel_count: advert.channel_count,
+                            channel_labels: normalize_channel_labels(
+                                advert.channel_count,
+                                advert.channel_labels,
+                            ),
+                            last_seen: Instant::now(),
+                        };
+
+                        let mut directory = directory.lock().unwrap();
+                        if directory.contains_key(&advert.node_id)
+                            || directory.len() < MAX_DISCOVERED_NODES
+                        {
+                            directory.insert(advert.node_id, node);
+                        }
+                    }
                 }
             }
             Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
@@ -275,27 +344,68 @@ pub fn start_control_listener(
     subscribers_by_stream: SubscriberRegistry,
     keep_running: Arc<AtomicBool>,
 ) -> Result<(), String> {
-    let socket = UdpSocket::bind(("0.0.0.0", CONTROL_PORT))
-        .map_err(|e| format!("failed to bind control listener on port {CONTROL_PORT}: {e}"))?;
+    run_control_listener(
+        bind_control_listener()?,
+        subscribers_by_stream,
+        keep_running,
+    )
+}
+
+pub fn bind_control_listener() -> Result<UdpSocket, String> {
+    bind_control_listener_on(CONTROL_PORT)
+}
+
+pub fn bind_control_listener_on(port: u16) -> Result<UdpSocket, String> {
+    let socket = UdpSocket::bind(("0.0.0.0", port))
+        .map_err(|e| format!("failed to bind control listener on port {port}: {e}"))?;
     socket
         .set_read_timeout(Some(Duration::from_millis(500)))
         .map_err(|e| format!("failed to set read timeout: {e}"))?;
 
+    Ok(socket)
+}
+
+pub fn run_control_listener(
+    socket: UdpSocket,
+    subscribers_by_stream: SubscriberRegistry,
+    keep_running: Arc<AtomicBool>,
+) -> Result<(), String> {
     let mut buf = [0u8; 256];
 
     while keep_running.load(Ordering::Relaxed) {
         match socket.recv_from(&mut buf) {
             Ok((len, src)) => {
                 if let Ok(req) = serde_json::from_slice::<SubscribeRequest>(&buf[..len]) {
-                    let dest = SocketAddr::new(src.ip(), req.receiver_port);
-                    let mut map = subscribers_by_stream.lock().unwrap();
-                    let list = map.entry(req.stream_id).or_insert_with(Vec::new);
-                    if !list.contains(&dest) {
-                        println!(
-                            "network-core: new subscriber for stream {}: {dest}",
-                            req.stream_id
-                        );
-                        list.push(dest);
+                    if valid_subscription_request(&req) {
+                        let dest = SocketAddr::new(src.ip(), req.receiver_port);
+                        let mut map = subscribers_by_stream.lock().unwrap();
+
+                        let now = Instant::now();
+                        for subscribers in map.values_mut() {
+                            subscribers.retain(|subscriber| {
+                                now.duration_since(subscriber.last_seen) < SUBSCRIBER_LEASE
+                            });
+                        }
+                        map.retain(|_, subscribers| !subscribers.is_empty());
+
+                        if map.contains_key(&req.stream_id) || map.len() < MAX_SUBSCRIBER_STREAMS {
+                            let list = map.entry(req.stream_id).or_default();
+                            if let Some(subscriber) = list
+                                .iter_mut()
+                                .find(|subscriber| subscriber.address == dest)
+                            {
+                                subscriber.last_seen = now;
+                            } else if list.len() < MAX_SUBSCRIBERS_PER_STREAM {
+                                println!(
+                                    "network-core: new subscriber for stream {}: {dest}",
+                                    req.stream_id
+                                );
+                                list.push(Subscriber {
+                                    address: dest,
+                                    last_seen: now,
+                                });
+                            }
+                        }
                     }
                 }
             }
@@ -307,4 +417,81 @@ pub fn start_control_listener(
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        active_subscribers, bind_control_listener_on, valid_advertisement,
+        valid_subscription_request, NodeAdvertisement, SubscribeRequest, Subscriber,
+        SubscriberRegistry, MAX_SUPPORTED_CHANNELS, SUBSCRIBER_LEASE,
+    };
+    use std::collections::HashMap;
+    use std::net::SocketAddr;
+    use std::sync::{Arc, Mutex};
+    use std::time::{Duration, Instant};
+
+    #[test]
+    fn control_listener_supports_advertised_ephemeral_ports() {
+        let socket = bind_control_listener_on(0).unwrap();
+        assert_ne!(socket.local_addr().unwrap().port(), 0);
+    }
+
+    fn advertisement() -> NodeAdvertisement {
+        NodeAdvertisement {
+            node_id: "node-1".to_string(),
+            node_name: "Sender".to_string(),
+            stream_id: 1,
+            stream_name: "Main".to_string(),
+            control_port: 7000,
+            channel_count: 2,
+            channel_labels: vec!["Left".to_string(), "Right".to_string()],
+        }
+    }
+
+    #[test]
+    fn discovery_advertisement_requires_valid_metadata_and_supported_channels() {
+        assert!(valid_advertisement(&advertisement()));
+
+        let mut invalid = advertisement();
+        invalid.control_port = 0;
+        assert!(!valid_advertisement(&invalid));
+
+        let mut invalid = advertisement();
+        invalid.channel_count = MAX_SUPPORTED_CHANNELS + 1;
+        assert!(!valid_advertisement(&invalid));
+
+        let mut invalid = advertisement();
+        invalid.node_name = " \n".to_string();
+        assert!(!valid_advertisement(&invalid));
+    }
+
+    #[test]
+    fn zero_receiver_port_is_not_a_valid_subscription() {
+        let request = SubscribeRequest {
+            stream_id: 1,
+            receiver_port: 0,
+        };
+        assert!(!valid_subscription_request(&request));
+
+        let request = SubscribeRequest {
+            stream_id: 1,
+            receiver_port: 7050,
+        };
+        assert!(valid_subscription_request(&request));
+    }
+
+    #[test]
+    fn subscriber_snapshot_expires_inactive_receivers() {
+        let registry: SubscriberRegistry = Arc::new(Mutex::new(HashMap::from([(
+            1,
+            vec![Subscriber {
+                address: "127.0.0.1:7050".parse::<SocketAddr>().unwrap(),
+                last_seen: Instant::now() - SUBSCRIBER_LEASE - Duration::from_secs(1),
+            }],
+        )])));
+
+        assert!(active_subscribers(&registry, 1).is_none());
+        assert!(registry.lock().unwrap().is_empty());
+    }
 }

@@ -1,9 +1,7 @@
 use crate::protocol::{
     sample_rate_to_code, AudioPayloadHeader, PacketHeader, SAMPLE_FORMAT_FLOAT32,
 };
-use network_core::discovery::{
-    start_advertising_with_labels, SubscribeRequest,
-};
+use network_core::discovery::{start_advertising_with_labels, SubscribeRequest};
 use serde::Deserialize;
 use std::collections::HashSet;
 use std::net::{SocketAddr, TcpStream, UdpSocket};
@@ -46,31 +44,42 @@ pub fn handle_publish_ws(
 
     let rate_code = sample_rate_to_code(handshake.sample_rate);
     if rate_code == 0 {
-        return Err(format!("Unsupported sample rate: {}", handshake.sample_rate));
+        return Err(format!(
+            "Unsupported sample rate: {}",
+            handshake.sample_rate
+        ));
     }
 
-    let stream_id = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().subsec_nanos() as u32;
+    let stream_id = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .subsec_nanos() as u32;
     let channels = handshake.channels;
-    
+    let max_frames_per_packet =
+        network_core::protocol::max_float32_frames_per_packet(channels as usize)?
+            .min(MAX_FRAMES_PER_PACKET);
+
     // We need a UdpSocket for sending audio packets
     let audio_socket = UdpSocket::bind("0.0.0.0:0").map_err(|e| e.to_string())?;
-    
+
     // We need a UdpSocket for the control port (to receive SubscribeRequest)
     let control_socket = UdpSocket::bind("0.0.0.0:0").map_err(|e| e.to_string())?;
-    control_socket.set_read_timeout(Some(Duration::from_millis(100))).unwrap();
+    control_socket
+        .set_read_timeout(Some(Duration::from_millis(100)))
+        .unwrap();
     let control_port = control_socket.local_addr().unwrap().port();
 
     let subscribers = Arc::new(Mutex::new(HashSet::<SocketAddr>::new()));
-    
+
     // Start discovery advertising
     let adv_keep_running = Arc::new(AtomicBool::new(true));
     let adv_keep_running_clone = adv_keep_running.clone();
-    
+
     let mut channel_labels = vec![];
     for i in 0..channels {
         channel_labels.push(format!("Channel {}", i + 1));
     }
-    
+
     let stream_name = handshake.stream_name.clone();
     std::thread::spawn(move || {
         let _ = start_advertising_with_labels(
@@ -101,12 +110,15 @@ pub fn handle_publish_ws(
         }
     });
 
-    println!("Web Publisher started: id={} port={}", stream_id, control_port);
-    
+    println!(
+        "Web Publisher started: id={} port={}",
+        stream_id, control_port
+    );
+
     // Audio sending loop
     let sequence = Arc::new(AtomicU32::new(0));
     let start_time = Instant::now();
-    
+
     loop {
         if !global_keep_running.load(Ordering::Relaxed) {
             break;
@@ -116,19 +128,21 @@ pub fn handle_publish_ws(
             Ok(Message::Binary(data)) => {
                 // `data` is a flat float32 array
                 let floats_count = data.len() / 4;
-                if floats_count == 0 { continue; }
-                
+                if floats_count == 0 {
+                    continue;
+                }
+
                 // parse as f32
                 let mut samples = Vec::with_capacity(floats_count);
                 for i in 0..floats_count {
                     let mut b = [0u8; 4];
-                    b.copy_from_slice(&data[i*4..(i+1)*4]);
+                    b.copy_from_slice(&data[i * 4..(i + 1) * 4]);
                     samples.push(f32::from_le_bytes(b));
                 }
 
                 let frame_count = floats_count / channels as usize;
                 let mut frame_offset = 0;
-                
+
                 let subs = {
                     let s = subscribers.lock().unwrap();
                     s.iter().cloned().collect::<Vec<_>>()
@@ -139,7 +153,8 @@ pub fn handle_publish_ws(
                 }
 
                 while frame_offset < frame_count {
-                    let frames_this_packet = (frame_count - frame_offset).min(MAX_FRAMES_PER_PACKET);
+                    let frames_this_packet =
+                        (frame_count - frame_offset).min(max_frames_per_packet);
                     let sequence_number = sequence.fetch_add(1, Ordering::Relaxed);
                     let timestamp_ns = start_time.elapsed().as_nanos() as u64;
 
@@ -157,7 +172,8 @@ pub fn handle_publish_ws(
                         samples_per_channel: frames_this_packet as u16,
                     };
 
-                    let mut packet = Vec::with_capacity(24 + 8 + frames_this_packet * channels as usize * 4);
+                    let mut packet =
+                        Vec::with_capacity(24 + 8 + frames_this_packet * channels as usize * 4);
                     packet.extend_from_slice(&header.to_bytes());
                     packet.extend_from_slice(&payload_header.to_bytes());
 

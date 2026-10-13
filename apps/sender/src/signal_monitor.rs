@@ -375,7 +375,7 @@ fn render_meter_bar(ui: &mut egui::Ui, desired_width: f32, peak_db: f32, held_pe
         painter.line_segment(
             [egui::pos2(x, rect.top()), egui::pos2(x, rect.bottom())],
             egui::Stroke::new(
-                1.0,
+                1.0_f32,
                 egui::Color32::from_rgba_unmultiplied(255, 255, 255, 55),
             ),
         );
@@ -391,7 +391,7 @@ fn render_meter_bar(ui: &mut egui::Ui, desired_width: f32, peak_db: f32, held_pe
                 egui::pos2(held_x, rect.top() + 1.0),
                 egui::pos2(held_x, rect.bottom() - 1.0),
             ],
-            egui::Stroke::new(2.0, peak_hold_color(held_peak_db)),
+            egui::Stroke::new(2.0_f32, peak_hold_color(held_peak_db)),
         );
     }
 

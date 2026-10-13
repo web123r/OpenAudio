@@ -1,17 +1,23 @@
-name: Publish Multi-Platform Release Binaries
+name: Publish OpenAudio Release Artifacts
 
 on:
   push:
     tags:
-      - 'v*'
-  workflow_dispatch:
+      - "v*"
+
+permissions:
+  contents: write
 
 env:
   CARGO_TERM_COLOR: always
+  # Set to 'true' once Gate A (VST3 REAPER host scan and audio validation) is
+  # complete and the plugin is ready for distribution.  Until then the VST3
+  # bundle is built and validated in CI but not included in the release ZIP.
+  INCLUDE_VST3_IN_RELEASE: 'false'
 
 jobs:
-  publish_release_binaries:
-    name: Build Release Binary (${{ matrix.os }})
+  build_release_assets:
+    name: Build Release Artifact (${{ matrix.target }})
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -19,7 +25,7 @@ jobs:
         include:
           - os: ubuntu-latest
             target: x86_64-unknown-linux-gnu
-            binary_name: openaudio-linux-x64
+            binary_name: OpenAudio
             asset_name: openaudio-linux-x64
           - os: macos-latest
             target: x86_64-apple-darwin
@@ -31,41 +37,122 @@ jobs:
             asset_name: openaudio-macos-arm64
           - os: windows-latest
             target: x86_64-pc-windows-msvc
-            binary_name: OpenAudio.exe
-            asset_name: OpenAudio-windows-x64.exe
 
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install Rust Toolchain
+      - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
 
-      - name: Install Linux Audio Dependencies
+      - name: Verify release tag matches the GUI package version
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $metadata = cargo metadata --no-deps --format-version 1 | ConvertFrom-Json
+          $package = $metadata.packages | Where-Object { $_.name -eq "openaudio-gui" }
+          $tagVersion = "${{ github.ref_name }}" -replace '^v', ''
+          $packageVersion = if ($package) { $package.version } else { "missing" }
+          if ($packageVersion -ne $tagVersion) {
+            throw "Release tag version '$tagVersion' does not match openaudio-gui package version '$packageVersion'."
+          }
+
+      - name: Install Linux audio dependencies
         if: runner.os == 'Linux'
         run: |
           sudo apt-get update
           sudo apt-get install -y libasound2-dev pkg-config libgtk-3-dev
 
-      - name: Build Release Binary
-        run: cargo build --release -p openaudio-gui --target ${{ matrix.target }}
+      - name: Build desktop application
+        run: cargo build --release -p openaudio-gui --bin OpenAudio --target ${{ matrix.target }}
 
-      - name: Prepare Binary Artifact
+      - name: Build Windows receiver
+        if: runner.os == 'Windows'
+        run: cargo build --release -p receiver --target ${{ matrix.target }}
+
+      # Always build the VST3 bundle on Windows to catch regressions.
+      # The bundle is only included in the release ZIP after Gate A validation
+      # passes.  To ship it, set INCLUDE_VST3_IN_RELEASE to 'true' above.
+      - name: Build Windows VST3 bundle
+        if: runner.os == 'Windows'
+        run: cargo xtask bundle openaudio-plugin --release --target ${{ matrix.target }}
+
+      - name: Prepare Windows portable package
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $stage = Join-Path $env:GITHUB_WORKSPACE "staging"
+          $package = Join-Path $stage "OpenAudio-windows-x64"
+          New-Item -ItemType Directory -Path $package -Force | Out-Null
+
+          Copy-Item "target/${{ matrix.target }}/release/OpenAudio.exe" $package
+          Copy-Item "target/${{ matrix.target }}/release/receiver.exe" $package
+          Copy-Item "README.md", "CHANGELOG.md", "LICENSE", "docs/windows-install.md" $package
+          Set-Content -Path (Join-Path $package "VERSION.txt") -Value "${{ github.ref_name }}" -Encoding ascii
+
+          # Include the VST3 bundle and its license notices only after Gate A
+          # hardware validation is confirmed.  Flip INCLUDE_VST3_IN_RELEASE to
+          # 'true' in the env section above when ready.
+          if ($env:INCLUDE_VST3_IN_RELEASE -eq 'true') {
+            $vst3Src = Join-Path $env:GITHUB_WORKSPACE "target/bundled/OpenAudio.vst3"
+            $vst3Dst = Join-Path $package "VST3"
+            New-Item -ItemType Directory -Path $vst3Dst -Force | Out-Null
+            Copy-Item -Recurse "$vst3Src" $vst3Dst
+            Copy-Item "apps/plugin/THIRD_PARTY_NOTICES.txt" (Join-Path $vst3Dst "OpenAudio.vst3")
+          }
+
+          $archive = Join-Path $stage "OpenAudio-windows-x64.zip"
+          Compress-Archive -Path (Join-Path $package "*") -DestinationPath $archive -CompressionLevel Optimal
+
+      - name: Prepare Unix release binary
+        if: runner.os != 'Windows'
         shell: bash
         run: |
           mkdir -p staging
-          if [ "${{ runner.os }}" = "Windows" ]; then
-            cp "target/${{ matrix.target }}/release/OpenAudio.exe" "staging/${{ matrix.asset_name }}"
-          elif [ "${{ runner.os }}" = "macOS" ]; then
-            cp "target/${{ matrix.target }}/release/OpenAudio" "staging/${{ matrix.asset_name }}"
-          else
-            cp "target/${{ matrix.target }}/release/OpenAudio" "staging/${{ matrix.asset_name }}"
-          fi
+          cp "target/${{ matrix.target }}/release/${{ matrix.binary_name }}" "staging/${{ matrix.asset_name }}"
 
-      - name: Upload Binaries to GitHub Release
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-assets-${{ matrix.target }}
+          path: staging/*
+          if-no-files-found: error
+          retention-days: 1
+
+  publish_release:
+    name: Publish release
+    needs: build_release_assets
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download release assets
+        uses: actions/download-artifact@v4
+        with:
+          pattern: release-assets-*
+          path: release-assets
+          merge-multiple: true
+
+      - name: Generate SHA-256 checksums
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $assets = Get-ChildItem -File -Path "release-assets" | Sort-Object Name
+          if (-not $assets) {
+            throw "No release assets were downloaded."
+          }
+
+          $lines = foreach ($asset in $assets) {
+            $hash = (Get-FileHash -Algorithm SHA256 -LiteralPath $asset.FullName).Hash.ToLowerInvariant()
+            "$hash  $($asset.Name)"
+          }
+          Set-Content -Path "release-assets/SHA256SUMS.txt" -Value $lines -Encoding ascii
+
+      - name: Publish GitHub release
         uses: softprops/action-gh-release@v2
         with:
-          files: staging/${{ matrix.asset_name }}
+          files: release-assets/*
+          fail_on_unmatched_files: true
+          generate_release_notes: true
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

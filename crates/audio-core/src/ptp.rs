@@ -36,7 +36,7 @@ impl PtpClock {
         let elapsed_ns = self.base_monotonic_instant.elapsed().as_nanos() as u64;
         let local_ns = self.base_system_time_ns.saturating_add(elapsed_ns);
         let offset = self.clock_offset_ns.load(Ordering::Relaxed);
-        
+
         if offset >= 0 {
             local_ns.saturating_add(offset as u64)
         } else {

@@ -21,14 +21,14 @@
 mod inner {
     use crate::asio::get_asio_device;
     use crate::ensure_realtime_audio_thread;
-    use crate::protocol::{parse_packet, ParsedPacket};
+    use crate::protocol::{float32_payload, parse_packet, ParsedPacket, SAMPLE_FORMAT_FLOAT32};
     use crate::recording::{
         create_wav_writer, finalize as finalize_recording, write_samples, SharedWavWriter,
     };
     use crate::util::safe_lock;
     use crate::{
-        register_scoped_signal_meter, AdaptiveJitterController, ClockSynchronizer,
-        resample_interleaved_linear, SignalDirection, SignalMeter,
+        register_scoped_signal_meter, AdaptiveJitterController, ClockSynchronizer, SignalDirection,
+        SignalMeter, StreamingLinearResampler,
     };
 
     use cpal::traits::{DeviceTrait, StreamTrait};
@@ -117,7 +117,6 @@ mod inner {
         let mut last_sequence = Some(first.sequence_number);
         let mut packets_received = 1u64;
         let mut packets_dropped = 0u64;
-        let mut jitter_controller = AdaptiveJitterController::new(sample_rate);
         let receive_clock_start = Instant::now();
         let mut clock_synchronizer = ClockSynchronizer::default();
         let mut last_clock_adjustment = Instant::now();
@@ -148,15 +147,11 @@ mod inner {
 
         let output_channels = output_config.channels() as usize;
         let output_sample_rate = output_config.sample_rate().0;
+        let mut jitter_controller = AdaptiveJitterController::new(output_sample_rate);
 
-        if output_sample_rate != sample_rate {
-            resample_buffer(
-                &audio_buffer,
-                incoming_channels,
-                sample_rate,
-                output_sample_rate,
-            );
-        }
+        let mut resampler =
+            StreamingLinearResampler::new(incoming_channels, sample_rate, output_sample_rate)?;
+        resample_buffer(&audio_buffer, &mut resampler)?;
 
         validate_routes(
             &output_routes,
@@ -205,7 +200,7 @@ mod inner {
             subscribed_stream_id,
             incoming_channels,
             sample_rate,
-            output_sample_rate,
+            &mut resampler,
             &jitter_controller,
             keep_running.clone(),
             &mut last_sequence,
@@ -254,6 +249,7 @@ mod inner {
             incoming_channels,
             sample_rate,
             output_sample_rate,
+            &mut resampler,
             keep_running,
             &mut last_sequence,
             &mut packets_received,
@@ -329,7 +325,7 @@ mod inner {
                 continue;
             }
 
-            append_packet_samples(audio_buffer, packet, &parsed, parsed.sample_rate)?;
+            append_packet_samples(audio_buffer, packet, &parsed, None)?;
 
             return Ok(parsed);
         }
@@ -343,7 +339,7 @@ mod inner {
         stream_id: u32,
         incoming_channels: usize,
         sample_rate: u32,
-        output_sample_rate: u32,
+        resampler: &mut StreamingLinearResampler,
         jitter_controller: &AdaptiveJitterController,
         keep_running: Arc<AtomicBool>,
         last_sequence: &mut Option<u32>,
@@ -400,12 +396,7 @@ mod inner {
 
             update_sequence_statistics(parsed.sequence_number, last_sequence, packets_dropped);
 
-            append_packet_samples(
-                audio_buffer,
-                packet,
-                &parsed,
-                output_sample_rate,
-            )?;
+            append_packet_samples(audio_buffer, packet, &parsed, Some(resampler))?;
 
             *packets_received = packets_received.saturating_add(1);
         }
@@ -429,6 +420,7 @@ mod inner {
         incoming_channels: usize,
         sample_rate: u32,
         output_sample_rate: u32,
+        resampler: &mut StreamingLinearResampler,
         keep_running: Arc<AtomicBool>,
         last_sequence: &mut Option<u32>,
         packets_received: &mut u64,
@@ -438,7 +430,7 @@ mod inner {
         receive_clock_start: Instant,
         last_clock_adjustment: &mut Instant,
     ) -> Result<(), String> {
-        let max_buffered_frames = (sample_rate as f64 * MAX_BUFFER_SECS) as usize;
+        let max_buffered_frames = (output_sample_rate as f64 * MAX_BUFFER_SECS) as usize;
 
         while keep_running.load(Ordering::Relaxed) {
             let (length, _) = match socket.recv_from(udp_buffer) {
@@ -480,7 +472,7 @@ mod inner {
                      {}ch @ {}Hz",
                     stream_id,
                     incoming_channels,
-                    output_sample_rate,
+                    sample_rate,
                     parsed.channel_count,
                     parsed.sample_rate
                 );
@@ -497,12 +489,7 @@ mod inner {
 
             update_sequence_statistics(parsed.sequence_number, last_sequence, packets_dropped);
 
-            append_packet_samples(
-                audio_buffer,
-                packet,
-                &parsed,
-                output_sample_rate,
-            )?;
+            append_packet_samples(audio_buffer, packet, &parsed, Some(resampler))?;
 
             apply_clock_correction(
                 audio_buffer,
@@ -980,6 +967,10 @@ mod inner {
     }
 
     fn validate_packet_payload(packet: &[u8], parsed: &ParsedPacket) -> Result<(), String> {
+        if parsed.sample_format != SAMPLE_FORMAT_FLOAT32 {
+            return Err("ASIO playback currently supports Float32 PCM packets only".to_string());
+        }
+
         let sample_count = (parsed.samples_per_channel as usize)
             .checked_mul(parsed.channel_count as usize)
             .ok_or_else(|| "OpenAudio packet sample count overflow".to_string())?;
@@ -1000,6 +991,9 @@ mod inner {
                 packet.len()
             ));
         }
+        if float32_payload(packet, parsed).is_none() {
+            return Err("invalid Float32 PCM packet payload".to_string());
+        }
 
         Ok(())
     }
@@ -1008,7 +1002,7 @@ mod inner {
         audio_buffer: &SharedAudioBuffer,
         packet: &[u8],
         parsed: &ParsedPacket,
-        output_sample_rate: u32,
+        resampler: Option<&mut StreamingLinearResampler>,
     ) -> Result<(), String> {
         validate_packet_payload(packet, parsed)?;
 
@@ -1033,12 +1027,10 @@ mod inner {
             .chunks_exact(4)
             .map(|bytes| f32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
             .collect::<Vec<_>>();
-        let samples = resample_interleaved_linear(
-            &samples,
-            parsed.channel_count as usize,
-            parsed.sample_rate,
-            output_sample_rate,
-        );
+        let samples = match resampler {
+            Some(resampler) => resampler.process(&samples)?,
+            None => samples,
+        };
 
         let mut guard = safe_lock(audio_buffer);
         guard.reserve(samples.len());
@@ -1049,14 +1041,13 @@ mod inner {
 
     fn resample_buffer(
         audio_buffer: &SharedAudioBuffer,
-        channels: usize,
-        input_rate: u32,
-        output_rate: u32,
-    ) {
+        resampler: &mut StreamingLinearResampler,
+    ) -> Result<(), String> {
         let mut guard = safe_lock(audio_buffer);
         let input = guard.drain(..).collect::<Vec<_>>();
-        let output = resample_interleaved_linear(&input, channels, input_rate, output_rate);
+        let output = resampler.process(&input)?;
         guard.extend(output);
+        Ok(())
     }
 
     fn apply_clock_correction(

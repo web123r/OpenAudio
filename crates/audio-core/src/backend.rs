@@ -17,9 +17,16 @@ pub trait AudioBackend: Send + Sync {
     fn list_input_devices(&self) -> Vec<DeviceInfo>;
     fn list_output_devices(&self) -> Vec<DeviceInfo>;
 
-    fn get_input_config(&self, device_name: Option<&str>) -> Result<(String, StreamConfig), String>;
-    fn get_output_config(&self, device_name: Option<&str>) -> Result<(String, StreamConfig), String>;
-    fn get_loopback_config(&self, device_name: Option<&str>) -> Result<(String, StreamConfig), String>;
+    fn get_input_config(&self, device_name: Option<&str>)
+        -> Result<(String, StreamConfig), String>;
+    fn get_output_config(
+        &self,
+        device_name: Option<&str>,
+    ) -> Result<(String, StreamConfig), String>;
+    fn get_loopback_config(
+        &self,
+        device_name: Option<&str>,
+    ) -> Result<(String, StreamConfig), String>;
 
     fn build_input_stream(
         &self,

@@ -1,6 +1,6 @@
 use crate::ensure_realtime_audio_thread;
 
-use crate::protocol::parse_packet;
+use crate::protocol::{float32_payload, parse_packet};
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream, UdpSocket};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -52,7 +52,9 @@ pub fn receive_and_serve_web(
         match socket.recv_from(&mut buf) {
             Ok((len, _src)) => {
                 if let Some(parsed) = parse_packet(&buf[..len]) {
-                    break (parsed.channel_count as u16, parsed.sample_rate);
+                    if float32_payload(&buf[..len], &parsed).is_some() {
+                        break (parsed.channel_count as u16, parsed.sample_rate);
+                    }
                 }
             }
             Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => continue,
@@ -184,24 +186,20 @@ pub fn receive_and_serve_web(
         if parsed.channel_count as u16 != channel_count || parsed.sample_rate != sample_rate {
             continue;
         }
-        packets_received += 1;
-
-        let sample_count = parsed.samples_per_channel as usize * parsed.channel_count as usize;
-        let payload_end = parsed.payload_offset + sample_count * 4;
-        if payload_end > len {
+        let Some(payload) = float32_payload(&buf[..len], &parsed) else {
             continue;
-        }
+        };
+        packets_received += 1;
 
         if batched_payload.is_empty() {
             batch_started = Instant::now();
         }
 
-        batched_payload.extend_from_slice(&buf[parsed.payload_offset..payload_end]);
+        batched_payload.extend_from_slice(payload);
         batched_frames += parsed.samples_per_channel as usize;
 
-        let target_batch_frames =
-            (sample_rate as usize * WEB_AUDIO_BATCH_MS as usize / 1_000)
-                .max(parsed.samples_per_channel as usize);
+        let target_batch_frames = (sample_rate as usize * WEB_AUDIO_BATCH_MS as usize / 1_000)
+            .max(parsed.samples_per_channel as usize);
 
         if batched_frames >= target_batch_frames {
             flush_web_audio_batch(

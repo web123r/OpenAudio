@@ -1,5 +1,5 @@
-use std::path::PathBuf;
 use rfd::FileDialog;
+use std::path::PathBuf;
 
 const EXTENSION: &str = "oapreset";
 const DESCRIPTION: &str = "OpenAudio preset";

@@ -6,6 +6,7 @@ members = [
     "apps/sender",
     "apps/receiver",
     "apps/plugin",
+    "apps/plugin/xtask",
 ]
 
 # Future milestones will add:

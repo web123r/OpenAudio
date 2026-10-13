@@ -52,9 +52,7 @@ impl AppPage {
             Self::Subscribe => {
                 "Receive discovered streams and route them to WASAPI, split devices, or ASIO."
             }
-            Self::Browser => {
-                "Control secure browser playback and trusted-LAN access."
-            }
+            Self::Browser => "Control secure browser playback and trusted-LAN access.",
             Self::Diagnostics => {
                 "Generate synthetic streams and test multichannel network performance."
             }
@@ -62,11 +60,7 @@ impl AppPage {
     }
 }
 
-pub fn render_navigation(
-    ui: &mut egui::Ui,
-    active_page: &mut AppPage,
-    summary: UiSummary,
-) {
+pub fn render_navigation(ui: &mut egui::Ui, active_page: &mut AppPage, summary: UiSummary) {
     egui::Frame::none()
         .fill(BG_SECONDARY)
         .rounding(12.0)
@@ -197,28 +191,16 @@ fn render_summary(ui: &mut egui::Ui, summary: UiSummary) {
             summary_card(
                 &mut columns[0],
                 "Publishers",
-                &format!(
-                    "{} running",
-                    summary.running_publishers
-                ),
-                &format!(
-                    "{} configured",
-                    summary.configured_publishers
-                ),
+                &format!("{} running", summary.running_publishers),
+                &format!("{} configured", summary.configured_publishers),
                 ACCENT_GREEN,
             );
 
             summary_card(
                 &mut columns[1],
                 "Subscribers",
-                &format!(
-                    "{} running",
-                    summary.running_subscribers
-                ),
-                &format!(
-                    "{} configured",
-                    summary.configured_subscribers
-                ),
+                &format!("{} running", summary.running_subscribers),
+                &format!("{} configured", summary.configured_subscribers),
                 ACCENT_PURPLE,
             );
 
@@ -242,8 +224,7 @@ fn render_summary(ui: &mut egui::Ui, summary: UiSummary) {
                     "Publishers",
                     &format!(
                         "{}/{}",
-                        summary.running_publishers,
-                        summary.configured_publishers
+                        summary.running_publishers, summary.configured_publishers
                     ),
                     ACCENT_GREEN,
                 );
@@ -253,8 +234,7 @@ fn render_summary(ui: &mut egui::Ui, summary: UiSummary) {
                     "Subscribers",
                     &format!(
                         "{}/{}",
-                        summary.running_subscribers,
-                        summary.configured_subscribers
+                        summary.running_subscribers, summary.configured_subscribers
                     ),
                     ACCENT_PURPLE,
                 );
@@ -284,12 +264,7 @@ fn render_summary(ui: &mut egui::Ui, summary: UiSummary) {
                     TEXT_SECONDARY
                 };
 
-                compact_summary_card(
-                    ui,
-                    "Gateway",
-                    gateway_text,
-                    gateway_color,
-                );
+                compact_summary_card(ui, "Gateway", gateway_text, gateway_color);
 
                 ui.end_row();
             });
@@ -311,11 +286,7 @@ fn summary_card(
             ui.set_min_height(72.0);
 
             ui.horizontal(|ui| {
-                ui.label(
-                    egui::RichText::new("●")
-                        .size(10.0)
-                        .color(accent),
-                );
+                ui.label(egui::RichText::new("●").size(10.0).color(accent));
 
                 ui.label(
                     egui::RichText::new(title)
@@ -342,45 +313,19 @@ fn summary_card(
         });
 }
 
-fn gateway_summary_card(
-    ui: &mut egui::Ui,
-    summary: UiSummary,
-) {
+fn gateway_summary_card(ui: &mut egui::Ui, summary: UiSummary) {
     let (primary, secondary, color) = if summary.gateway_running {
-        (
-            "Running",
-            "browser playback exposed",
-            ACCENT_GREEN,
-        )
+        ("Running", "browser playback exposed", ACCENT_GREEN)
     } else if summary.gateway_stopping {
-        (
-            "Stopping",
-            "waiting for gateway thread",
-            ACCENT_ORANGE,
-        )
+        ("Stopping", "waiting for gateway thread", ACCENT_ORANGE)
     } else {
-        (
-            "Stopped",
-            "browser playback private",
-            TEXT_SECONDARY,
-        )
+        ("Stopped", "browser playback private", TEXT_SECONDARY)
     };
 
-    summary_card(
-        ui,
-        "Browser Gateway",
-        primary,
-        secondary,
-        color,
-    );
+    summary_card(ui, "Browser Gateway", primary, secondary, color);
 }
 
-fn compact_summary_card(
-    ui: &mut egui::Ui,
-    title: &str,
-    value: &str,
-    accent: egui::Color32,
-) {
+fn compact_summary_card(ui: &mut egui::Ui, title: &str, value: &str, accent: egui::Color32) {
     let available = (ui.available_width() * 0.5 - 6.0).max(135.0);
 
     egui::Frame::none()
@@ -391,17 +336,8 @@ fn compact_summary_card(
             ui.set_min_width(available);
             ui.set_min_height(54.0);
 
-            ui.label(
-                egui::RichText::new(title)
-                    .size(10.0)
-                    .color(TEXT_SECONDARY),
-            );
+            ui.label(egui::RichText::new(title).size(10.0).color(TEXT_SECONDARY));
 
-            ui.label(
-                egui::RichText::new(value)
-                    .size(15.0)
-                    .strong()
-                    .color(accent),
-            );
+            ui.label(egui::RichText::new(value).size(15.0).strong().color(accent));
         });
 }

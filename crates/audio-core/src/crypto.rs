@@ -39,15 +39,16 @@ mod tests {
         let cipher = StreamCipher::new(&key);
 
         let pcm_payload = vec![0.1f32, -0.5f32, 0.9f32];
-        let raw_bytes: Vec<u8> = pcm_payload
-            .iter()
-            .flat_map(|f| f.to_le_bytes())
-            .collect();
+        let raw_bytes: Vec<u8> = pcm_payload.iter().flat_map(|f| f.to_le_bytes()).collect();
 
-        let encrypted = cipher.encrypt(&nonce, &raw_bytes).expect("encryption succeeds");
+        let encrypted = cipher
+            .encrypt(&nonce, &raw_bytes)
+            .expect("encryption succeeds");
         assert_ne!(encrypted, raw_bytes);
 
-        let decrypted = cipher.decrypt(&nonce, &encrypted).expect("decryption succeeds");
+        let decrypted = cipher
+            .decrypt(&nonce, &encrypted)
+            .expect("decryption succeeds");
         assert_eq!(decrypted, raw_bytes);
     }
 }

@@ -61,8 +61,9 @@ fn main() {
         timer_flag.store(false, Ordering::Relaxed);
     });
 
+    let device_targets = device_names.into_iter().map(Some).collect();
     if let Err(e) =
-        audio_core::receive_and_split_to_devices(&my_bind_addr, device_names, keep_running)
+        audio_core::receive_and_split_to_devices(&my_bind_addr, device_targets, false, keep_running)
     {
         eprintln!("Error: {e}");
     }

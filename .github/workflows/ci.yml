@@ -33,11 +33,18 @@ jobs:
     - name: Check Workspace
       run: cargo check --workspace
 
-    - name: Run Network-Core Tests
-      run: cargo test -p network-core
+    - name: Run Workspace Tests
+      run: cargo test --workspace
 
-    - name: Run Audio-Core Tests
-      run: cargo test -p audio-core --lib
+    - name: Run Browser Playback Tests
+      run: node --test crates/audio-core/tests/web_player.test.js
+
+    - name: Build Sender App
+      run: cargo build -p openaudio-gui --bin OpenAudio
 
     - name: Build Receiver App
       run: cargo build -p receiver
+
+    - name: Bundle Windows VST3 Sender
+      if: runner.os == 'Windows'
+      run: cargo xtask bundle openaudio-plugin --release

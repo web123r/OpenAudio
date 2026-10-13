@@ -1,12 +1,12 @@
 use crate::backend::get_backend;
 use crate::ensure_realtime_audio_thread;
-use crate::resample_interleaved_linear;
-use crate::protocol::parse_packet;
+use crate::protocol::{float32_payload, parse_packet};
 use crate::recording::{
     create_wav_writer, finalize as finalize_recording, generate_record_path, write_samples,
     SharedWavWriter,
 };
 use crate::util::safe_lock;
+use crate::StreamingLinearResampler;
 use crate::{register_scoped_signal_meter, SignalDirection};
 use std::collections::VecDeque;
 use std::net::UdpSocket;
@@ -40,7 +40,7 @@ pub fn receive_and_split_to_devices(
     // non-ASIO publishers.
     let mut packet_buffer = [0u8; 65_536];
 
-    let (channel_count, sample_rate, first_payload_offset, first_packet_length) = loop {
+    let (channel_count, sample_rate, first_payload) = loop {
         if !keep_running.load(Ordering::Relaxed) {
             return Ok(());
         }
@@ -48,11 +48,14 @@ pub fn receive_and_split_to_devices(
         match socket.recv_from(&mut packet_buffer) {
             Ok((packet_length, _source)) => {
                 if let Some(parsed) = parse_packet(&packet_buffer[..packet_length]) {
+                    let Some(payload) = float32_payload(&packet_buffer[..packet_length], &parsed)
+                    else {
+                        continue;
+                    };
                     break (
                         parsed.channel_count as usize,
                         parsed.sample_rate,
-                        parsed.payload_offset,
-                        packet_length,
+                        payload.to_vec(),
                     );
                 }
             }
@@ -135,11 +138,16 @@ pub fn receive_and_split_to_devices(
             .clone()
             .unwrap_or_else(|| "System Default".to_string());
 
-        let (_device_label, output_config) = backend.get_output_config(target.as_deref()).map_err(|error| {
-            format!("channel {channel_index} ('{label}'): {error}")
-        })?;
+        let (_device_label, output_config) = backend
+            .get_output_config(target.as_deref())
+            .map_err(|error| format!("channel {channel_index} ('{label}'): {error}"))?;
 
         let output_channels = output_config.channels as usize;
+        if output_channels == 0 {
+            return Err(format!(
+                "channel {channel_index} ('{label}') exposes zero output channels"
+            ));
+        }
         let output_sample_rate = output_config.sample_rate;
         output_sample_rates.push(output_sample_rate);
 
@@ -148,43 +156,34 @@ pub fn receive_and_split_to_devices(
         let signal_meter_for_callback = signal_meter.clone();
         let logical_meter_channel = channel_index;
 
-        let stream = backend.build_output_stream(
-            target.as_deref(),
-            Box::new(move |data: &mut [f32]| {
-                ensure_realtime_audio_thread();
+        let stream = backend
+            .build_output_stream(
+                target.as_deref(),
+                Box::new(move |data: &mut [f32]| {
+                    ensure_realtime_audio_thread();
 
-                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    let mut buffer = safe_lock(&buffer_for_callback);
+                    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        render_split_channel(data, output_channels, &buffer_for_callback);
 
-                    // We ignore `output_channels` and output mono
-                    // (the same sample duplicated) across all channels
-                    // the device natively exposes.
-                    for frame in data.chunks_mut(output_channels) {
-                        let sample = buffer.pop_front().unwrap_or(0.0);
-                        for out_sample in frame {
-                            *out_sample = sample;
-                        }
-                    }
+                        signal_meter_for_callback.observe_channel(logical_meter_channel, data);
+                    }));
 
-                    signal_meter_for_callback.observe_channel(logical_meter_channel, data);
-                }));
-
-                if result.is_err() {
-                    eprintln!(
-                        "audio-core: panic caught in split \
+                    if result.is_err() {
+                        eprintln!(
+                            "audio-core: panic caught in split \
                          callback — outputting silence this cycle"
-                    );
-                    data.fill(0.0);
-                    signal_meter_for_callback.observe_channel(logical_meter_channel, data);
-                }
-            }),
-        )
-        .map_err(|error| {
-            format!(
-                "channel {channel_index} ('{label}'): \
-                 failed to build stream: {error}"
+                        );
+                        data.fill(0.0);
+                        signal_meter_for_callback.observe_channel(logical_meter_channel, data);
+                    }
+                }),
             )
-        })?;
+            .map_err(|error| {
+                format!(
+                    "channel {channel_index} ('{label}'): \
+                 failed to build stream: {error}"
+                )
+            })?;
 
         stream
             .play()
@@ -193,15 +192,20 @@ pub fn receive_and_split_to_devices(
         streams.push(stream);
     }
 
+    let mut resamplers = output_sample_rates
+        .iter()
+        .map(|&output_sample_rate| {
+            StreamingLinearResampler::new(1, sample_rate, output_sample_rate)
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+
     demux_into_buffers(
         &per_channel_buffers,
         &writers,
-        &packet_buffer[..first_packet_length],
-        first_payload_offset,
+        &mut resamplers,
+        &first_payload,
         channel_count,
-        sample_rate,
-        &output_sample_rates,
-    );
+    )?;
 
     println!("All {channel_count} channel(s) playing. Streaming...");
 
@@ -238,24 +242,25 @@ pub fn receive_and_split_to_devices(
             continue;
         }
 
+        let Some(payload) = float32_payload(packet, &parsed) else {
+            continue;
+        };
+
         packets_received = packets_received.saturating_add(1);
 
         demux_into_buffers(
             &per_channel_buffers,
             &writers,
-            packet,
-            parsed.payload_offset,
+            &mut resamplers,
+            payload,
             channel_count,
-            sample_rate,
-            &output_sample_rates,
-        );
+        )?;
 
-        // Keep no more than 200ms per logical channel. Dropping the
-        // oldest samples prevents network or device stalls from
-        // creating unbounded latency.
+        // Each split queue is mono, so trimming individual samples also
+        // preserves frame alignment.
         for (channel_index, channel_buffer) in per_channel_buffers.iter().enumerate() {
-            let maximum_samples = ((output_sample_rates[channel_index] as f64 * 0.2) as usize)
-                .max(1);
+            let maximum_samples =
+                ((output_sample_rates[channel_index] as f64 * 0.2) as usize).max(1);
             let mut buffer = safe_lock(channel_buffer);
 
             while buffer.len() > maximum_samples {
@@ -322,37 +327,27 @@ fn render_split_channel(
 fn demux_into_buffers(
     per_channel_buffers: &[Arc<Mutex<VecDeque<f32>>>],
     writers: &[Option<SharedWavWriter>],
-    packet: &[u8],
-    payload_offset: usize,
+    resamplers: &mut [StreamingLinearResampler],
+    payload: &[u8],
     channel_count: usize,
-    input_sample_rate: u32,
-    output_sample_rates: &[u32],
-) {
+) -> Result<(), String> {
     if channel_count == 0
         || per_channel_buffers.len() < channel_count
         || writers.len() < channel_count
-        || output_sample_rates.len() < channel_count
+        || resamplers.len() < channel_count
     {
-        return;
+        return Err("split stream has inconsistent channel routing state".to_string());
     }
-
-    let Some(payload) = packet.get(payload_offset..) else {
-        eprintln!(
-            "audio-core: split dropping packet with invalid \
-             payload offset"
-        );
-        return;
-    };
 
     let bytes_per_frame = match channel_count.checked_mul(4) {
         Some(value) if value > 0 => value,
-        _ => return,
+        _ => return Err("split stream has an invalid channel count".to_string()),
     };
 
     let frame_count = payload.len() / bytes_per_frame;
 
     if frame_count == 0 {
-        return;
+        return Ok(());
     }
 
     // Lock each destination queue once per packet instead of once per
@@ -377,12 +372,7 @@ fn demux_into_buffers(
     }
 
     for channel_index in 0..channel_count {
-        let converted = resample_interleaved_linear(
-            &channel_samples[channel_index],
-            1,
-            input_sample_rate,
-            output_sample_rates[channel_index],
-        );
+        let converted = resamplers[channel_index].process(&channel_samples[channel_index])?;
 
         {
             let mut destination = safe_lock(&per_channel_buffers[channel_index]);
@@ -394,4 +384,5 @@ fn demux_into_buffers(
             write_samples(writer, &channel_samples[channel_index]);
         }
     }
+    Ok(())
 }

@@ -12,7 +12,7 @@ pub mod inner {
     use std::collections::VecDeque;
     use std::net::UdpSocket;
     use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
-    use std::sync::{Arc, Mutex};
+    use std::sync::{Arc, Mutex, TryLockError};
     use std::time::{Duration, Instant};
 
     use crate::discovery::{start_advertising_with_labels, SubscriberRegistry};
@@ -645,7 +645,16 @@ pub mod inner {
 
         let incoming_selected_samples = frame_count.saturating_mul(selected_channel_count);
 
-        let mut queue = safe_lock(capture_buffer);
+        let mut queue = match capture_buffer.try_lock() {
+            Ok(queue) => queue,
+            Err(TryLockError::Poisoned(poisoned)) => poisoned.into_inner(),
+            Err(TryLockError::WouldBlock) => {
+                metrics
+                    .dropped_capture_frames
+                    .fetch_add(frame_count as u64, Ordering::Relaxed);
+                return;
+            }
+        };
 
         let required_capacity = queue.len().saturating_add(incoming_selected_samples);
 
@@ -771,14 +780,9 @@ pub mod inner {
             // useful while the publisher is waiting for a receiver.
             signal_meter.observe_interleaved(&samples, channel_count);
 
-            let destinations = {
-                let subscribers = safe_lock(subscribers_by_stream);
-
-                subscribers
-                    .get(&stream_id)
-                    .filter(|addresses| !addresses.is_empty())
-                    .cloned()
-            };
+            let destinations =
+                crate::discovery::active_subscribers(subscribers_by_stream, stream_id)
+                    .filter(|addresses| !addresses.is_empty());
 
             // Captured data is always drained to prevent unlimited
             // latency, even when no subscriber is connected.
@@ -936,6 +940,28 @@ pub mod inner {
         #[test]
         fn zero_channels_are_rejected() {
             assert!(calculate_max_frames_per_packet(0).is_err());
+        }
+
+        #[test]
+        fn capture_callback_drops_cycle_instead_of_waiting_for_queue_lock() {
+            let capture_buffer = Arc::new(Mutex::new(VecDeque::with_capacity(8)));
+            let metrics = CaptureMetrics::default();
+            let locked_queue = capture_buffer.lock().unwrap();
+
+            capture_selected_channels(
+                &[0.1f32, 0.2, 0.3, 0.4],
+                2,
+                &[0, 1],
+                &capture_buffer,
+                8,
+                2,
+                &metrics,
+                &|sample| sample,
+            );
+
+            assert_eq!(locked_queue.len(), 0);
+            assert_eq!(metrics.dropped_capture_frames.load(Ordering::Relaxed), 2);
+            drop(locked_queue);
         }
     }
 }

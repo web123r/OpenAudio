@@ -19,10 +19,10 @@
 //! Milestone 14: Synthetic multichannel publishing for network diagnostics.
 
 pub mod backend;
-pub mod cpal_backend;
 mod bus;
 mod capture;
 mod combine;
+pub mod cpal_backend;
 mod devices;
 mod diagnostic_publish;
 mod discovery;
@@ -40,12 +40,12 @@ mod web_gateway;
 pub mod web_publish;
 mod web_stream;
 
-pub mod crypto;
-pub mod ptp;
-pub mod webrtc_gateway;
 pub mod asio;
 mod asio_subscribe;
+pub mod crypto;
+pub mod ptp;
 pub mod signal_meter;
+pub mod webrtc_gateway;
 
 pub use signal_meter::{
     register_scoped_signal_meter, register_signal_meter, remove_signal_meter,
@@ -61,13 +61,12 @@ pub use platform::{
 
 pub use stream_control::{
     resample_interleaved_linear, AdaptiveJitterController, ClockSynchronizer,
+    StreamingLinearResampler,
 };
 
 // ── Standard audio-device discovery ─────────────────────────────────────
 
-pub use devices::{
-    list_input_devices, list_output_devices, DeviceInfo, NONE_DEVICE,
-};
+pub use devices::{list_input_devices, list_output_devices, DeviceInfo, NONE_DEVICE};
 
 // ── Basic capture and receive operations ────────────────────────────────
 
@@ -104,8 +103,8 @@ pub use bus::{
 
 pub use discovery::{
     send_subscribe_request, start_advertising, start_advertising_with_labels,
-    start_control_listener, start_discovery_listener,
-    DiscoveredNode, NodeAdvertisement, SubscriberRegistry,
+    start_control_listener, start_discovery_listener, DiscoveredNode, NodeAdvertisement,
+    SubscriberRegistry,
 };
 
 // ── Multichannel standard-device and SAR routing ────────────────────────

@@ -1,12 +1,12 @@
 use crate::devices::is_skip;
-use crate::protocol::{parse_packet, ParsedPacket};
+use crate::protocol::{float32_payload, parse_packet, ParsedPacket};
 use crate::recording::{
     create_wav_writer, finalize as finalize_recording, write_samples, SharedWavWriter,
 };
-use crate::util::safe_lock;
+use crate::util::{safe_lock, trim_interleaved_queue};
 use crate::{
-    ensure_realtime_audio_thread, register_scoped_signal_meter, resample_interleaved_linear,
-    SignalDirection, SignalMeter, JITTER_BUFFER_TARGET_SECS,
+    ensure_realtime_audio_thread, register_scoped_signal_meter, SignalDirection, SignalMeter,
+    StreamingLinearResampler, JITTER_BUFFER_TARGET_SECS,
 };
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::net::UdpSocket;
@@ -82,7 +82,7 @@ pub fn receive_and_play_bus_with_volume(
 
     let mut packet_buffer = [0u8; 65_536];
 
-    let (channel_count, sample_rate) = loop {
+    let (channel_count, sample_rate, first_packet) = loop {
         if !keep_running.load(Ordering::Relaxed) {
             return Ok(());
         }
@@ -90,14 +90,14 @@ pub fn receive_and_play_bus_with_volume(
         match socket.recv_from(&mut packet_buffer) {
             Ok((length, _source)) => {
                 if let Some(parsed) = parse_packet(&packet_buffer[..length]) {
-                    push_samples(
-                        &buffers,
-                        &packet_buffer[..length],
-                        &parsed,
+                    if float32_payload(&packet_buffer[..length], &parsed).is_none() {
+                        continue;
+                    }
+                    break (
+                        parsed.channel_count as u16,
                         parsed.sample_rate,
+                        packet_buffer[..length].to_vec(),
                     );
-
-                    break (parsed.channel_count as u16, parsed.sample_rate);
                 }
             }
             Err(ref error) if error.kind() == std::io::ErrorKind::WouldBlock => {
@@ -123,11 +123,6 @@ pub fn receive_and_play_bus_with_volume(
          Setting up playback..."
     );
 
-    let writer: Option<SharedWavWriter> = match &record_path {
-        Some(path) => Some(create_wav_writer(path, channel_count, sample_rate)?),
-        None => None,
-    };
-
     // Headless path: drain, mix, record, and meter the bus without
     // opening physical output hardware.
     if is_skip(&device_name) {
@@ -144,6 +139,21 @@ pub fn receive_and_play_bus_with_volume(
         );
 
         let headless_buffers = buffers.clone();
+        let mut resamplers = HashMap::new();
+        let first_parsed = parse_packet(&first_packet)
+            .ok_or_else(|| "first bus packet became invalid".to_string())?;
+        push_samples(
+            &buffers,
+            &mut resamplers,
+            &first_packet,
+            &first_parsed,
+            sample_rate,
+        )?;
+
+        let writer: Option<SharedWavWriter> = match &record_path {
+            Some(path) => Some(create_wav_writer(path, channel_count, sample_rate)?),
+            None => None,
+        };
         let headless_volume = volume.clone();
         let headless_writer = writer.clone();
         let headless_keep_running = keep_running.clone();
@@ -170,8 +180,8 @@ pub fn receive_and_play_bus_with_volume(
             &socket,
             &mut packet_buffer,
             &buffers,
+            &mut resamplers,
             channel_count,
-            sample_rate,
             sample_rate,
             keep_running,
         );
@@ -184,6 +194,32 @@ pub fn receive_and_play_bus_with_volume(
     let output_channels = output_config.channels as usize;
     let output_sample_rate = output_config.sample_rate;
     let input_channels = channel_count as usize;
+
+    if output_channels == 0 {
+        return Err(format!(
+            "output device '{device_label}' exposes zero channels"
+        ));
+    }
+
+    let writer: Option<SharedWavWriter> = match &record_path {
+        Some(path) => Some(create_wav_writer(
+            path,
+            output_channels as u16,
+            output_sample_rate,
+        )?),
+        None => None,
+    };
+
+    let mut resamplers = HashMap::new();
+    let first_parsed =
+        parse_packet(&first_packet).ok_or_else(|| "first bus packet became invalid".to_string())?;
+    push_samples(
+        &buffers,
+        &mut resamplers,
+        &first_packet,
+        &first_parsed,
+        output_sample_rate,
+    )?;
 
     if output_channels != input_channels {
         println!(
@@ -204,6 +240,9 @@ pub fn receive_and_play_bus_with_volume(
     let volume_for_callback = volume.clone();
     let writer_for_callback = writer.clone();
     let signal_meter_for_callback = signal_meter.clone();
+    let mut mixed_frame = vec![0.0f32; output_channels];
+    let mut input_frame = vec![0.0f32; input_channels];
+    let mut remapped_frame = vec![0.0f32; output_channels];
 
     let stream = backend.build_output_stream(
         device_name.as_deref(),
@@ -217,6 +256,9 @@ pub fn receive_and_play_bus_with_volume(
                     input_channels,
                     &buffers_for_callback,
                     &volume_for_callback,
+                    &mut mixed_frame,
+                    &mut input_frame,
+                    &mut remapped_frame,
                 );
 
                 // Observe the final samples after mixing,
@@ -241,6 +283,7 @@ pub fn receive_and_play_bus_with_volume(
         &socket,
         &mut packet_buffer,
         &buffers,
+        &mut resamplers,
         channel_count,
         sample_rate,
         output_sample_rate,
@@ -257,8 +300,8 @@ pub fn receive_and_play_bus_with_volume(
         &socket,
         &mut packet_buffer,
         &buffers,
+        &mut resamplers,
         channel_count,
-        sample_rate,
         output_sample_rate,
         keep_running,
     );
@@ -282,6 +325,9 @@ fn render_bus_output(
     input_channels: usize,
     buffers: &Arc<Mutex<HashMap<u32, VecDeque<f32>>>>,
     volume: &VolumeControl,
+    mixed_frame: &mut [f32],
+    input_frame: &mut [f32],
+    remapped_frame: &mut [f32],
 ) {
     if output_channels == 0 || input_channels == 0 {
         data.fill(0.0);
@@ -292,10 +338,6 @@ fn render_bus_output(
     let frame_count = data.len() / output_channels;
     let mut buffers_guard = safe_lock(buffers);
 
-    let mut mixed_frame = vec![0.0f32; output_channels];
-    let mut input_frame = vec![0.0f32; input_channels];
-    let mut remapped_frame = vec![0.0f32; output_channels];
-
     for frame_index in 0..frame_count {
         mixed_frame.fill(0.0);
 
@@ -304,7 +346,7 @@ fn render_bus_output(
                 *sample = source_buffer.pop_front().unwrap_or(0.0);
             }
 
-            remap_frame_into(&input_frame, &mut remapped_frame);
+            remap_frame_into(input_frame, remapped_frame);
 
             for (mixed_sample, remapped_sample) in mixed_frame.iter_mut().zip(remapped_frame.iter())
             {
@@ -318,6 +360,8 @@ fn render_bus_output(
             data[output_offset + channel] = (mixed_frame[channel] * gain).clamp(-1.0, 1.0);
         }
     }
+
+    data[frame_count * output_channels..].fill(0.0);
 }
 
 fn total_buffered_samples(buffers: &Arc<Mutex<HashMap<u32, VecDeque<f32>>>>) -> usize {
@@ -328,12 +372,13 @@ fn prime_bus_buffers(
     socket: &UdpSocket,
     packet_buffer: &mut [u8],
     buffers: &Arc<Mutex<HashMap<u32, VecDeque<f32>>>>,
+    resamplers: &mut HashMap<u32, (u32, StreamingLinearResampler)>,
     channel_count: u16,
     sample_rate: u32,
     output_sample_rate: u32,
     keep_running: Arc<AtomicBool>,
 ) -> Result<(), String> {
-    let target_samples = ((sample_rate as f64 * JITTER_BUFFER_TARGET_SECS) as usize)
+    let target_samples = ((output_sample_rate as f64 * JITTER_BUFFER_TARGET_SECS) as usize)
         .saturating_mul(channel_count as usize);
 
     let prime_deadline = Instant::now() + Duration::from_millis(500);
@@ -350,8 +395,9 @@ fn prime_bus_buffers(
                 if let Some(parsed) = parse_packet(packet) {
                     if parsed.channel_count as u16 == channel_count
                         && parsed.sample_rate == sample_rate
+                        && float32_payload(packet, &parsed).is_some()
                     {
-                        push_samples(buffers, packet, &parsed, output_sample_rate);
+                        push_samples(buffers, resamplers, packet, &parsed, output_sample_rate)?;
                     }
                 }
             }
@@ -381,8 +427,8 @@ fn run_receive_loop(
     socket: &UdpSocket,
     packet_buffer: &mut [u8],
     buffers: &Arc<Mutex<HashMap<u32, VecDeque<f32>>>>,
+    resamplers: &mut HashMap<u32, (u32, StreamingLinearResampler)>,
     channel_count: u16,
-    sample_rate: u32,
     output_sample_rate: u32,
     keep_running: Arc<AtomicBool>,
 ) -> Result<(), String> {
@@ -414,6 +460,10 @@ fn run_receive_loop(
             continue;
         };
 
+        if float32_payload(packet, &parsed).is_none() {
+            continue;
+        }
+
         if parsed.channel_count as u16 != channel_count {
             eprintln!(
                 "audio-core: bus dropping packet from stream \
@@ -426,18 +476,13 @@ fn run_receive_loop(
         streams_seen.insert(parsed.stream_id);
         packets_received = packets_received.saturating_add(1);
 
-        push_samples(buffers, packet, &parsed, output_sample_rate);
-
-        let maximum_samples =
-            ((output_sample_rate as f64 * 0.2) as usize)
-                .saturating_mul(channel_count as usize);
+        push_samples(buffers, resamplers, packet, &parsed, output_sample_rate)?;
 
         let mut guard = safe_lock(buffers);
 
         if let Some(stream_buffer) = guard.get_mut(&parsed.stream_id) {
-            while stream_buffer.len() > maximum_samples {
-                stream_buffer.pop_front();
-            }
+            let maximum_frames = (output_sample_rate as f64 * 0.2) as usize;
+            trim_interleaved_queue(stream_buffer, maximum_frames, channel_count as usize);
         }
     }
 
@@ -562,60 +607,79 @@ fn remap_frame_into(input: &[f32], output: &mut [f32]) {
         return;
     }
 
-    let mut counts = vec![0usize; output_channels];
-
     for (index, &sample) in input.iter().enumerate() {
         let output_channel = index % output_channels;
         output[output_channel] += sample;
-        counts[output_channel] += 1;
     }
 
-    for (sample, count) in output.iter_mut().zip(counts.iter()) {
-        *sample /= (*count).max(1) as f32;
+    let base_count = input_channels / output_channels;
+    let extra_channels = input_channels % output_channels;
+    for (index, sample) in output.iter_mut().enumerate() {
+        let count = base_count + usize::from(index < extra_channels);
+        *sample /= count.max(1) as f32;
     }
 }
 
 fn push_samples(
     buffers: &Arc<Mutex<HashMap<u32, VecDeque<f32>>>>,
+    resamplers: &mut HashMap<u32, (u32, StreamingLinearResampler)>,
     packet: &[u8],
     parsed: &ParsedPacket,
     output_sample_rate: u32,
-) {
-    let sample_count = parsed.samples_per_channel as usize * parsed.channel_count as usize;
-
-    let payload_bytes = match sample_count.checked_mul(4) {
-        Some(value) => value,
-        None => return,
-    };
-
-    let payload_end = match parsed.payload_offset.checked_add(payload_bytes) {
-        Some(value) => value,
-        None => return,
-    };
-
-    let Some(payload) = packet.get(parsed.payload_offset..payload_end) else {
-        eprintln!(
-            "audio-core: bus dropping truncated payload from \
-             stream {}",
+) -> Result<(), String> {
+    let Some(payload) = float32_payload(packet, parsed) else {
+        return Err(format!(
+            "bus received unsupported or truncated payload from stream {}",
             parsed.stream_id
-        );
-        return;
+        ));
     };
 
     let input = payload
         .chunks_exact(4)
         .map(|bytes| f32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
         .collect::<Vec<_>>();
-    let converted = resample_interleaved_linear(
-        &input,
-        parsed.channel_count as usize,
-        parsed.sample_rate,
-        output_sample_rate,
-    );
+    let needs_resampler = resamplers
+        .get(&parsed.stream_id)
+        .map(|(input_rate, _)| *input_rate != parsed.sample_rate)
+        .unwrap_or(true);
+
+    if needs_resampler {
+        resamplers.insert(
+            parsed.stream_id,
+            (
+                parsed.sample_rate,
+                StreamingLinearResampler::new(
+                    parsed.channel_count as usize,
+                    parsed.sample_rate,
+                    output_sample_rate,
+                )?,
+            ),
+        );
+    }
+
+    let (_, resampler) = resamplers
+        .get_mut(&parsed.stream_id)
+        .ok_or_else(|| "bus resampler was not initialized".to_string())?;
+    let converted = resampler.process(&input)?;
 
     let mut guard = safe_lock(buffers);
 
     let stream_buffer = guard.entry(parsed.stream_id).or_insert_with(VecDeque::new);
 
     stream_buffer.extend(converted);
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::remap_frame_into;
+
+    #[test]
+    fn remapping_groups_channels_without_allocating_per_frame_scratch() {
+        let mut output = [0.0; 3];
+
+        remap_frame_into(&[1.0, 2.0, 3.0, 4.0, 5.0, 6.0], &mut output);
+
+        assert_eq!(output, [2.5, 3.5, 4.5]);
+    }
 }

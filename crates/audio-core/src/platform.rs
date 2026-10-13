@@ -109,7 +109,7 @@ fn prepare_realtime_audio_thread_linux() {
         param.sched_priority = max_priority;
 
         let result = libc::pthread_setschedparam(thread, libc::SCHED_RR, &param);
-        
+
         if result != 0 {
             // EPERM is common if the user lacks CAP_SYS_NICE or audio group limits.
             // We log a warning but continue; audio will still work, just with less
@@ -137,10 +137,10 @@ fn prepare_realtime_audio_thread_macos() {
         // Values are typically hardware/clock dependent. We use common
         // conservative hints for audio time constraints.
         // HZ = sample rate (e.g. 48000), buffer = 512 frames.
-        // Conversion requires knowing the Mach absolute timebase, but for 
+        // Conversion requires knowing the Mach absolute timebase, but for
         // a simple boost, approximate values or 0s are often accepted,
         // or we use a general high priority.
-        
+
         let mut policy = thread_time_constraint_policy {
             period: 0,
             computation: 0,
@@ -148,8 +148,8 @@ fn prepare_realtime_audio_thread_macos() {
             preemptible: 1,
         };
 
-        // Note: For production macOS audio, we should query mach_timebase_info 
-        // to set these accurately based on buffer sizes, but this opts us into 
+        // Note: For production macOS audio, we should query mach_timebase_info
+        // to set these accurately based on buffer sizes, but this opts us into
         // the realtime band safely for now.
 
         let result = thread_policy_set(

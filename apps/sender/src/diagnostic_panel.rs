@@ -463,6 +463,10 @@ fn show_final_report(ui: &mut egui::Ui, report: &DiagnosticPublishReport, sample
             ui.label(format_duration(report.elapsed));
             ui.end_row();
 
+            ui.label("Subscriber active");
+            ui.label(format_duration(report.subscriber_elapsed));
+            ui.end_row();
+
             ui.label("Generated audio");
             ui.label(format!(
                 "{:.2} seconds",
@@ -483,6 +487,14 @@ fn show_final_report(ui: &mut egui::Ui, report: &DiagnosticPublishReport, sample
                 "{} ({:.0}/s)",
                 report.datagrams_sent,
                 report.average_datagrams_per_second()
+            ));
+            ui.end_row();
+
+            ui.label("Active packet rate");
+            ui.label(format!(
+                "{:.0} packets/s, {:.0} datagrams/s",
+                report.subscriber_packets_per_second(),
+                report.subscriber_datagrams_per_second()
             ));
             ui.end_row();
 

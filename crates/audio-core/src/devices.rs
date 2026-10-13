@@ -56,4 +56,3 @@ pub fn is_skip(value: &Option<String>) -> bool {
         DeviceSelection::NoDevice
     )
 }
-

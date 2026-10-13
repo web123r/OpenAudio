@@ -9,12 +9,12 @@ use crate::recording::{
     create_wav_writer, finalize as finalize_recording, generate_record_path, write_samples,
     SharedWavWriter,
 };
-use crate::util::safe_lock;
+use crate::util::BoundedAudioQueue;
 use crate::{register_scoped_signal_meter, SignalDirection};
 use std::collections::VecDeque;
 use std::net::UdpSocket;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 const MAX_FRAMES_PER_PACKET: usize = 58;
@@ -26,7 +26,8 @@ pub struct ChannelSource {
 }
 
 struct OpenedChannel {
-    buffer: Arc<Mutex<VecDeque<f32>>>,
+    buffer: Arc<BoundedAudioQueue>,
+    pending: VecDeque<f32>,
     _stream: Box<dyn crate::backend::AudioStream>,
     sample_rate: u32,
     label: String,
@@ -85,6 +86,10 @@ pub fn capture_and_combine_with_labels(
         return Err("channel count exceeds protocol limit of 255".to_string());
     }
 
+    let max_frames_per_packet =
+        network_core::protocol::max_float32_frames_per_packet(channel_count)?
+            .min(MAX_FRAMES_PER_PACKET);
+
     let mut slots = Vec::<ChannelSlot>::with_capacity(channel_count);
     let backend = get_backend();
 
@@ -110,15 +115,15 @@ pub fn capture_and_combine_with_labels(
             label_base
         };
 
-        let (device_label, input_channels, sample_rate) = if source.is_loopback {
-            let (lbl, config) = backend.get_loopback_config(source.device_name.as_deref()).map_err(|error| {
-                format!("channel {channel_index} ('{label}'): {error}")
-            })?;
+        let (_device_label, input_channels, sample_rate) = if source.is_loopback {
+            let (lbl, config) = backend
+                .get_loopback_config(source.device_name.as_deref())
+                .map_err(|error| format!("channel {channel_index} ('{label}'): {error}"))?;
             (lbl, config.channels as usize, config.sample_rate)
         } else {
-            let (lbl, config) = backend.get_input_config(source.device_name.as_deref()).map_err(|error| {
-                format!("channel {channel_index} ('{label}'): {error}")
-            })?;
+            let (lbl, config) = backend
+                .get_input_config(source.device_name.as_deref())
+                .map_err(|error| format!("channel {channel_index} ('{label}'): {error}"))?;
             (lbl, config.channels as usize, config.sample_rate)
         };
 
@@ -137,10 +142,14 @@ pub fn capture_and_combine_with_labels(
             None
         };
 
-        let buffer = Arc::new(Mutex::new(VecDeque::<f32>::new()));
+        let maximum_buffered_frames = (sample_rate as usize)
+            .checked_mul(100)
+            .ok_or_else(|| "combine capture queue capacity overflow".to_string())?
+            / 1_000;
+        let buffer = Arc::new(BoundedAudioQueue::new(1, maximum_buffered_frames.max(1))?);
 
         let buffer_for_callback = buffer.clone();
-        let writer_for_callback = writer.clone();
+        let capture_clock = Instant::now();
 
         let stream = if source.is_loopback {
             backend.build_loopback_stream(
@@ -153,7 +162,7 @@ pub fn capture_and_combine_with_labels(
                             data,
                             input_channels,
                             &buffer_for_callback,
-                            writer_for_callback.as_ref(),
+                            capture_clock.elapsed().as_nanos() as u64,
                         );
                     }));
 
@@ -176,7 +185,7 @@ pub fn capture_and_combine_with_labels(
                             data,
                             input_channels,
                             &buffer_for_callback,
-                            writer_for_callback.as_ref(),
+                            capture_clock.elapsed().as_nanos() as u64,
                         );
                     }));
 
@@ -188,7 +197,10 @@ pub fn capture_and_combine_with_labels(
                     }
                 }),
             )
-        }.map_err(|error| format!("channel {channel_index} ('{label}'): failed to build stream: {error}"))?;
+        }
+        .map_err(|error| {
+            format!("channel {channel_index} ('{label}'): failed to build stream: {error}")
+        })?;
 
         stream.play().map_err(|error| {
             format!(
@@ -199,6 +211,7 @@ pub fn capture_and_combine_with_labels(
 
         slots.push(ChannelSlot::Active(OpenedChannel {
             buffer,
+            pending: VecDeque::new(),
             _stream: stream,
             sample_rate,
             label,
@@ -284,14 +297,44 @@ pub fn capture_and_combine_with_labels(
     );
 
     let poll_interval = Duration::from_millis(2);
+    let mut last_drop_report = Instant::now();
 
     while keep_running.load(Ordering::Relaxed) {
+        for slot in &mut slots {
+            let ChannelSlot::Active(channel) = slot else {
+                continue;
+            };
+
+            while let Some(block) = channel.buffer.try_pop() {
+                if let Some(writer) = &channel.writer {
+                    write_samples(writer, &block.samples);
+                }
+                channel.pending.extend(block.samples);
+            }
+        }
+
+        if last_drop_report.elapsed() >= Duration::from_secs(1) {
+            for slot in &slots {
+                if let ChannelSlot::Active(channel) = slot {
+                    let dropped_frames = channel.buffer.take_dropped_frames();
+                    if dropped_frames > 0 {
+                        eprintln!(
+                            "audio-core: combine channel '{}' dropped \
+                             {dropped_frames} capture frame(s)",
+                            channel.label
+                        );
+                    }
+                }
+            }
+            last_drop_report = Instant::now();
+        }
+
         // Only active channels determine readiness. A skipped slot
         // never receives samples and must not block the combined stream.
         let available_frames = slots
             .iter()
             .filter_map(|slot| match slot {
-                ChannelSlot::Active(channel) => Some(safe_lock(&channel.buffer).len()),
+                ChannelSlot::Active(channel) => Some(channel.pending.len()),
                 ChannelSlot::Skipped => None,
             })
             .min()
@@ -302,27 +345,19 @@ pub fn capture_and_combine_with_labels(
             continue;
         }
 
-        let frames_to_send = available_frames.min(MAX_FRAMES_PER_PACKET);
+        let frames_to_send = available_frames.min(max_frames_per_packet);
 
-        let destinations = {
-            let subscribers = safe_lock(&subscribers_by_stream);
-
-            subscribers
-                .get(&stream_id)
-                .filter(|addresses| !addresses.is_empty())
-                .cloned()
-        };
+        let destinations = crate::discovery::active_subscribers(&subscribers_by_stream, stream_id)
+            .filter(|addresses| !addresses.is_empty());
 
         // Always drain active capture buffers, including when no
         // subscriber is connected, to keep latency and memory bounded.
         let mut per_channel_samples = Vec::<Vec<f32>>::with_capacity(channel_count);
 
-        for slot in &slots {
+        for slot in &mut slots {
             match slot {
                 ChannelSlot::Active(channel) => {
-                    let mut buffer = safe_lock(&channel.buffer);
-
-                    let samples = buffer.drain(..frames_to_send).collect::<Vec<_>>();
+                    let samples = channel.pending.drain(..frames_to_send).collect::<Vec<_>>();
 
                     per_channel_samples.push(samples);
                 }
@@ -410,8 +445,8 @@ pub fn capture_and_combine_with_labels(
 fn capture_first_channel(
     data: &[f32],
     input_channels: usize,
-    buffer: &Arc<Mutex<VecDeque<f32>>>,
-    writer: Option<&SharedWavWriter>,
+    buffer: &Arc<BoundedAudioQueue>,
+    presentation_timestamp_ns: u64,
 ) {
     if input_channels == 0 {
         return;
@@ -431,10 +466,25 @@ fn capture_first_channel(
         mono.push(data[sample_index]);
     }
 
-    if let Some(writer) = writer {
-        write_samples(writer, &mono);
+    if let Err(error) = buffer.try_push_owned(mono, presentation_timestamp_ns) {
+        eprintln!("audio-core: dropping malformed combine capture block: {error}");
     }
+}
 
-    let mut queue = safe_lock(buffer);
-    queue.extend(mono);
+#[cfg(test)]
+mod tests {
+    use super::capture_first_channel;
+    use crate::util::BoundedAudioQueue;
+    use std::sync::Arc;
+
+    #[test]
+    fn combine_capture_extracts_first_channel_into_bounded_queue() {
+        let queue = Arc::new(BoundedAudioQueue::new(1, 4).unwrap());
+        capture_first_channel(&[0.25, -0.25, 0.5, -0.5, 0.75, -0.75], 2, &queue, 12_345);
+
+        let block = queue.try_pop().expect("captured block");
+        assert_eq!(block.samples, vec![0.25, 0.5, 0.75]);
+        assert_eq!(block.presentation_timestamp_ns, 12_345);
+        assert!(queue.try_pop().is_none());
+    }
 }
