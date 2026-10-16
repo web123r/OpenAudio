@@ -1,0 +1,89 @@
+Third-Party Software Notices — OpenAudio VST3 Sender
+=====================================================
+
+This file lists the open-source libraries used by the OpenAudio VST3 sender
+plug-in, together with their license identifiers and source locations.  The
+full text of each license is available at the URL shown or from the crate
+registry at https://crates.io.
+
+OpenAudio itself is not yet assigned a license.  This notice covers only
+bundled third-party components.
+
+───────────────────────────────────────────────────────────────────────────────
+nice-plug (and nice-plug-core, nice-plug-derive, nice-plug-xtask)
+  Version:    0.4.2
+  License:    ISC
+  Source:     https://codeberg.org/RustAudio/nice-plug
+
+ISC License
+
+  Copyright (c) RustAudio contributors
+
+  Permission to use, copy, modify, and/or distribute this software for any
+  purpose with or without fee is hereby granted, provided that the above
+  copyright notice and this permission notice appear in all copies.
+
+  THE SOFTWARE IS PROVIDED "AS IS" AND THE AUTHOR DISCLAIMS ALL WARRANTIES
+  WITH REGARD TO THIS SOFTWARE INCLUDING ALL IMPLIED WARRANTIES OF
+  MERCHANTABILITY AND FITNESS.  IN NO EVENT SHALL THE AUTHOR BE LIABLE FOR
+  ANY SPECIAL, DIRECT, INDIRECT, OR CONSEQUENTIAL DAMAGES OR ANY DAMAGES
+  WHATSOEVER RESULTING FROM LOSS OF USE, DATA OR PROFITS, WHETHER IN AN
+  ACTION OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION, ARISING OUT OF OR
+  IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
+
+───────────────────────────────────────────────────────────────────────────────
+vst3
+  Version:    0.3.0
+  License:    MIT OR Apache-2.0
+  Source:     https://github.com/coupler-rs/vst3-rs
+
+  You may use this library under the terms of either the MIT License or the
+  Apache License, Version 2.0.
+
+  MIT License text:  https://opensource.org/licenses/MIT
+  Apache 2.0 text:   https://www.apache.org/licenses/LICENSE-2.0
+
+  NOTE: The VST3 SDK itself (Steinberg Media Technologies GmbH) is a separate
+  component not bundled in this crate.  Redistribution of plug-ins that use
+  the VST3 interface is subject to the Steinberg VST3 Licensing Agreement.
+  Review https://developer.steinberg.net/display/VST/VST+3+Licensing before
+  distributing plug-ins built against the VST3 SDK.
+
+───────────────────────────────────────────────────────────────────────────────
+crossbeam (and crossbeam-channel, crossbeam-deque, crossbeam-epoch,
+           crossbeam-queue, crossbeam-utils)
+  Version:    0.8.5 (and matching sub-crate versions)
+  License:    MIT OR Apache-2.0
+  Source:     https://github.com/crossbeam-rs/crossbeam
+
+  You may use these libraries under the terms of either the MIT License or the
+  Apache License, Version 2.0.
+
+  MIT License text:  https://opensource.org/licenses/MIT
+  Apache 2.0 text:   https://www.apache.org/licenses/LICENSE-2.0
+
+───────────────────────────────────────────────────────────────────────────────
+widestring
+  Version:    1.2.1
+  License:    MIT OR Apache-2.0
+  Source:     https://github.com/VoidStarKat/widestring-rs
+
+  You may use this library under the terms of either the MIT License or the
+  Apache License, Version 2.0.
+
+  MIT License text:  https://opensource.org/licenses/MIT
+  Apache 2.0 text:   https://www.apache.org/licenses/LICENSE-2.0
+
+───────────────────────────────────────────────────────────────────────────────
+Transitive dependencies
+
+The libraries above themselves depend on additional crates, all of which are
+licensed under one or more of: MIT, Apache-2.0, ISC, BSD-2-Clause, or Zlib.
+A full transitive dependency list with license identifiers can be generated
+from the workspace with:
+
+  cargo metadata --format-version 1 | \
+    jq -r '.packages[] | "\(.name) \(.version)  \(.license)"' | sort
+
+Review the output before redistribution to confirm no copyleft (GPL/LGPL/EUPL)
+or proprietary dependencies have been added.

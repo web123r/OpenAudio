@@ -1,0 +1,10 @@
+[package]
+name = "receiver"
+version = "0.1.0"
+edition = "2021"
+description = "Platform-neutral OpenAudio network receiver and diagnostics CLI."
+
+[dependencies]
+network-core = { path = "../../crates/network-core" }
+audio-core = { path = "../../crates/audio-core" }
+serde_json = "1"

@@ -1,0 +1,50 @@
+name: OpenAudio CI
+
+on:
+  push:
+    branches: [ "main" ]
+  pull_request:
+    branches: [ "main" ]
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build_and_test:
+    name: Build and Test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+
+    steps:
+    - uses: actions/checkout@v3
+
+    - name: Install Rust
+      uses: dtolnay/rust-toolchain@stable
+
+    - name: Install Linux Dependencies
+      if: runner.os == 'Linux'
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y libasound2-dev pkg-config
+
+    - name: Check Workspace
+      run: cargo check --workspace
+
+    - name: Run Workspace Tests
+      run: cargo test --workspace
+
+    - name: Run Browser Playback Tests
+      run: node --test crates/audio-core/tests/web_player.test.js
+
+    - name: Build Sender App
+      run: cargo build -p openaudio-gui --bin OpenAudio
+
+    - name: Build Receiver App
+      run: cargo build -p receiver
+
+    - name: Bundle Windows VST3 Sender
+      if: runner.os == 'Windows'
+      run: cargo xtask bundle openaudio-plugin --release

@@ -1,0 +1,17 @@
+[package]
+name = "openaudio-plugin"
+version = "0.1.0"
+edition = "2021"
+description = "OpenAudio VST3 sender for mono, stereo, and multichannel DAW tracks (up to 64 channels)."
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+audio-core = { path = "../../crates/audio-core" }
+network-core = { path = "../../crates/network-core" }
+crossbeam = "0.8"
+nice-plug = { git = "https://codeberg.org/RustAudio/nice-plug", rev = "e60b5db09d8606c3dc3e93f982847a00bce17325", default-features = false, features = [
+    "tracing-subscriber",
+    "vst3",
+] }

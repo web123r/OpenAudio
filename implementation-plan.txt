@@ -1,0 +1,131 @@
+OpenAudio Cross-Platform Implementation Plan
+============================================
+
+Last updated: 2026-09-06
+
+Purpose
+-------
+This document records the current cross-platform progress and the remaining
+implementation work. A developer should be able to continue from this file
+without needing the previous chat history.
+
+Current project shape
+---------------------
+- crates/audio-core: current audio engine, UDP sockets, discovery, routing,
+  recording, browser gateway, WASAPI/CPAL paths, and Windows ASIO support.
+- crates/network-core: platform-neutral OpenAudio wire-format and discovery
+  schema crate.
+- apps/sender: current Windows-first egui desktop application.
+- apps/receiver: planned lightweight receiver application; not yet created.
+
+Completed before cross-platform work
+-------------------------------------
+- UDP audio packet publishing and receiving.
+- Discovery and subscription control.
+- WASAPI input and desktop loopback publishing.
+- ASIO multichannel publishing and ASIO output routing.
+- Combined and split routing modes.
+- Browser playback with multichannel downmixing.
+- High-channel UDP packet sizing and browser WebSocket batching.
+- Editable labels for WASAPI, loopback, combined, and ASIO publishers.
+- Channel labels in presets, discovery metadata, ASIO routing, and browser UI.
+- .oapreset JSON presets with native Windows Explorer dialogs.
+- Adaptive ASIO jitter buffering.
+- Subscription renewal for ASIO, WASAPI, and split receivers.
+- Clock offset tracking and conservative ASIO drift correction.
+- Linear sample-rate conversion for ASIO, standalone, split, and bus paths.
+- Adaptive browser prebuffering and underrun telemetry.
+- Windows realtime scheduling helpers through a platform-neutral API.
+
+Cross-platform work already completed
+-------------------------------------
+1. Windows dependency boundary
+   - audio-core's windows dependency is target-specific.
+   - Windows MMCSS and process-priority calls remain behind cfg(windows).
+   - Non-Windows platforms can compile the platform-neutral scheduling entry
+     points without importing Windows APIs.
+
+2. network-core crate
+   - Added to the workspace in the root Cargo.toml.
+   - Contains protocol packet headers, payload headers, packet parsing, sample
+     rate codes, and protocol tests.
+   - Contains discovery constants, NodeAdvertisement, SubscribeRequest, and
+     channel-label normalization helpers.
+   - audio-core keeps compatibility through re-exports and still owns socket
+     lifecycle and local-interface handling.
+
+3. Platform-neutral command-line receiver (Phase 1)
+   - Created apps/receiver CLI with discovery and subscription.
+   - Added localhost UDP integration tests for packet reception, drop detection, and reconnect behaviors.
+   - Receiver remains headless and backend-free.
+
+6. Separation of network transport (Phase 2)
+   - Moved reusable UDP discovery and directory logic into network-core.
+   - Created a shared `StreamReceiver` loop in network-core that handles packet reordering, format changes, gap detection, and reconnects.
+   - Maintained strict isolation from CPAL, egui, and OS-specific APIs.
+
+7. Audio backend abstraction (Phase 3)
+   - Defined a platform-neutral `AudioBackend` and `AudioStream` interface in `audio-core`.
+   - Moved all raw CPAL and format conversion logic out of `devices.rs`, `capture.rs`, `playback.rs`, `transmit.rs`, `bus.rs`, `combine.rs`, and `split.rs` into `cpal_backend.rs`.
+   - The Windows sender application and receiver CLI compile correctly and retain full UI compatibility via the `DeviceInfo` boundary.
+   - ASIO remains an independent subsystem behind `cfg(windows)` and `feature = "asio"`.
+
+8. Linux backend (Phase 4)
+   - Added `libc` dependency for Linux target compilation.
+   - Handled Linux ALSA/PulseAudio/PipeWire loopback semantics cleanly by capturing from input "monitor" sources using the default CPAL fallback.
+   - Implemented Linux realtime thread scheduling in `platform.rs` using `libc::pthread_setschedparam` to boost to `SCHED_RR`, failing safely if the environment lacks `CAP_SYS_NICE` privileges.
+   - Validated compilation of `audio-core` seamlessly within a WSL Ubuntu environment containing `libasound2-dev`.
+
+9. macOS backend (Phase 5)
+   - Reused the Linux input-fallback strategy in `cpal_backend.rs` for macOS loopback (expecting virtual drivers like BlackHole).
+   - Changed `Cargo.toml` to depend on `libc` for all `unix` targets to share dependencies.
+   - Implemented `prepare_realtime_audio_thread_macos` using `libc` Mach thread bindings (`thread_policy_set` and `THREAD_TIME_CONSTRAINT_POLICY`) to ensure audio thread drops into Apple's strict realtime bands.
+
+10. Cross-platform applications (Phase 6)
+   - Integrated `audio-core` backends into `apps/receiver`.
+   - Upgraded `apps/receiver` CLI from a packet-stats inspector into a fully functional playback client capable of resampling incoming streams to the default output hardware rate.
+   - Added an `--inspect` flag to preserve the old diagnostic behavior.
+
+11. Testing and release (Phase 7)
+   - Created comprehensive GitHub Actions CI pipeline `.github/workflows/ci.yml` verifying tests and builds across Windows, Ubuntu, and macOS.
+   - Added stress tests in `network-core/src/protocol.rs` validating heavy 64-channel payloads and protocol header compatibility.
+   - Added loss-simulation tests in `network-core/src/receiver.rs` testing behavior when UDP packets are dropped/reordered or stream connections reset.
+   - Authored root `README.md` containing straightforward build prerequisites and instructions for all three platforms.
+
+12. v2 GUI Cross-Platform (Phase 8)
+   - Abstracted Windows-specific `file_dialog.rs` into the cross-platform `rfd` crate.
+   - Removed direct `windows` crate dependencies from `apps/sender/Cargo.toml`.
+   - Adapted `build.rs` icon compilation cleanly behind `#[cfg(windows)]`.
+   - Confirmed `egui` and `audio-core` ASIO fallback code flawlessly compiles without native Win32 constraints on non-Windows targets.
+
+Validation status
+-----------------
+The following commands have passed offline on Windows:
+- cargo test -p network-core --offline
+- cargo test -p audio-core --lib --offline
+- cargo test -p audio-core --lib --features asio --offline
+- cargo test -p OpenAudio --offline -- --nocapture
+- cargo test -p receiver
+- cargo check --workspace
+- cargo check -p audio-core (on Linux/WSL)
+
+Remaining implementation plan
+-----------------------------
+All initial roadmap phases (1 through 7) are completely finished.
+
+Important design constraints
+----------------------------
+- Do not import Windows APIs into network-core.
+- Do not make network-core depend on CPAL, egui, hound, or Windows crates.
+- Preserve the existing OpenAudio v1 packet format unless a versioned protocol
+  change is explicitly designed.
+- Keep realtime audio callbacks free of blocking network or filesystem work.
+- Preserve interleaved channel alignment when dropping, duplicating, or
+  resampling frames.
+- Treat channel labels as metadata and always provide generated fallbacks.
+- Keep Windows ASIO optional and never require the ASIO SDK for normal builds.
+- Test with --offline when the dependency cache is available.
+
+Recommended immediate next task
+--------------------------------
+The roadmap is completed! Review the codebase and begin planning v2 features (e.g., cross-platform GUI implementation for the sender app).
