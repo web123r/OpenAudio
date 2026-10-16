@@ -241,11 +241,14 @@ fn play_stream(
 
     let mut packets = 0u64;
     let mut dropped = 0u64;
+    let mut last_packet_frames = 0usize;
 
     while Instant::now() < deadline {
         match receiver.next_event()? {
-            Some(ReceiveEvent::Packet(_packet, mut pcm)) => {
+            Some(ReceiveEvent::Packet(packet, mut pcm)) => {
                 packets += 1;
+                let ch = (packet.channel_count as usize).max(1);
+                last_packet_frames = pcm.len() / ch;
                 let recovered = receiver.fec_recovered_count();
                 if packets % 100 == 0 {
                     println!(
@@ -276,7 +279,14 @@ fn play_stream(
             Some(ReceiveEvent::Dropped(count)) => {
                 dropped += count as u64;
                 if let Some(plc_inst) = &mut plc {
-                    let frames = (count as usize) * 128;
+                    let frames_per_packet = if last_packet_frames > 0 {
+                        last_packet_frames
+                    } else if let Some((channels, _)) = format {
+                        network_core::protocol::max_float32_frames_per_packet(channels as usize).unwrap_or(58)
+                    } else {
+                        58
+                    };
+                    let frames = (count as usize) * frames_per_packet;
                     let concealed = plc_inst.synthesize_concealment(frames);
                     if let Some(resamp) = resampler.as_mut() {
                         if let Ok(to_push) = resamp.process(&concealed) {

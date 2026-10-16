@@ -132,8 +132,6 @@ struct PublisherRuntime {
     packets_sent: Arc<AtomicU64>,
     #[allow(dead_code)]
     publish_enabled: Arc<AtomicBool>,
-    is_encrypted: bool,
-    pin: u32,
     running: Arc<AtomicBool>,
     publisher: Option<JoinHandle<()>>,
     advertiser: Option<JoinHandle<()>>,
@@ -147,8 +145,8 @@ impl PublisherRuntime {
         maximum_block_frames: usize,
         publish_enabled: Arc<AtomicBool>,
         slot: u32,
-        is_encrypted: bool,
-        pin: u32,
+        encrypt_enabled: Arc<AtomicBool>,
+        active_pin: Arc<AtomicU32>,
     ) -> Result<Self, String> {
         if channels == 0 || channels > 64 {
             return Err(format!(
@@ -217,16 +215,13 @@ impl PublisherRuntime {
         let publisher_packets_sent = packets_sent.clone();
         let publisher_subscribers = control_service.subscribers.clone();
 
-        let maybe_cipher = if is_encrypted {
-            Some(audio_core::crypto::StreamCipher::from_passphrase(&pin.to_string()))
-        } else {
-            None
-        };
+        let publisher_encrypt_enabled = encrypt_enabled.clone();
+        let publisher_active_pin = active_pin.clone();
 
         eprintln!(
             "OpenAudio VST3 [stream {stream_id}]: activated — \
              {channels}ch @ {sample_rate} Hz, max block {maximum_block_frames} frames, \
-             control port {control_port}, stream name \"{stream_name}\", encrypted: {is_encrypted}"
+             control port {control_port}, stream name \"{stream_name}\""
         );
 
         let publisher = thread::Builder::new()
@@ -237,6 +232,8 @@ impl PublisherRuntime {
                 let mut fec_encoder = network_core::fec::FecEncoder::new(
                     network_core::fec::DEFAULT_FEC_GROUP_SIZE,
                 );
+                let mut current_cipher: Option<(u32, audio_core::crypto::StreamCipher)> = None;
+
                 while publisher_running.load(Ordering::Acquire)
                     || !publisher_ready_blocks.is_empty()
                 {
@@ -250,6 +247,15 @@ impl PublisherRuntime {
                         }
                         thread::sleep(Duration::from_millis(5));
                         continue;
+                    }
+
+                    if publisher_encrypt_enabled.load(Ordering::Relaxed) {
+                        let pin = publisher_active_pin.load(Ordering::Relaxed);
+                        if current_cipher.as_ref().map(|(p, _)| *p) != Some(pin) {
+                            current_cipher = Some((pin, audio_core::crypto::StreamCipher::from_passphrase(&pin.to_string())));
+                        }
+                    } else {
+                        current_cipher = None;
                     }
 
                     if let Some(block) = publisher_ready_blocks.pop() {
@@ -279,7 +285,7 @@ impl PublisherRuntime {
                                     samples,
                                 ) {
                                     Ok(mut packet) => {
-                                        if let Some(ref cipher) = maybe_cipher {
+                                        if let Some((_, ref cipher)) = current_cipher {
                                             if let Ok(enc) = audio_core::crypto::encrypt_audio_packet(cipher, &packet) {
                                                 packet = enc;
                                             }
@@ -367,9 +373,11 @@ impl PublisherRuntime {
 
         let advertiser_running = running.clone();
         let advertiser_active = publish_enabled.clone();
+        let advertiser_encrypted = encrypt_enabled.clone();
         let advertiser = match thread::Builder::new()
             .name(format!("openaudio-vst3-discovery-{stream_id}"))
             .spawn(move || {
+                let is_enc = advertiser_encrypted.load(Ordering::Relaxed);
                 if let Err(error) = audio_core::start_advertising_with_labels_and_active_encrypted(
                     "OpenAudio VST3".to_string(),
                     stream_id,
@@ -377,7 +385,7 @@ impl PublisherRuntime {
                     channels as u8,
                     network_core::discovery::default_channel_labels(channels as u8),
                     control_port,
-                    is_encrypted,
+                    is_enc,
                     advertiser_running,
                     advertiser_active,
                 ) {
@@ -412,8 +420,6 @@ impl PublisherRuntime {
             send_errors,
             packets_sent,
             publish_enabled,
-            is_encrypted,
-            pin,
             running,
             publisher: Some(publisher),
             advertiser: Some(advertiser),
@@ -604,8 +610,8 @@ impl Plugin for OpenAudioDawSender {
             buffer_config.max_buffer_size as usize,
             self.publish_enabled.clone(),
             slot,
-            is_encrypted,
-            pin,
+            self.encrypt_enabled.clone(),
+            self.active_pin.clone(),
         ) {
             Ok(runtime) => {
                 self.runtime = Some(runtime);
@@ -627,34 +633,6 @@ impl Plugin for OpenAudioDawSender {
         let Some(runtime) = &self.runtime else {
             return ProcessStatus::Normal;
         };
-
-        let current_slot = self.active_slot.load(Ordering::Acquire);
-        let current_encrypt = self.encrypt_enabled.load(Ordering::Acquire);
-        let current_pin = self.active_pin.load(Ordering::Acquire);
-
-        if runtime.stream_sequence != current_slot
-            || runtime.is_encrypted != current_encrypt
-            || runtime.pin != current_pin
-        {
-            let channels = runtime.channels;
-            let sample_rate = runtime.sample_rate as f32;
-            let max_frames = runtime.maximum_block_frames;
-            if let Some(mut old_runtime) = self.runtime.take() {
-                old_runtime.stop();
-            }
-            if let Ok(new_runtime) = PublisherRuntime::start(
-                channels,
-                sample_rate,
-                max_frames,
-                self.publish_enabled.clone(),
-                current_slot,
-                current_encrypt,
-                current_pin,
-            ) {
-                self.runtime = Some(new_runtime);
-            }
-            return ProcessStatus::Normal;
-        }
 
         let is_publishing = self.params.publish.value();
         self.publish_enabled.store(is_publishing, Ordering::Release);

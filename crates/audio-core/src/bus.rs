@@ -582,6 +582,7 @@ fn handle_receive_event(
     buffers: &Arc<Mutex<HashMap<u32, VecDeque<f32>>>>,
     resamplers: &mut HashMap<u32, (u32, StreamingLinearResampler)>,
     plc: &mut PacketLossConcealer,
+    last_frames_per_packet: &mut usize,
     channel_count: u16,
     output_sample_rate: u32,
     packets_lost: &mut u64,
@@ -589,6 +590,8 @@ fn handle_receive_event(
     match event {
         ReceiveEvent::Packet(pkt, mut pcm) => {
             plc.process_incoming(&mut pcm);
+            let ch = (pkt.channel_count as usize).max(1);
+            *last_frames_per_packet = pcm.len() / ch;
             push_pcm_samples(
                 buffers,
                 resamplers,
@@ -601,7 +604,11 @@ fn handle_receive_event(
         }
         ReceiveEvent::Dropped(count) => {
             *packets_lost = packets_lost.saturating_add(count as u64);
-            let frames_per_packet = 128;
+            let frames_per_packet = if *last_frames_per_packet > 0 {
+                *last_frames_per_packet
+            } else {
+                network_core::protocol::max_float32_frames_per_packet(channel_count as usize).unwrap_or(58)
+            };
             let total_frames = (count as usize) * frames_per_packet;
             let concealed = plc.synthesize_concealment(total_frames);
             let stream_ids: Vec<u32> = {
@@ -651,6 +658,7 @@ fn run_receive_loop(
     let mut fec_decoder = FecDecoder::new(32);
     let mut reorder_window = PacketReorderWindow::new(16);
     let mut plc = PacketLossConcealer::new(channel_count as usize);
+    let mut last_frames_per_packet = 0usize;
 
     socket.set_read_timeout(Some(Duration::from_millis(5))).map_err(|e| e.to_string())?;
 
@@ -671,6 +679,7 @@ fn run_receive_loop(
                 buffers,
                 resamplers,
                 &mut plc,
+                &mut last_frames_per_packet,
                 channel_count,
                 output_sample_rate,
                 &mut packets_lost,
@@ -722,6 +731,7 @@ fn run_receive_loop(
                                         buffers,
                                         resamplers,
                                         &mut plc,
+                                        &mut last_frames_per_packet,
                                         channel_count,
                                         output_sample_rate,
                                         &mut packets_lost,
@@ -779,6 +789,7 @@ fn run_receive_loop(
                 buffers,
                 resamplers,
                 &mut plc,
+                &mut last_frames_per_packet,
                 channel_count,
                 output_sample_rate,
                 &mut packets_lost,

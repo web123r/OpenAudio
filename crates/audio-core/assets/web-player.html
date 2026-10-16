@@ -1777,12 +1777,15 @@
     ringAvailable = 0;
     fallbackUnderruns = 0;
 
+    const effectiveTargetMs = (typeof currentBufferTargetMs !== "undefined" && currentBufferTargetMs) ? currentBufferTargetMs : 150;
     let prebuffer = Math.floor(
-      sampleRate * ((currentBufferTargetMs || 50) / 1000.0)
+      sampleRate * (effectiveTargetMs / 1000.0)
     );
-    window.updateFallbackPrebuffer = function(ms) {
-      prebuffer = Math.floor(sampleRate * (ms / 1000.0));
-    };
+    if (typeof window !== "undefined") {
+      window.updateFallbackPrebuffer = function(ms) {
+        prebuffer = Math.floor(sampleRate * (ms / 1000.0));
+      };
+    }
     let stableCallbacks = 0;
 
     let started = false;
@@ -1896,12 +1899,16 @@
             1000
           ).toFixed(0);
 
-        lastBufferStats = {
-          ms: milliseconds,
-          underruns: fallbackUnderruns,
-          targetMs: targetMs
-        };
-        renderStats();
+        if (typeof lastBufferStats !== "undefined") {
+          lastBufferStats = {
+            ms: milliseconds,
+            underruns: fallbackUnderruns,
+            targetMs: targetMs
+          };
+        }
+        if (typeof renderStats === "function") {
+          renderStats();
+        }
       };
 
     processorNode.connect(

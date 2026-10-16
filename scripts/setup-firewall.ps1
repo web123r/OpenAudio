@@ -59,7 +59,7 @@ try {
             -Program $appExe `
             -Direction Inbound `
             -Action Allow `
-            -Profile Domain,Private,Public `
+            -Profile Private,Domain `
             -Enabled True | Out-Null
 
         New-NetFirewallRule -Name "${rulePrefix}-App-Out" `
@@ -68,7 +68,7 @@ try {
             -Program $appExe `
             -Direction Outbound `
             -Action Allow `
-            -Profile Domain,Private,Public `
+            -Profile Private,Domain `
             -Enabled True | Out-Null
 
         Write-Host " [OK] Application rules configured for: $appExe" -ForegroundColor Green
@@ -82,7 +82,7 @@ try {
         -LocalPort 5450 `
         -Direction Inbound `
         -Action Allow `
-        -Profile Domain,Private,Public `
+        -Profile Private,Domain `
         -Enabled True | Out-Null
 
     New-NetFirewallRule -Name "${rulePrefix}-Discovery-Out" `
@@ -92,7 +92,7 @@ try {
         -LocalPort 5450 `
         -Direction Outbound `
         -Action Allow `
-        -Profile Domain,Private,Public `
+        -Profile Private,Domain `
         -Enabled True | Out-Null
     Write-Host " [OK] Discovery multicast rules (UDP 5450) configured." -ForegroundColor Green
 
@@ -104,7 +104,7 @@ try {
         -LocalPort 5000-7500 `
         -Direction Inbound `
         -Action Allow `
-        -Profile Domain,Private,Public `
+        -Profile Private,Domain `
         -Enabled True | Out-Null
 
     New-NetFirewallRule -Name "${rulePrefix}-Transport-Out" `
@@ -114,19 +114,19 @@ try {
         -LocalPort 5000-7500 `
         -Direction Outbound `
         -Action Allow `
-        -Profile Domain,Private,Public `
+        -Profile Private,Domain `
         -Enabled True | Out-Null
     Write-Host " [OK] Audio transport rules (UDP 5000-7500) configured." -ForegroundColor Green
 
     # 4. Web Browser Gateway (TCP 8080)
     New-NetFirewallRule -Name "${rulePrefix}-WebGateway-In" `
-        -DisplayName "OpenAudio WebRTC Gateway (Inbound TCP 8080)" `
+        -DisplayName "OpenAudio Web Browser Gateway (Inbound TCP 8080)" `
         -Description "Allows web browser player connections for OpenAudio HTTP/WebSocket relay." `
         -Protocol TCP `
         -LocalPort 8080 `
         -Direction Inbound `
         -Action Allow `
-        -Profile Domain,Private,Public `
+        -Profile Private,Domain `
         -Enabled True | Out-Null
     Write-Host " [OK] Browser Gateway rule (TCP 8080) configured." -ForegroundColor Green
 

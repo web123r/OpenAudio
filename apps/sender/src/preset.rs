@@ -26,7 +26,7 @@ pub struct PublishPreset {
     pub channel_labels: Vec<String>,
     #[serde(default)]
     pub encrypted: bool,
-    #[serde(default)]
+    #[serde(skip_serializing, default)]
     pub passphrase: String,
 }
 
@@ -43,7 +43,7 @@ pub struct CombinePublishPreset {
     pub channel_labels: Vec<String>,
     #[serde(default)]
     pub encrypted: bool,
-    #[serde(default)]
+    #[serde(skip_serializing, default)]
     pub passphrase: String,
 }
 
@@ -73,7 +73,7 @@ pub struct SubscribePreset {
     pub jitter_target_ms: u32,
     #[serde(default)]
     pub encrypted: bool,
-    #[serde(default)]
+    #[serde(skip_serializing, default)]
     pub passphrase: String,
 }
 
@@ -86,13 +86,14 @@ pub struct SplitSubscribePreset {
     pub record: bool,
     #[serde(default)]
     pub encrypted: bool,
-    #[serde(default)]
+    #[serde(skip_serializing, default)]
     pub passphrase: String,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct BrowserPreset {
     pub access_mode: String,
+    #[serde(skip_serializing, default)]
     pub password: String,
 }
 

@@ -108,9 +108,7 @@ pub fn transmit_multi(
         Box::new(move |data: &[f32]| {
             signal_meter_for_callback.observe_interleaved(data, channels as usize);
             let timestamp_ns = start.elapsed().as_nanos() as u64;
-            if let Err(error) = queue_for_callback.try_push(data, timestamp_ns) {
-                eprintln!("audio-core: dropping malformed capture block: {error}");
-            }
+            let _ = queue_for_callback.try_push(data, timestamp_ns);
         }),
     )?;
 
@@ -204,9 +202,7 @@ pub fn transmit_with_control(
         Box::new(move |data: &[f32]| {
             signal_meter_for_callback.observe_interleaved(data, channels as usize);
             let timestamp_ns = start.elapsed().as_nanos() as u64;
-            if let Err(error) = queue_for_callback.try_push(data, timestamp_ns) {
-                eprintln!("audio-core: dropping malformed capture block: {error}");
-            }
+            let _ = queue_for_callback.try_push(data, timestamp_ns);
         }),
     )?;
 
@@ -385,9 +381,7 @@ pub fn transmit_with_discovery_labeled_encrypted(
             let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 signal_meter_for_callback.observe_interleaved(data, channels as usize);
                 let timestamp_ns = start.elapsed().as_nanos() as u64;
-                if let Err(error) = queue_for_callback.try_push(data, timestamp_ns) {
-                    eprintln!("audio-core: dropping malformed capture block: {error}");
-                }
+                let _ = queue_for_callback.try_push(data, timestamp_ns);
             }));
 
             if result.is_err() {
@@ -583,9 +577,7 @@ pub fn transmit_loopback_with_discovery_labeled_encrypted(
                 let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                     signal_meter_for_callback.observe_interleaved(data, channels as usize);
                     let timestamp_ns = start.elapsed().as_nanos() as u64;
-                    if let Err(error) = queue_for_callback.try_push(data, timestamp_ns) {
-                        eprintln!("audio-core: dropping malformed loopback block: {error}");
-                    }
+                    let _ = queue_for_callback.try_push(data, timestamp_ns);
                 }));
 
                 if result.is_err() {

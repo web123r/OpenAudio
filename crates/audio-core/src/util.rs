@@ -45,6 +45,7 @@ pub(crate) struct BoundedAudioQueue {
 
 struct AudioQueueState {
     blocks: VecDeque<QueuedAudioBlock>,
+    recycled: Vec<Vec<f32>>,
     buffered_samples: usize,
     closed: bool,
 }
@@ -64,11 +65,15 @@ impl BoundedAudioQueue {
             .checked_mul(maximum_frames)
             .ok_or_else(|| "audio queue capacity overflow".to_string())?;
 
+        let block_capacity = (maximum_samples / 4).clamp(64, 8192);
+        let recycled = (0..16).map(|_| Vec::with_capacity(block_capacity)).collect();
+
         Ok(Self {
             channels,
             maximum_samples,
             state: Mutex::new(AudioQueueState {
                 blocks: VecDeque::new(),
+                recycled,
                 buffered_samples: 0,
                 closed: false,
             }),
@@ -78,17 +83,10 @@ impl BoundedAudioQueue {
 
     /// Copies one interleaved block without waiting for the consumer lock.
     /// When full, stale queued blocks are dropped to keep latency bounded.
+    /// Uses pre-allocated recycled buffers to avoid heap allocations in audio callbacks.
     pub(crate) fn try_push(
         &self,
         samples: &[f32],
-        presentation_timestamp_ns: u64,
-    ) -> Result<bool, String> {
-        self.try_push_owned(samples.to_vec(), presentation_timestamp_ns)
-    }
-
-    pub(crate) fn try_push_owned(
-        &self,
-        samples: Vec<f32>,
         presentation_timestamp_ns: u64,
     ) -> Result<bool, String> {
         if samples.len() % self.channels != 0 {
@@ -131,14 +129,34 @@ impl BoundedAudioQueue {
                 (stale_block.samples.len() / self.channels) as u64,
                 Ordering::Relaxed,
             );
+            if state.recycled.len() < 32 {
+                let mut v = stale_block.samples;
+                v.clear();
+                state.recycled.push(v);
+            }
         }
+
+        let mut buf = state
+            .recycled
+            .pop()
+            .unwrap_or_else(|| Vec::with_capacity(samples.len()));
+        buf.clear();
+        buf.extend_from_slice(samples);
 
         state.buffered_samples += samples.len();
         state.blocks.push_back(QueuedAudioBlock {
-            samples,
+            samples: buf,
             presentation_timestamp_ns,
         });
         Ok(true)
+    }
+
+    pub(crate) fn try_push_owned(
+        &self,
+        samples: Vec<f32>,
+        presentation_timestamp_ns: u64,
+    ) -> Result<bool, String> {
+        self.try_push(&samples, presentation_timestamp_ns)
     }
 
     pub(crate) fn try_pop(&self) -> Option<QueuedAudioBlock> {
@@ -146,6 +164,16 @@ impl BoundedAudioQueue {
         let block = state.blocks.pop_front()?;
         state.buffered_samples -= block.samples.len();
         Some(block)
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn recycle_buffer(&self, mut buf: Vec<f32>) {
+        buf.clear();
+        if let Ok(mut state) = self.state.try_lock() {
+            if state.recycled.len() < 32 {
+                state.recycled.push(buf);
+            }
+        }
     }
 
     pub(crate) fn close(&self) {
