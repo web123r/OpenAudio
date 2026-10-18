@@ -15,6 +15,7 @@ pub enum AppPage {
     Overview,
     Publish,
     Subscribe,
+    Patchbay,
     Browser,
     Diagnostics,
 }
@@ -36,6 +37,7 @@ impl AppPage {
             Self::Overview => "Overview",
             Self::Publish => "Publish Audio",
             Self::Subscribe => "Receive Audio",
+            Self::Patchbay => "Patchbay Matrix",
             Self::Browser => "Browser Sharing",
             Self::Diagnostics => "Diagnostics",
         }
@@ -51,6 +53,9 @@ impl AppPage {
             }
             Self::Subscribe => {
                 "Receive discovered streams and route them to WASAPI, split devices, or ASIO."
+            }
+            Self::Patchbay => {
+                "Visual 2D routing matrix: click any crosspoint to route audio between sources and destinations."
             }
             Self::Browser => "Control secure browser playback and trusted-LAN access.",
             Self::Diagnostics => {
@@ -92,6 +97,15 @@ pub fn render_navigation(ui: &mut egui::Ui, active_page: &mut AppPage, summary: 
                     "↓",
                     "Subscribe",
                     ACCENT_PURPLE,
+                );
+
+                navigation_button(
+                    ui,
+                    active_page,
+                    AppPage::Patchbay,
+                    "⊞",
+                    "Patchbay",
+                    ACCENT_BLUE,
                 );
 
                 navigation_button(

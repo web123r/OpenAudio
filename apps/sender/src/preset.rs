@@ -4,6 +4,8 @@ use serde::{Deserialize, Serialize};
 pub struct PresetFile {
     pub format: String,
     pub version: u32,
+    #[serde(default)]
+    pub selected_interface: Option<String>,
     pub publish_sessions: Vec<PublishPreset>,
     pub combine_publish_sessions: Vec<CombinePublishPreset>,
     pub asio_publish_sessions: Vec<AsioPublishPreset>,
@@ -22,6 +24,10 @@ pub struct PublishPreset {
     pub record: bool,
     #[serde(default)]
     pub channel_labels: Vec<String>,
+    #[serde(default)]
+    pub encrypted: bool,
+    #[serde(skip_serializing, default)]
+    pub passphrase: String,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -35,6 +41,10 @@ pub struct CombinePublishPreset {
     pub record: bool,
     #[serde(default)]
     pub channel_labels: Vec<String>,
+    #[serde(default)]
+    pub encrypted: bool,
+    #[serde(skip_serializing, default)]
+    pub passphrase: String,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -48,6 +58,10 @@ pub struct AsioPublishPreset {
     pub channel_labels: Vec<String>,
 }
 
+fn default_jitter_ms() -> u32 {
+    20
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 pub struct SubscribePreset {
     pub selected_discovered_node_id: Option<String>,
@@ -55,6 +69,12 @@ pub struct SubscribePreset {
     pub selected_output: Option<String>,
     pub volume: f32,
     pub record: bool,
+    #[serde(default = "default_jitter_ms")]
+    pub jitter_target_ms: u32,
+    #[serde(default)]
+    pub encrypted: bool,
+    #[serde(skip_serializing, default)]
+    pub passphrase: String,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -64,11 +84,16 @@ pub struct SplitSubscribePreset {
     pub bind_port: String,
     pub channel_devices: Vec<Option<String>>,
     pub record: bool,
+    #[serde(default)]
+    pub encrypted: bool,
+    #[serde(skip_serializing, default)]
+    pub passphrase: String,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct BrowserPreset {
     pub access_mode: String,
+    #[serde(skip_serializing, default)]
     pub password: String,
 }
 
@@ -77,6 +102,7 @@ impl Default for PresetFile {
         Self {
             format: "OpenAudio preset".to_string(),
             version: 1,
+            selected_interface: None,
             publish_sessions: Vec::new(),
             combine_publish_sessions: Vec::new(),
             asio_publish_sessions: Vec::new(),

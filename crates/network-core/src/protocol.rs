@@ -8,9 +8,13 @@ pub struct PacketHeader {
 
 const MAGIC: [u8; 4] = *b"OAv1";
 const VERSION: u8 = 1;
-const PACKET_TYPE_AUDIO: u8 = 0x01;
+pub const PACKET_TYPE_AUDIO: u8 = 0x01;
+pub const PACKET_TYPE_FEC: u8 = 0x02;
+pub const PACKET_TYPE_NACK: u8 = 0x03;
+pub const PACKET_TYPE_AUDIO_ENCRYPTED: u8 = 0x04;
 pub const MAX_SAFE_UDP_PAYLOAD_BYTES: usize = 1_200;
 pub const OPENAUDIO_HEADER_BYTES: usize = 32;
+pub const FEC_HEADER_BYTES: usize = 36;
 
 /// Calculates the largest Float32 frame count that keeps the complete
 /// OpenAudio packet within the conservative UDP payload budget.
@@ -39,10 +43,14 @@ pub fn max_float32_frames_per_packet(channel_count: usize) -> Result<usize, Stri
 
 impl PacketHeader {
     pub fn to_bytes(&self) -> [u8; 24] {
+        self.to_bytes_with_type(PACKET_TYPE_AUDIO)
+    }
+
+    pub fn to_bytes_with_type(&self, packet_type: u8) -> [u8; 24] {
         let mut buf = [0u8; 24];
         buf[0..4].copy_from_slice(&MAGIC);
         buf[4] = VERSION;
-        buf[5] = PACKET_TYPE_AUDIO;
+        buf[5] = packet_type;
         buf[6..8].copy_from_slice(&self.sub_stream_index.to_be_bytes());
         buf[8..12].copy_from_slice(&self.stream_id.to_be_bytes());
         buf[12..16].copy_from_slice(&self.sequence_number.to_be_bytes());
@@ -103,7 +111,7 @@ pub fn sample_rate_to_code(rate: u32) -> u16 {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ParsedPacket {
     pub stream_id: u32,
     pub sequence_number: u32,
@@ -258,11 +266,144 @@ pub fn decode_float32(buf: &[u8], packet: &ParsedPacket) -> Option<Vec<f32>> {
     )
 }
 
+/// Peeks at the packet type byte if the buffer is a valid OpenAudio v1 packet.
+pub fn peek_packet_type(buf: &[u8]) -> Option<u8> {
+    if buf.len() >= 6 && &buf[0..4] == b"OAv1" && buf[4] == 1 {
+        Some(buf[5])
+    } else {
+        None
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ParsedFecPacket {
+    pub stream_id: u32,
+    pub fec_sequence_number: u32,
+    pub presentation_timestamp_ns: u64,
+    pub base_sequence_number: u32,
+    pub packet_count: u8,
+    pub channel_count: u8,
+    pub sample_rate: u32,
+    pub samples_per_channel: u16,
+    pub payload_offset: usize,
+    pub payload_len: usize,
+}
+
+pub fn encode_fec_packet(
+    stream_id: u32,
+    fec_seq: u32,
+    presentation_timestamp_ns: u64,
+    base_sequence_number: u32,
+    packet_count: u8,
+    channel_count: u8,
+    sample_rate: u32,
+    samples_per_channel: u16,
+    parity_payload: &[u8],
+) -> Result<Vec<u8>, String> {
+    let sample_rate_code = sample_rate_to_code(sample_rate);
+    if sample_rate_code == 0 {
+        return Err(format!("unsupported sample rate: {sample_rate}"));
+    }
+    let header = PacketHeader {
+        sub_stream_index: 0,
+        stream_id,
+        sequence_number: fec_seq,
+        presentation_timestamp_ns,
+    };
+    let payload_len = parity_payload.len() as u16;
+    let mut packet = Vec::with_capacity(FEC_HEADER_BYTES + parity_payload.len());
+    packet.extend_from_slice(&header.to_bytes_with_type(PACKET_TYPE_FEC));
+    packet.extend_from_slice(&base_sequence_number.to_be_bytes());
+    packet.push(packet_count);
+    packet.push(channel_count);
+    packet.extend_from_slice(&sample_rate_code.to_be_bytes());
+    packet.extend_from_slice(&samples_per_channel.to_be_bytes());
+    packet.extend_from_slice(&payload_len.to_be_bytes());
+    packet.extend_from_slice(parity_payload);
+    Ok(packet)
+}
+
+pub fn parse_fec_packet(buf: &[u8]) -> Option<ParsedFecPacket> {
+    if buf.len() < FEC_HEADER_BYTES || &buf[0..4] != b"OAv1" || buf[4] != 1 || buf[5] != PACKET_TYPE_FEC {
+        return None;
+    }
+    let stream_id = u32::from_be_bytes(buf[8..12].try_into().ok()?);
+    let fec_sequence_number = u32::from_be_bytes(buf[12..16].try_into().ok()?);
+    let presentation_timestamp_ns = u64::from_be_bytes(buf[16..24].try_into().ok()?);
+    let base_sequence_number = u32::from_be_bytes(buf[24..28].try_into().ok()?);
+    let packet_count = buf[28];
+    let channel_count = buf[29];
+    let sample_rate_code = u16::from_be_bytes(buf[30..32].try_into().ok()?);
+    let sample_rate = code_to_sample_rate(sample_rate_code);
+    let samples_per_channel = u16::from_be_bytes(buf[32..34].try_into().ok()?);
+    let payload_len = u16::from_be_bytes(buf[34..36].try_into().ok()?) as usize;
+    if channel_count == 0 || sample_rate == 0 || samples_per_channel == 0 || packet_count == 0 {
+        return None;
+    }
+    if buf.len() < FEC_HEADER_BYTES + payload_len {
+        return None;
+    }
+    Some(ParsedFecPacket {
+        stream_id,
+        fec_sequence_number,
+        presentation_timestamp_ns,
+        base_sequence_number,
+        packet_count,
+        channel_count,
+        sample_rate,
+        samples_per_channel,
+        payload_offset: FEC_HEADER_BYTES,
+        payload_len,
+    })
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ParsedNackPacket {
+    pub stream_id: u32,
+    pub missing_sequence_number: u32,
+    pub missing_count: u16,
+}
+
+pub fn encode_nack_packet(
+    stream_id: u32,
+    missing_sequence_number: u32,
+    missing_count: u16,
+) -> Vec<u8> {
+    let header = PacketHeader {
+        sub_stream_index: 0,
+        stream_id,
+        sequence_number: 0,
+        presentation_timestamp_ns: 0,
+    };
+    let mut packet = Vec::with_capacity(32);
+    packet.extend_from_slice(&header.to_bytes_with_type(PACKET_TYPE_NACK));
+    packet.extend_from_slice(&missing_sequence_number.to_be_bytes());
+    packet.extend_from_slice(&missing_count.to_be_bytes());
+    packet.extend_from_slice(&[0u8; 2]); // padding to 32 bytes
+    packet
+}
+
+pub fn parse_nack_packet(buf: &[u8]) -> Option<ParsedNackPacket> {
+    if buf.len() < 30 || &buf[0..4] != b"OAv1" || buf[4] != 1 || buf[5] != PACKET_TYPE_NACK {
+        return None;
+    }
+    let stream_id = u32::from_be_bytes(buf[8..12].try_into().ok()?);
+    let missing_sequence_number = u32::from_be_bytes(buf[24..28].try_into().ok()?);
+    let missing_count = u16::from_be_bytes(buf[28..30].try_into().ok()?);
+    Some(ParsedNackPacket {
+        stream_id,
+        missing_sequence_number,
+        missing_count,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
-        decode_float32, float32_payload, max_float32_frames_per_packet, parse_packet,
-        AudioPayloadHeader, PacketHeader, MAX_SAFE_UDP_PAYLOAD_BYTES, OPENAUDIO_HEADER_BYTES,
+        decode_float32, encode_fec_packet, encode_nack_packet, float32_payload,
+        max_float32_frames_per_packet, parse_fec_packet, parse_nack_packet, parse_packet,
+        peek_packet_type, AudioPayloadHeader, PacketHeader, MAX_SAFE_UDP_PAYLOAD_BYTES,
+        OPENAUDIO_HEADER_BYTES, PACKET_TYPE_FEC, PACKET_TYPE_NACK,
         SAMPLE_FORMAT_FLOAT32,
     };
 
@@ -485,5 +626,50 @@ mod tests {
         packet[24] = 1;
         packet[26..28].copy_from_slice(&0_u16.to_be_bytes());
         assert!(parse_packet(&packet).is_none());
+    }
+
+    #[test]
+    fn fec_packet_encoding_and_parsing_round_trip() {
+        let parity = vec![0xAA, 0x55, 0x12, 0x34];
+        let fec_bytes = encode_fec_packet(
+            101, // stream_id
+            5,   // fec_seq
+            1_000_000,
+            10,  // base_seq
+            4,   // count
+            2,   // channels
+            48_000,
+            128,
+            &parity,
+        )
+        .expect("encode fec");
+
+        assert_eq!(peek_packet_type(&fec_bytes), Some(PACKET_TYPE_FEC));
+        assert!(parse_packet(&fec_bytes).is_none()); // Audio parser must reject FEC
+
+        let parsed = parse_fec_packet(&fec_bytes).expect("parse fec");
+        assert_eq!(parsed.stream_id, 101);
+        assert_eq!(parsed.fec_sequence_number, 5);
+        assert_eq!(parsed.base_sequence_number, 10);
+        assert_eq!(parsed.packet_count, 4);
+        assert_eq!(parsed.channel_count, 2);
+        assert_eq!(parsed.sample_rate, 48_000);
+        assert_eq!(parsed.samples_per_channel, 128);
+        assert_eq!(
+            &fec_bytes[parsed.payload_offset..parsed.payload_offset + parsed.payload_len],
+            &parity
+        );
+    }
+
+    #[test]
+    fn nack_packet_encoding_and_parsing_round_trip() {
+        let nack_bytes = encode_nack_packet(202, 45, 3);
+        assert_eq!(peek_packet_type(&nack_bytes), Some(PACKET_TYPE_NACK));
+        assert!(parse_packet(&nack_bytes).is_none());
+
+        let parsed = parse_nack_packet(&nack_bytes).expect("parse nack");
+        assert_eq!(parsed.stream_id, 202);
+        assert_eq!(parsed.missing_sequence_number, 45);
+        assert_eq!(parsed.missing_count, 3);
     }
 }

@@ -43,6 +43,10 @@ mod web_stream;
 pub mod asio;
 mod asio_subscribe;
 pub mod crypto;
+pub use crypto::{
+    decrypt_audio_packet, derive_key_from_passphrase, encrypt_audio_packet, packet_nonce,
+    StreamCipher,
+};
 pub mod ptp;
 pub mod signal_meter;
 pub mod webrtc_gateway;
@@ -78,8 +82,9 @@ pub use receive::receive_to_wav;
 
 pub use transmit::{
     transmit, transmit_loopback_with_discovery, transmit_loopback_with_discovery_labeled,
-    transmit_multi, transmit_with_control, transmit_with_discovery,
-    transmit_with_discovery_labeled,
+    transmit_loopback_with_discovery_labeled_encrypted, transmit_multi, transmit_with_control,
+    transmit_with_discovery, transmit_with_discovery_labeled,
+    transmit_with_discovery_labeled_encrypted,
 };
 
 // ── Synthetic diagnostic publishing ─────────────────────────────────────
@@ -95,25 +100,34 @@ pub use diagnostic_publish::{
 // ── Mixed subscriber bus ────────────────────────────────────────────────
 
 pub use bus::{
-    get_volume, new_volume_control, receive_and_play_bus, receive_and_play_bus_with_control,
-    receive_and_play_bus_with_volume, set_volume, VolumeControl,
+    get_volume, new_volume_control, receive_and_play_bus, receive_and_play_bus_filtered,
+    receive_and_play_bus_filtered_with_status, receive_and_play_bus_filtered_with_status_and_jitter,
+    receive_and_play_bus_filtered_with_status_jitter_and_cipher,
+    receive_and_play_bus_with_control, receive_and_play_bus_with_volume, set_volume, VolumeControl,
 };
 
 // ── Discovery and subscription control ──────────────────────────────────
 
 pub use discovery::{
-    send_subscribe_request, start_advertising, start_advertising_with_labels,
-    start_control_listener, start_discovery_listener, DiscoveredNode, NodeAdvertisement,
-    SubscriberRegistry,
+    bind_control_listener_on_interface, list_network_interfaces, measure_node_rtt,
+    send_subscribe_request, send_subscribe_request_from_interface, start_advertising,
+    start_advertising_with_active, start_advertising_with_labels,
+    start_advertising_with_labels_and_active, start_advertising_with_labels_and_active_encrypted,
+    start_advertising_with_labels_and_active_encrypted_interface,
+    start_advertising_with_labels_and_active_encrypted_selector, start_control_listener,
+    start_discovery_listener, start_discovery_listener_on_interface,
+    start_discovery_listener_on_interface_selector, DiscoveredNode, NetworkInterfaceInfo,
+    NodeAdvertisement, SubscriberRegistry,
 };
 
 // ── Multichannel standard-device and SAR routing ────────────────────────
 
 pub use combine::{
-    capture_and_combine_with_discovery, capture_and_combine_with_labels, ChannelSource,
+    capture_and_combine_with_discovery, capture_and_combine_with_labels,
+    capture_and_combine_with_labels_encrypted, ChannelSource,
 };
 
-pub use split::receive_and_split_to_devices;
+pub use split::{receive_and_split_to_devices, receive_and_split_to_devices_with_cipher};
 
 pub use sar_config::{
     ensure_openaudio_endpoints, find_sar_config_path, openaudio_endpoint_name,

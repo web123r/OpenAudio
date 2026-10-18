@@ -1,6 +1,6 @@
 [package]
 name = "openaudio-gui"
-version = "0.1.0"
+version = "0.3.0"
 edition = "2021"
 
 [[bin]]
@@ -14,6 +14,8 @@ eframe = { version = "0.28", default-features = false, features = ["default_font
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 rfd = "0.14"
+ctrlc = "3.4"
+ureq = { version = "2.10", default-features = false, features = ["tls", "json"] }
 [target.'cfg(windows)'.build-dependencies]
 winresource = "0.1"
 

@@ -1,4 +1,5 @@
 use crate::backend::get_backend;
+use crate::crypto::StreamCipher;
 use crate::devices::is_skip;
 use crate::discovery::SubscriberRegistry;
 use crate::ensure_realtime_audio_thread;
@@ -72,6 +73,30 @@ pub fn capture_and_combine_with_labels(
     subscribers_by_stream: SubscriberRegistry,
     record_each_channel: bool,
     channel_labels: Option<Vec<String>>,
+    keep_running: Arc<AtomicBool>,
+) -> Result<(), String> {
+    capture_and_combine_with_labels_encrypted(
+        node_name,
+        stream_name,
+        stream_id,
+        sources,
+        subscribers_by_stream,
+        record_each_channel,
+        channel_labels,
+        None,
+        keep_running,
+    )
+}
+
+pub fn capture_and_combine_with_labels_encrypted(
+    node_name: String,
+    stream_name: String,
+    stream_id: u32,
+    sources: Vec<ChannelSource>,
+    subscribers_by_stream: SubscriberRegistry,
+    record_each_channel: bool,
+    channel_labels: Option<Vec<String>>,
+    cipher: Option<Arc<StreamCipher>>,
     keep_running: Arc<AtomicBool>,
 ) -> Result<(), String> {
     ensure_realtime_audio_thread();
@@ -271,14 +296,17 @@ pub fn capture_and_combine_with_labels(
             .collect()
     });
 
+    let is_encrypted = cipher.is_some();
     std::thread::spawn(move || {
-        if let Err(error) = crate::discovery::start_advertising_with_labels(
+        if let Err(error) = crate::discovery::start_advertising_with_labels_and_active_encrypted(
             node_name,
             stream_id,
             stream_name,
             advertised_channel_count,
             labels,
             crate::discovery::CONTROL_PORT,
+            is_encrypted,
+            advertising_keep_running.clone(),
             advertising_keep_running,
         ) {
             eprintln!("audio-core: advertising stopped: {error}");
@@ -413,8 +441,20 @@ pub fn capture_and_combine_with_labels(
             packet.extend_from_slice(&sample.to_le_bytes());
         }
 
+        let packet_to_send = if let Some(ref c) = cipher {
+            match crate::crypto::encrypt_audio_packet(c, &packet) {
+                Ok(enc) => enc,
+                Err(error) => {
+                    eprintln!("audio-core: failed to encrypt combine packet: {error}");
+                    continue;
+                }
+            }
+        } else {
+            packet
+        };
+
         for destination in &destinations {
-            if let Err(error) = socket.send_to(&packet, destination) {
+            if let Err(error) = socket.send_to(&packet_to_send, destination) {
                 eprintln!(
                     "audio-core: send to {destination} \
                      failed: {error}"

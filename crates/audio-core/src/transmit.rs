@@ -108,9 +108,7 @@ pub fn transmit_multi(
         Box::new(move |data: &[f32]| {
             signal_meter_for_callback.observe_interleaved(data, channels as usize);
             let timestamp_ns = start.elapsed().as_nanos() as u64;
-            if let Err(error) = queue_for_callback.try_push(data, timestamp_ns) {
-                eprintln!("audio-core: dropping malformed capture block: {error}");
-            }
+            let _ = queue_for_callback.try_push(data, timestamp_ns);
         }),
     )?;
 
@@ -128,6 +126,7 @@ pub fn transmit_multi(
         max_frames_per_packet,
         None,
         packets_sent.clone(),
+        None,
     );
 
     println!(
@@ -203,9 +202,7 @@ pub fn transmit_with_control(
         Box::new(move |data: &[f32]| {
             signal_meter_for_callback.observe_interleaved(data, channels as usize);
             let timestamp_ns = start.elapsed().as_nanos() as u64;
-            if let Err(error) = queue_for_callback.try_push(data, timestamp_ns) {
-                eprintln!("audio-core: dropping malformed capture block: {error}");
-            }
+            let _ = queue_for_callback.try_push(data, timestamp_ns);
         }),
     )?;
 
@@ -223,6 +220,7 @@ pub fn transmit_with_control(
         max_frames_per_packet,
         None,
         packets_sent,
+        None,
     );
 
     while keep_running.load(Ordering::Relaxed) {
@@ -267,6 +265,30 @@ pub fn transmit_with_discovery_labeled(
     record_path: Option<String>,
     channel_labels: Option<Vec<String>>,
     keep_running: Arc<AtomicBool>,
+) -> Result<(), String> {
+    transmit_with_discovery_labeled_encrypted(
+        node_name,
+        stream_name,
+        stream_id,
+        device_name,
+        subscribers_by_stream,
+        record_path,
+        channel_labels,
+        keep_running,
+        None,
+    )
+}
+
+pub fn transmit_with_discovery_labeled_encrypted(
+    node_name: String,
+    stream_name: String,
+    stream_id: u32,
+    device_name: Option<String>,
+    subscribers_by_stream: SubscriberRegistry,
+    record_path: Option<String>,
+    channel_labels: Option<Vec<String>>,
+    keep_running: Arc<AtomicBool>,
+    cipher: Option<Arc<crate::crypto::StreamCipher>>,
 ) -> Result<(), String> {
     ensure_realtime_audio_thread();
 
@@ -328,14 +350,17 @@ pub fn transmit_with_discovery_labeled(
             .collect()
     });
 
+    let is_encrypted = cipher.is_some();
     std::thread::spawn(move || {
-        if let Err(error) = crate::discovery::start_advertising_with_labels(
+        if let Err(error) = crate::discovery::start_advertising_with_labels_and_active_encrypted(
             node_name,
             stream_id,
             stream_name,
             channels_u8,
             labels,
             crate::discovery::CONTROL_PORT,
+            is_encrypted,
+            advertise_keep_running.clone(),
             advertise_keep_running,
         ) {
             eprintln!("audio-core: advertising stopped: {error}");
@@ -356,9 +381,7 @@ pub fn transmit_with_discovery_labeled(
             let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 signal_meter_for_callback.observe_interleaved(data, channels as usize);
                 let timestamp_ns = start.elapsed().as_nanos() as u64;
-                if let Err(error) = queue_for_callback.try_push(data, timestamp_ns) {
-                    eprintln!("audio-core: dropping malformed capture block: {error}");
-                }
+                let _ = queue_for_callback.try_push(data, timestamp_ns);
             }));
 
             if result.is_err() {
@@ -384,6 +407,7 @@ pub fn transmit_with_discovery_labeled(
         max_frames_per_packet,
         writer.clone(),
         Arc::new(AtomicU32::new(0)),
+        cipher,
     );
 
     while keep_running.load(Ordering::Relaxed) {
@@ -433,6 +457,30 @@ pub fn transmit_loopback_with_discovery_labeled(
     record_path: Option<String>,
     channel_labels: Option<Vec<String>>,
     keep_running: Arc<AtomicBool>,
+) -> Result<(), String> {
+    transmit_loopback_with_discovery_labeled_encrypted(
+        node_name,
+        stream_name,
+        stream_id,
+        device_name,
+        subscribers_by_stream,
+        record_path,
+        channel_labels,
+        keep_running,
+        None,
+    )
+}
+
+pub fn transmit_loopback_with_discovery_labeled_encrypted(
+    node_name: String,
+    stream_name: String,
+    stream_id: u32,
+    device_name: Option<String>,
+    subscribers_by_stream: SubscriberRegistry,
+    record_path: Option<String>,
+    channel_labels: Option<Vec<String>>,
+    keep_running: Arc<AtomicBool>,
+    cipher: Option<Arc<crate::crypto::StreamCipher>>,
 ) -> Result<(), String> {
     ensure_realtime_audio_thread();
 
@@ -496,14 +544,17 @@ pub fn transmit_loopback_with_discovery_labeled(
             .collect()
     });
 
+    let is_encrypted = cipher.is_some();
     std::thread::spawn(move || {
-        if let Err(error) = crate::discovery::start_advertising_with_labels(
+        if let Err(error) = crate::discovery::start_advertising_with_labels_and_active_encrypted(
             node_name,
             stream_id,
             stream_name,
             channels_u8,
             labels,
             crate::discovery::CONTROL_PORT,
+            is_encrypted,
+            advertise_keep_running.clone(),
             advertise_keep_running,
         ) {
             eprintln!("audio-core: advertising stopped: {error}");
@@ -526,9 +577,7 @@ pub fn transmit_loopback_with_discovery_labeled(
                 let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                     signal_meter_for_callback.observe_interleaved(data, channels as usize);
                     let timestamp_ns = start.elapsed().as_nanos() as u64;
-                    if let Err(error) = queue_for_callback.try_push(data, timestamp_ns) {
-                        eprintln!("audio-core: dropping malformed loopback block: {error}");
-                    }
+                    let _ = queue_for_callback.try_push(data, timestamp_ns);
                 }));
 
                 if result.is_err() {
@@ -561,6 +610,7 @@ pub fn transmit_loopback_with_discovery_labeled(
         max_frames_per_packet,
         writer.clone(),
         Arc::new(AtomicU32::new(0)),
+        cipher,
     );
 
     while keep_running.load(Ordering::Relaxed) {
@@ -590,9 +640,12 @@ fn spawn_capture_publisher(
     max_frames_per_packet: usize,
     writer: Option<SharedWavWriter>,
     packets_sent: Arc<AtomicU32>,
+    cipher: Option<Arc<crate::crypto::StreamCipher>>,
 ) -> std::thread::JoinHandle<()> {
     std::thread::spawn(move || {
         let mut last_drop_report = Instant::now();
+        let mut fec_encoder =
+            network_core::fec::FecEncoder::new(network_core::fec::DEFAULT_FEC_GROUP_SIZE);
 
         loop {
             if last_drop_report.elapsed() >= Duration::from_secs(1) {
@@ -628,10 +681,11 @@ fn spawn_capture_publisher(
 
                         let sample_start = frame_offset * channels as usize;
                         let sample_end = (frame_offset + frames_this_packet) * channels as usize;
+                        let sample_rate = network_core::protocol::code_to_sample_rate(rate_code);
                         let packet = match network_core::protocol::encode_float32_packet(
                             &header,
                             channels as u8,
-                            network_core::protocol::code_to_sample_rate(rate_code),
+                            sample_rate,
                             &data[sample_start..sample_end],
                         ) {
                             Ok(packet) => packet,
@@ -642,9 +696,39 @@ fn spawn_capture_publisher(
                             }
                         };
 
+                        let packet_to_send = if let Some(ref cipher) = cipher {
+                            match crate::crypto::encrypt_audio_packet(cipher, &packet) {
+                                Ok(enc) => enc,
+                                Err(error) => {
+                                    eprintln!("audio-core: failed to encrypt audio packet: {error}");
+                                    frame_offset += frames_this_packet;
+                                    continue;
+                                }
+                            }
+                        } else {
+                            packet.clone()
+                        };
+
                         for address in &destinations {
-                            if let Err(error) = socket.send_to(&packet, address) {
+                            if let Err(error) = socket.send_to(&packet_to_send, address) {
                                 eprintln!("audio-core: send to {address} failed: {error}");
+                            }
+                        }
+
+                        if cipher.is_none() && packet.len() >= 32 {
+                            let maybe_fec = fec_encoder.push_audio_packet(
+                                stream_id,
+                                sequence_number,
+                                header.presentation_timestamp_ns,
+                                channels as u8,
+                                sample_rate,
+                                frames_this_packet as u16,
+                                &packet[32..],
+                            );
+                            if let Some(fec_packet) = maybe_fec {
+                                for address in &destinations {
+                                    let _ = socket.send_to(&fec_packet, address);
+                                }
                             }
                         }
 

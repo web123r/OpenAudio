@@ -5,6 +5,7 @@ mod patchbay;
 mod preset;
 mod signal_monitor;
 mod ui_shell;
+mod updater;
 
 use asio_subscribe_ui::AsioSubscribePanel;
 use diagnostic_panel::DiagnosticPanel;
@@ -17,7 +18,7 @@ use ui_shell::{AppPage, UiSummary};
 
 use eframe::egui;
 use std::collections::{HashMap, HashSet};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -86,9 +87,16 @@ mod tests {
     }
 }
 
+#[derive(Debug, Clone, Copy)]
+pub struct NodePing {
+    pub rtt_ms: f32,
+    pub last_seen: Instant,
+}
+
 // ============================================================================
 // PUBLISH SESSION TYPES
 // ============================================================================
+
 
 struct PublishSession {
     id: u64,
@@ -99,6 +107,8 @@ struct PublishSession {
     is_loopback: bool,
     record: bool,
     channel_labels: Vec<String>,
+    encrypted: bool,
+    passphrase: String,
     running: Arc<AtomicBool>,
     status: Arc<Mutex<String>>,
     last_toggle: Instant,
@@ -114,6 +124,8 @@ struct CombinePublishSession {
     channel_sources: Vec<(Option<String>, bool)>,
     channel_labels: Vec<String>,
     record: bool,
+    encrypted: bool,
+    passphrase: String,
     running: Arc<AtomicBool>,
     status: Arc<Mutex<String>>,
     last_toggle: Instant,
@@ -144,9 +156,12 @@ struct SubscribeSession {
     selected_output: Option<String>,
     volume: audio_core::VolumeControl,
     record: bool,
+    encrypted: bool,
+    passphrase: String,
     running: Arc<AtomicBool>,
     status: Arc<Mutex<String>>,
     last_toggle: Instant,
+    jitter_target_ms: Arc<AtomicU32>,
 }
 
 struct SplitSubscribeSession {
@@ -159,6 +174,8 @@ struct SplitSubscribeSession {
     status: Arc<Mutex<String>>,
     last_toggle: Instant,
     record: bool,
+    encrypted: bool,
+    passphrase: String,
 }
 
 // Browser playback uses one application-level gateway rather than one
@@ -204,6 +221,7 @@ struct OpenAudioApp {
     // Subscribe sessions.
     subscribe_sessions: Vec<SubscribeSession>,
     split_subscribe_sessions: Vec<SplitSubscribeSession>,
+    patchbay_matrix: patchbay::PatchbayMatrix,
 
     // Available devices and drivers.
     input_devices: Vec<audio_core::DeviceInfo>,
@@ -214,6 +232,10 @@ struct OpenAudioApp {
     // Shared networking state.
     discovery_directory: Arc<Mutex<HashMap<String, audio_core::DiscoveredNode>>>,
     subscribers_by_stream: audio_core::SubscriberRegistry,
+    node_pings: Arc<Mutex<HashMap<String, NodePing>>>,
+    selected_interface: Option<String>,
+    interface_selector: Arc<Mutex<Option<std::net::Ipv4Addr>>>,
+    available_interfaces: Vec<audio_core::NetworkInterfaceInfo>,
 
     // User notifications.
     error_banner: Arc<Mutex<Option<String>>>,
@@ -223,6 +245,9 @@ struct OpenAudioApp {
     refreshing_devices: Arc<AtomicBool>,
     pending_device_refresh:
         Arc<Mutex<Option<(Vec<audio_core::DeviceInfo>, Vec<audio_core::DeviceInfo>)>>>,
+
+    // Background update checker.
+    updater: updater::UpdateChecker,
 }
 
 // ============================================================================
@@ -237,12 +262,19 @@ impl Default for OpenAudioApp {
         let subscribers_by_stream: audio_core::SubscriberRegistry =
             Arc::new(Mutex::new(HashMap::new()));
 
+        let interface_selector: Arc<Mutex<Option<std::net::Ipv4Addr>>> =
+            Arc::new(Mutex::new(None));
+
         // Discovery and publisher-control listeners live for the lifetime
         // of the desktop application.
         let always_on = Arc::new(AtomicBool::new(true));
 
+        let updater = updater::UpdateChecker::default();
+        updater.start_background_loop(always_on.clone());
+
         let directory_for_discovery = discovery_directory.clone();
         let discovery_running = always_on.clone();
+        let iface_selector_for_discovery = interface_selector.clone();
 
         thread::Builder::new()
             .name("openaudio-discovery-listener".to_string())
@@ -250,7 +282,11 @@ impl Default for OpenAudioApp {
                 audio_core::ensure_realtime_audio_thread();
 
                 if let Err(error) =
-                    audio_core::start_discovery_listener(directory_for_discovery, discovery_running)
+                    audio_core::start_discovery_listener_on_interface_selector(
+                        directory_for_discovery,
+                        discovery_running,
+                        iface_selector_for_discovery,
+                    )
                 {
                     eprintln!("Discovery listener error: {error}");
                 }
@@ -260,7 +296,7 @@ impl Default for OpenAudioApp {
             });
 
         let registry_for_control = subscribers_by_stream.clone();
-        let control_running = always_on;
+        let control_running = always_on.clone();
 
         thread::Builder::new()
             .name("openaudio-control-listener".to_string())
@@ -276,6 +312,56 @@ impl Default for OpenAudioApp {
             .unwrap_or_else(|error| {
                 panic!("Failed to start control listener: {error}");
             });
+
+        let node_pings: Arc<Mutex<HashMap<String, NodePing>>> =
+            Arc::new(Mutex::new(HashMap::new()));
+        let pings_for_monitor = node_pings.clone();
+        let directory_for_pings = discovery_directory.clone();
+        let ping_running = always_on;
+
+        if let Err(error) = thread::Builder::new()
+            .name("openaudio-ping-monitor".to_string())
+            .spawn(move || {
+                while ping_running.load(Ordering::Relaxed) {
+                    thread::sleep(Duration::from_millis(2000));
+                    if !ping_running.load(Ordering::Relaxed) {
+                        break;
+                    }
+
+                    let targets: Vec<(String, String, u16)> = {
+                        let Ok(dir) = directory_for_pings.lock() else {
+                            continue;
+                        };
+                        dir.values()
+                            .map(|node| (node.node_id.clone(), node.ip.clone(), node.control_port))
+                            .collect()
+                    };
+
+                    for (node_id, ip, control_port) in targets {
+                        if !ping_running.load(Ordering::Relaxed) {
+                            break;
+                        }
+                        if let Some(rtt_ms) = audio_core::measure_node_rtt(
+                            &ip,
+                            control_port,
+                            Duration::from_millis(300),
+                        ) {
+                            if let Ok(mut pings) = pings_for_monitor.lock() {
+                                pings.insert(
+                                    node_id,
+                                    NodePing {
+                                        rtt_ms,
+                                        last_seen: Instant::now(),
+                                    },
+                                );
+                            }
+                        }
+                    }
+                }
+            })
+        {
+            eprintln!("Failed to start ping monitor: {error}");
+        }
 
         // The application owns one configurable browser gateway. It remains
         // stopped until explicitly enabled by the user.
@@ -309,6 +395,7 @@ impl Default for OpenAudioApp {
 
             subscribe_sessions: Vec::new(),
             split_subscribe_sessions: Vec::new(),
+            patchbay_matrix: patchbay::PatchbayMatrix::new(),
 
             input_devices: audio_core::list_input_devices(),
             output_devices: audio_core::list_output_devices(),
@@ -317,12 +404,18 @@ impl Default for OpenAudioApp {
 
             discovery_directory,
             subscribers_by_stream,
+            node_pings,
+            selected_interface: None,
+            interface_selector,
+            available_interfaces: audio_core::list_network_interfaces(),
 
             error_banner: Arc::new(Mutex::new(None)),
             info_banner: Arc::new(Mutex::new(None)),
 
             refreshing_devices: Arc::new(AtomicBool::new(false)),
             pending_device_refresh: Arc::new(Mutex::new(None)),
+
+            updater,
         }
     }
 }
@@ -332,6 +425,15 @@ impl Default for OpenAudioApp {
 // ============================================================================
 
 impl OpenAudioApp {
+    pub fn set_selected_interface(&mut self, iface_ip: Option<String>) {
+        let parsed_ip = iface_ip
+            .as_ref()
+            .and_then(|s| s.parse::<std::net::Ipv4Addr>().ok());
+        if let Ok(mut guard) = self.interface_selector.lock() {
+            *guard = parsed_ip;
+        }
+        self.selected_interface = iface_ip;
+    }
     fn ui_summary(&self) -> UiSummary {
         let configured_publishers = self.publish_sessions.len()
             + self.combine_publish_sessions.len()
@@ -508,6 +610,7 @@ impl OpenAudioApp {
         PresetFile {
             format: "OpenAudio preset".to_string(),
             version: 1,
+            selected_interface: self.selected_interface.clone(),
             publish_sessions: self
                 .publish_sessions
                 .iter()
@@ -519,6 +622,8 @@ impl OpenAudioApp {
                     is_loopback: session.is_loopback,
                     record: session.record,
                     channel_labels: session.channel_labels.clone(),
+                    encrypted: session.encrypted,
+                    passphrase: session.passphrase.clone(),
                 })
                 .collect(),
             combine_publish_sessions: self
@@ -533,6 +638,8 @@ impl OpenAudioApp {
                     channel_sources: session.channel_sources.clone(),
                     record: session.record,
                     channel_labels: session.channel_labels.clone(),
+                    encrypted: session.encrypted,
+                    passphrase: session.passphrase.clone(),
                 })
                 .collect(),
             asio_publish_sessions: self
@@ -556,6 +663,9 @@ impl OpenAudioApp {
                     selected_output: session.selected_output.clone(),
                     volume: audio_core::get_volume(&session.volume),
                     record: session.record,
+                    jitter_target_ms: session.jitter_target_ms.load(Ordering::Relaxed),
+                    encrypted: session.encrypted,
+                    passphrase: session.passphrase.clone(),
                 })
                 .collect(),
             split_subscribe_sessions: self
@@ -567,6 +677,8 @@ impl OpenAudioApp {
                     bind_port: session.bind_port.clone(),
                     channel_devices: session.channel_devices.clone(),
                     record: session.record,
+                    encrypted: session.encrypted,
+                    passphrase: session.passphrase.clone(),
                 })
                 .collect(),
             browser: BrowserPreset {
@@ -610,6 +722,8 @@ impl OpenAudioApp {
             return Err("stop all active audio sessions before loading a preset".to_string());
         }
 
+        self.set_selected_interface(preset.selected_interface);
+
         self.publish_sessions.clear();
         self.combine_publish_sessions.clear();
         self.asio_publish_sessions.clear();
@@ -627,6 +741,8 @@ impl OpenAudioApp {
                 is_loopback: item.is_loopback,
                 record: item.record,
                 channel_labels: item.channel_labels,
+                encrypted: item.encrypted,
+                passphrase: item.passphrase,
                 running: Arc::new(AtomicBool::new(false)),
                 status: Arc::new(Mutex::new("Not started.".to_string())),
                 last_toggle: Instant::now() - Duration::from_secs(1),
@@ -645,6 +761,8 @@ impl OpenAudioApp {
                 channel_sources: item.channel_sources,
                 channel_labels: item.channel_labels,
                 record: item.record,
+                encrypted: item.encrypted,
+                passphrase: item.passphrase,
                 running: Arc::new(AtomicBool::new(false)),
                 status: Arc::new(Mutex::new("Not started.".to_string())),
                 last_toggle: Instant::now() - Duration::from_secs(1),
@@ -683,9 +801,12 @@ impl OpenAudioApp {
                 selected_output: item.selected_output,
                 volume: audio_core::new_volume_control(item.volume.clamp(0.0, 2.0)),
                 record: item.record,
+                encrypted: item.encrypted,
+                passphrase: item.passphrase,
                 running: Arc::new(AtomicBool::new(false)),
                 status: Arc::new(Mutex::new("Not started.".to_string())),
                 last_toggle: Instant::now() - Duration::from_secs(1),
+                jitter_target_ms: Arc::new(AtomicU32::new(item.jitter_target_ms.clamp(5, 100))),
             });
         }
 
@@ -698,6 +819,8 @@ impl OpenAudioApp {
                 bind_port: item.bind_port,
                 channel_devices: item.channel_devices,
                 record: item.record,
+                encrypted: item.encrypted,
+                passphrase: item.passphrase,
                 running: Arc::new(AtomicBool::new(false)),
                 status: Arc::new(Mutex::new("Not started.".to_string())),
                 last_toggle: Instant::now() - Duration::from_secs(1),
@@ -751,9 +874,34 @@ impl Theme {
     const TEXT_SECONDARY: egui::Color32 = egui::Color32::from_rgb(152, 152, 157);
 }
 
+fn render_rtt_badge(ui: &mut egui::Ui, ping: &NodePing) {
+    let (icon, color, text) = if ping.rtt_ms < 2.0 {
+        ("⚡", Theme::ACCENT_GREEN, format!("{:.1}ms", ping.rtt_ms))
+    } else if ping.rtt_ms < 15.0 {
+        ("📶", Theme::ACCENT_BLUE, format!("{:.1}ms", ping.rtt_ms))
+    } else if ping.rtt_ms < 40.0 {
+        ("📶", Theme::ACCENT_ORANGE, format!("{:.0}ms", ping.rtt_ms))
+    } else {
+        ("⚠️", Theme::ACCENT_RED, format!("{:.0}ms", ping.rtt_ms))
+    };
+
+    ui.label(
+        egui::RichText::new(format!("{icon} {text}"))
+            .size(10.0)
+            .strong()
+            .color(color),
+    )
+    .on_hover_text(format!(
+        "Network Round-Trip Time (RTT): {:.2} ms (updated {:.1}s ago)",
+        ping.rtt_ms,
+        ping.last_seen.elapsed().as_secs_f32()
+    ));
+}
+
 // ============================================================================
 // SHARED UI HELPERS
 // ============================================================================
+
 
 fn configure_style(ctx: &egui::Context) {
     let mut style = (*ctx.style()).clone();
@@ -936,6 +1084,9 @@ impl eframe::App for OpenAudioApp {
                             AppPage::Subscribe => {
                                 self.render_subscribe_page(ui);
                             }
+                            AppPage::Patchbay => {
+                                self.render_patchbay_page(ui);
+                            }
                             AppPage::Browser => {
                                 self.render_browser_page(ui);
                             }
@@ -1028,6 +1179,45 @@ impl OpenAudioApp {
                     self.save_preset();
                 }
 
+                let is_checking_update = self.updater.is_checking.load(Ordering::Relaxed);
+                let update_btn_text = if is_checking_update {
+                    "Checking..."
+                } else {
+                    "↻ Updates"
+                };
+
+                let update_btn = ui
+                    .add_enabled(
+                        !is_checking_update,
+                        egui::Button::new(
+                            egui::RichText::new(update_btn_text).color(Theme::TEXT_PRIMARY),
+                        )
+                        .fill(Theme::BG_CARD)
+                        .rounding(8.0)
+                        .min_size(egui::vec2(95.0, 34.0)),
+                    );
+
+                if update_btn.clicked() {
+                    self.updater.check_now();
+                }
+
+                if let Ok(guard) = self.updater.status.lock() {
+                    match &*guard {
+                        updater::UpdateStatus::UpToDate { version, .. } => {
+                            update_btn.on_hover_text(format!("OpenAudio v{version} is up to date"));
+                        }
+                        updater::UpdateStatus::UpdateAvailable { latest_version, .. } => {
+                            update_btn.on_hover_text(format!("Update available: v{latest_version}"));
+                        }
+                        updater::UpdateStatus::Error { message, .. } => {
+                            update_btn.on_hover_text(format!("Update check: {message}"));
+                        }
+                        _ => {
+                            update_btn.on_hover_text("Check GitHub for latest release");
+                        }
+                    }
+                }
+
                 let active_audio_sessions = self.active_audio_session_count();
 
                 let (status_text, status_color) = if active_audio_sessions > 0 {
@@ -1091,6 +1281,85 @@ impl OpenAudioApp {
     }
 
     fn render_banners(&mut self, ui: &mut egui::Ui) {
+        if !self.updater.dismissed.load(Ordering::Relaxed) {
+            let update_info = if let Ok(guard) = self.updater.status.lock() {
+                if let updater::UpdateStatus::UpdateAvailable {
+                    latest_version,
+                    release_name,
+                    release_url,
+                    download_url,
+                    ..
+                } = &*guard
+                {
+                    Some((
+                        latest_version.clone(),
+                        release_name.clone(),
+                        release_url.clone(),
+                        download_url.clone(),
+                    ))
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
+
+            if let Some((latest_ver, rel_name, rel_url, dl_url)) = update_info {
+                egui::Frame::none()
+                    .fill(egui::Color32::from_rgb(16, 88, 54))
+                    .rounding(10.0)
+                    .inner_margin(12.0)
+                    .show(ui, |ui| {
+                        ui.horizontal(|ui| {
+                            ui.label(
+                                egui::RichText::new("🚀")
+                                    .size(16.0)
+                                    .color(egui::Color32::WHITE),
+                            );
+
+                            ui.label(
+                                egui::RichText::new(format!(
+                                    "A new version of OpenAudio is available: v{latest_ver} ({rel_name})"
+                                ))
+                                .color(egui::Color32::WHITE)
+                                .strong(),
+                            );
+
+                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                if ui.small_button("✕ Dismiss").clicked() {
+                                    self.updater.dismissed.store(true, Ordering::Relaxed);
+                                }
+
+                                if let Some(download) = dl_url {
+                                    if ui
+                                        .button(
+                                            egui::RichText::new("📥 Download Latest")
+                                                .color(egui::Color32::WHITE)
+                                                .strong(),
+                                        )
+                                        .clicked()
+                                    {
+                                        ui.ctx().open_url(egui::OpenUrl::new_tab(download));
+                                    }
+                                }
+
+                                if ui
+                                    .button(
+                                        egui::RichText::new("Release Notes")
+                                            .color(egui::Color32::WHITE),
+                                    )
+                                    .clicked()
+                                {
+                                    ui.ctx().open_url(egui::OpenUrl::new_tab(rel_url));
+                                }
+                            });
+                        });
+                    });
+
+                ui.add_space(10.0);
+            }
+        }
+
         if let Some(error) = shared_message(&self.error_banner) {
             egui::Frame::none()
                 .fill(Theme::ACCENT_RED)
@@ -1155,11 +1424,112 @@ impl OpenAudioApp {
 
         ui.add_space(12.0);
 
+        self.render_network_adapter_selector(ui);
+
+        ui.add_space(12.0);
+
         self.signal_monitor.ui(ui);
 
         ui.add_space(12.0);
 
         self.render_discovered_streams_overview(ui);
+    }
+
+    fn render_network_adapter_selector(&mut self, ui: &mut egui::Ui) {
+        section_frame().show(ui, |ui| {
+            ui.horizontal(|ui| {
+                ui.label(
+                    egui::RichText::new("Network Adapter & Subnet")
+                        .size(17.0)
+                        .strong()
+                        .color(Theme::TEXT_PRIMARY),
+                );
+
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if ui
+                        .add(
+                            egui::Button::new(
+                                egui::RichText::new("↻ Refresh Adapters").color(Theme::TEXT_PRIMARY),
+                            )
+                            .fill(Theme::BG_CARD)
+                            .rounding(6.0),
+                        )
+                        .clicked()
+                    {
+                        self.available_interfaces = audio_core::list_network_interfaces();
+                    }
+                });
+            });
+
+            ui.add_space(4.0);
+
+            ui.label(
+                egui::RichText::new(
+                    "Select a dedicated physical NIC, Dante VLAN, or secondary subnet for audio streaming. \
+                     'All Adapters (0.0.0.0)' announces and discovers on every active network interface.",
+                )
+                .size(11.0)
+                .color(Theme::TEXT_SECONDARY),
+            );
+
+            ui.add_space(10.0);
+
+            let current_label = match &self.selected_interface {
+                Some(ip_str) => {
+                    if let Some(info) = self
+                        .available_interfaces
+                        .iter()
+                        .find(|i| &i.ip.to_string() == ip_str)
+                    {
+                        let mask = info
+                            .netmask
+                            .map(|m| m.to_string())
+                            .unwrap_or_else(|| "N/A".into());
+                        format!("{} — {} (mask: {})", info.name, info.ip, mask)
+                    } else {
+                        format!("Interface IP: {ip_str}")
+                    }
+                }
+                None => "All Network Adapters (0.0.0.0) — Recommended".to_string(),
+            };
+
+            let mut changed = false;
+            let mut new_choice = self.selected_interface.clone();
+
+            egui::ComboBox::from_id_source("network_adapter_selector_combo")
+                .width(460.0)
+                .selected_text(egui::RichText::new(&current_label).color(Theme::TEXT_PRIMARY))
+                .show_ui(ui, |ui| {
+                    if ui
+                        .selectable_label(
+                            self.selected_interface.is_none(),
+                            "All Network Adapters (0.0.0.0) — Recommended",
+                        )
+                        .clicked()
+                    {
+                        new_choice = None;
+                        changed = true;
+                    }
+
+                    for iface in &self.available_interfaces {
+                        let ip_str = iface.ip.to_string();
+                        let mask_str = iface
+                            .netmask
+                            .map(|m| m.to_string())
+                            .unwrap_or_else(|| "N/A".into());
+                        let label = format!("{} — {} (mask: {})", iface.name, iface.ip, mask_str);
+                        let is_selected = self.selected_interface.as_deref() == Some(&ip_str);
+                        if ui.selectable_label(is_selected, &label).clicked() {
+                            new_choice = Some(ip_str);
+                            changed = true;
+                        }
+                    }
+                });
+
+            if changed {
+                self.set_selected_interface(new_choice);
+            }
+        });
     }
 
     fn render_overview_actions(&mut self, ui: &mut egui::Ui) {
@@ -2379,7 +2749,27 @@ impl OpenAudioApp {
                                 egui::RichText::new("Record stream to WAV")
                                     .color(Theme::TEXT_PRIMARY),
                             );
+
+                            let is_enc = session.encrypted;
+                            ui.checkbox(
+                                &mut session.encrypted,
+                                egui::RichText::new("🔒 Encrypt Stream (AES-256-GCM)")
+                                    .color(if is_enc { egui::Color32::from_rgb(52, 199, 89) } else { Theme::TEXT_PRIMARY }),
+                            );
                         });
+
+                        if session.encrypted {
+                            ui.add_space(4.0);
+                            ui.horizontal(|ui| {
+                                ui.label(egui::RichText::new("🔑 Passphrase:").color(Theme::TEXT_SECONDARY));
+                                ui.add(
+                                    egui::TextEdit::singleline(&mut session.passphrase)
+                                        .password(true)
+                                        .hint_text("Enter stream encryption passphrase...")
+                                        .desired_width(260.0),
+                                );
+                            });
+                        }
 
                         ui.add_space(8.0);
 
@@ -2583,6 +2973,12 @@ impl OpenAudioApp {
 
                                 let channel_labels = session.channel_labels.clone();
 
+                                let cipher = if session.encrypted && !session.passphrase.is_empty() {
+                                    Some(Arc::new(audio_core::StreamCipher::from_passphrase(&session.passphrase)))
+                                } else {
+                                    None
+                                };
+
                                 let record_path = if session.record {
                                     Some(audio_core::generate_record_path(&format!(
                                         "publish_{stream_id}"
@@ -2619,7 +3015,7 @@ impl OpenAudioApp {
                                     .name(format!("wasapi-publish-{stream_id}"))
                                     .spawn(move || {
                                         let result = if is_loopback {
-                                            audio_core::transmit_loopback_with_discovery_labeled(
+                                            audio_core::transmit_loopback_with_discovery_labeled_encrypted(
                                                 node_name,
                                                 stream_name,
                                                 stream_id,
@@ -2628,9 +3024,10 @@ impl OpenAudioApp {
                                                 record_path,
                                                 Some(channel_labels),
                                                 worker_running.clone(),
+                                                cipher,
                                             )
                                         } else {
-                                            audio_core::transmit_with_discovery_labeled(
+                                            audio_core::transmit_with_discovery_labeled_encrypted(
                                                 node_name,
                                                 stream_name,
                                                 stream_id,
@@ -2639,6 +3036,7 @@ impl OpenAudioApp {
                                                 record_path,
                                                 Some(channel_labels),
                                                 worker_running.clone(),
+                                                cipher,
                                             )
                                         };
 
@@ -2781,6 +3179,8 @@ impl OpenAudioApp {
                 is_loopback: false,
                 record: false,
                 channel_labels: vec!["Channel 1".to_string(), "Channel 2".to_string()],
+                encrypted: false,
+                passphrase: String::new(),
                 running: Arc::new(AtomicBool::new(false)),
                 status: Arc::new(Mutex::new("Not started.".to_string())),
                 last_toggle: Instant::now() - Duration::from_secs(1),
@@ -3023,7 +3423,27 @@ impl OpenAudioApp {
                                 egui::RichText::new("Record each channel to WAV")
                                     .color(Theme::TEXT_PRIMARY),
                             );
+
+                            let is_enc = session.encrypted;
+                            ui.checkbox(
+                                &mut session.encrypted,
+                                egui::RichText::new("🔒 Encrypt Stream (AES-256-GCM)")
+                                    .color(if is_enc { egui::Color32::from_rgb(52, 199, 89) } else { Theme::TEXT_PRIMARY }),
+                            );
                         });
+
+                        if session.encrypted {
+                            ui.add_space(4.0);
+                            ui.horizontal(|ui| {
+                                ui.label(egui::RichText::new("🔑 Passphrase:").color(Theme::TEXT_SECONDARY));
+                                ui.add(
+                                    egui::TextEdit::singleline(&mut session.passphrase)
+                                        .password(true)
+                                        .hint_text("Enter stream encryption passphrase...")
+                                        .desired_width(260.0),
+                                );
+                            });
+                        }
 
                         ui.add_space(10.0);
 
@@ -3191,10 +3611,16 @@ impl OpenAudioApp {
                                     ),
                                 );
 
+                                let cipher = if session.encrypted && !session.passphrase.is_empty() {
+                                    Some(Arc::new(audio_core::StreamCipher::from_passphrase(&session.passphrase)))
+                                } else {
+                                    None
+                                };
+
                                 let spawn_result = thread::Builder::new()
                                     .name(format!("combined-publish-{stream_id}"))
                                     .spawn(move || {
-                                        let result = audio_core::capture_and_combine_with_labels(
+                                        let result = audio_core::capture_and_combine_with_labels_encrypted(
                                             node_name,
                                             stream_name,
                                             stream_id,
@@ -3202,6 +3628,7 @@ impl OpenAudioApp {
                                             subscribers,
                                             record_each,
                                             Some(channel_labels),
+                                            cipher,
                                             worker_running.clone(),
                                         );
 
@@ -3359,6 +3786,8 @@ impl OpenAudioApp {
                 channel_sources: vec![(None, false), (None, false)],
                 channel_labels: vec!["Channel 1".to_string(), "Channel 2".to_string()],
                 record: false,
+                encrypted: false,
+                passphrase: String::new(),
                 running: Arc::new(AtomicBool::new(false)),
                 status: Arc::new(Mutex::new("Not started.".to_string())),
                 last_toggle: Instant::now() - Duration::from_secs(1),
@@ -3433,6 +3862,11 @@ impl OpenAudioApp {
 
         let discovered_nodes = match self.discovery_directory.lock() {
             Ok(directory) => directory.clone(),
+            Err(poisoned) => poisoned.into_inner().clone(),
+        };
+
+        let pings = match self.node_pings.lock() {
+            Ok(pings) => pings.clone(),
             Err(poisoned) => poisoned.into_inner().clone(),
         };
 
@@ -3577,7 +4011,27 @@ impl OpenAudioApp {
                                 egui::RichText::new("Record mixed output to WAV")
                                     .color(Theme::TEXT_PRIMARY),
                             );
+
+                            let is_enc = session.encrypted;
+                            ui.checkbox(
+                                &mut session.encrypted,
+                                egui::RichText::new("🔒 Stream is Encrypted (AES-256-GCM)")
+                                    .color(if is_enc { egui::Color32::from_rgb(52, 199, 89) } else { Theme::TEXT_PRIMARY }),
+                            );
                         });
+
+                        if session.encrypted {
+                            ui.add_space(4.0);
+                            ui.horizontal(|ui| {
+                                ui.label(egui::RichText::new("🔑 Passphrase:").color(Theme::TEXT_SECONDARY));
+                                ui.add(
+                                    egui::TextEdit::singleline(&mut session.passphrase)
+                                        .password(true)
+                                        .hint_text("Enter decryption passphrase...")
+                                        .desired_width(260.0),
+                                );
+                            });
+                        }
                     });
 
                     ui.add_space(8.0);
@@ -3601,6 +4055,37 @@ impl OpenAudioApp {
                                 .size(11.0)
                                 .color(Theme::TEXT_SECONDARY),
                         );
+                    });
+
+                    ui.add_space(4.0);
+
+                    ui.horizontal(|ui| {
+                        let mut target_ms = session.jitter_target_ms.load(Ordering::Relaxed);
+
+                        ui.label(
+                            egui::RichText::new("Jitter Buffer").color(Theme::TEXT_SECONDARY),
+                        );
+
+                        if ui
+                            .add(
+                                egui::Slider::new(&mut target_ms, 5..=100)
+                                    .suffix(" ms")
+                                    .show_value(true),
+                            )
+                            .changed()
+                        {
+                            session.jitter_target_ms.store(target_ms, Ordering::Relaxed);
+                        }
+
+                        if ui.selectable_label(target_ms == 5, "LAN (5ms)").clicked() {
+                            session.jitter_target_ms.store(5, Ordering::Relaxed);
+                        }
+                        if ui.selectable_label(target_ms == 20, "Wi-Fi (20ms)").clicked() {
+                            session.jitter_target_ms.store(20, Ordering::Relaxed);
+                        }
+                        if ui.selectable_label(target_ms == 50, "Safe (50ms)").clicked() {
+                            session.jitter_target_ms.store(50, Ordering::Relaxed);
+                        }
                     });
 
                     ui.add_space(10.0);
@@ -3640,18 +4125,35 @@ impl OpenAudioApp {
                                     node.node_name, node.stream_name, node.channel_count, node.ip,
                                 );
 
-                                let response = ui.selectable_label(
-                                    selected,
-                                    egui::RichText::new(label).color(if selected {
-                                        Theme::TEXT_PRIMARY
-                                    } else {
-                                        Theme::TEXT_SECONDARY
-                                    }),
-                                );
+                                ui.horizontal(|ui| {
+                                    let response = ui.selectable_label(
+                                        selected,
+                                        egui::RichText::new(label).color(if selected {
+                                            Theme::TEXT_PRIMARY
+                                        } else {
+                                            Theme::TEXT_SECONDARY
+                                        }),
+                                    );
 
-                                if response.clicked() {
-                                    session.selected_discovered_node_id = Some(node_id.clone());
-                                }
+                                    if node.encrypted {
+                                        ui.label(
+                                            egui::RichText::new("🔒 Encrypted")
+                                                .size(10.0)
+                                                .color(egui::Color32::from_rgb(255, 179, 0)),
+                                        );
+                                    }
+
+                                    if let Some(ping) = pings.get(node_id) {
+                                        render_rtt_badge(ui, ping);
+                                    }
+
+                                    if response.clicked() {
+                                        session.selected_discovered_node_id = Some(node_id.clone());
+                                        if node.encrypted {
+                                            session.encrypted = true;
+                                        }
+                                    }
+                                });
                             }
                         });
                     }
@@ -3797,27 +4299,34 @@ impl OpenAudioApp {
                                                     ),
                                                 );
 
+                                                let cipher = if session.encrypted && !session.passphrase.trim().is_empty() {
+                                                    Some(Arc::new(audio_core::StreamCipher::from_passphrase(&session.passphrase)))
+                                                } else {
+                                                    None
+                                                };
+
+                                                let jitter_target = session.jitter_target_ms.clone();
+
                                                 let spawn_result = thread::Builder::new()
                                                     .name(format!("wasapi-subscribe-{port}"))
                                                     .spawn(move || {
                                                         let result =
                                                                 audio_core::
-                                                                receive_and_play_bus_with_volume(
+                                                                receive_and_play_bus_filtered_with_status_jitter_and_cipher(
                                                                     &bind_addr,
                                                                     device_name,
                                                                     volume,
                                                                     record_path,
                                                                     worker_running
                                                                         .clone(),
+                                                                    Some(reconnect_stream_id),
+                                                                    Some(worker_status.clone()),
+                                                                    Some(jitter_target),
+                                                                    cipher,
                                                                 );
 
                                                         match result {
-                                                            Ok(()) => {
-                                                                set_shared_status(
-                                                                    &worker_status,
-                                                                    "Stopped.",
-                                                                );
-                                                            }
+                                                            Ok(()) => {}
                                                             Err(error) => {
                                                                 let friendly =
                                                                     friendly_error(&error);
@@ -3981,10 +4490,936 @@ impl OpenAudioApp {
                 selected_output: None,
                 volume: audio_core::new_volume_control(1.0),
                 record: false,
+                encrypted: false,
+                passphrase: String::new(),
                 running: Arc::new(AtomicBool::new(false)),
                 status: Arc::new(Mutex::new("Not started.".to_string())),
                 last_toggle: Instant::now() - Duration::from_secs(1),
+                jitter_target_ms: Arc::new(AtomicU32::new(20)),
             });
+        }
+    }
+}
+
+// ============================================================================
+// SUBSCRIBE SESSION LIFECYCLE & PATCHBAY MATRIX
+// ============================================================================
+
+impl OpenAudioApp {
+    fn stop_subscribe_session(&mut self, session_index: usize) {
+        if let Some(session) = self.subscribe_sessions.get_mut(session_index) {
+            session.last_toggle = Instant::now();
+            session.running.store(false, Ordering::Release);
+            set_shared_status(&session.status, "Stopping...");
+        }
+    }
+
+    fn start_subscribe_session(&mut self, session_index: usize) {
+        let discovered_nodes = match self.discovery_directory.lock() {
+            Ok(directory) => directory.clone(),
+            Err(poisoned) => poisoned.into_inner().clone(),
+        };
+        let error_banner = self.error_banner.clone();
+
+        if let Some(session) = self.subscribe_sessions.get_mut(session_index) {
+            session.last_toggle = Instant::now();
+            set_shared_optional_message(&error_banner, None);
+
+            let selected_id = session.selected_discovered_node_id.clone();
+            let node = selected_id
+                .as_ref()
+                .and_then(|node_id| discovered_nodes.get(node_id))
+                .cloned();
+
+            let port = session.bind_port.parse::<u16>();
+
+            match (node, port) {
+                (Some(node), Ok(port)) if port != 0 => {
+                    let subscribe_result = audio_core::send_subscribe_request(
+                        &node.ip,
+                        node.control_port,
+                        node.stream_id,
+                        port,
+                    );
+
+                    match subscribe_result {
+                        Ok(()) => {
+                            let bind_addr = format!("0.0.0.0:{port}");
+                            let device_name = session.selected_output.clone();
+                            let volume = session.volume.clone();
+                            let record_path = if session.record {
+                                Some(audio_core::generate_record_path(&format!("subscribe_{port}")))
+                            } else {
+                                None
+                            };
+                            let running = session.running.clone();
+                            let worker_running = running.clone();
+                            let status = session.status.clone();
+                            let worker_status = status.clone();
+                            let worker_banner = error_banner.clone();
+                            let stream_name = node.stream_name.clone();
+                            let node_name = node.node_name.clone();
+
+                            running.store(true, Ordering::Release);
+
+                            let reconnect_running = running.clone();
+                            let reconnect_ip = node.ip.clone();
+                            let reconnect_control_port = node.control_port;
+                            let reconnect_stream_id = node.stream_id;
+                            thread::spawn(move || {
+                                while reconnect_running.load(Ordering::Acquire) {
+                                    let _ = audio_core::send_subscribe_request(
+                                        &reconnect_ip,
+                                        reconnect_control_port,
+                                        reconnect_stream_id,
+                                        port,
+                                    );
+                                    for _ in 0..10 {
+                                        if !reconnect_running.load(Ordering::Acquire) {
+                                            return;
+                                        }
+                                        thread::sleep(Duration::from_millis(100));
+                                    }
+                                }
+                            });
+
+                            set_shared_status(
+                                &status,
+                                format!("Receiving '{stream_name}' from '{node_name}'..."),
+                            );
+
+                            let cipher = if session.encrypted && !session.passphrase.trim().is_empty() {
+                                Some(Arc::new(audio_core::StreamCipher::from_passphrase(&session.passphrase)))
+                            } else {
+                                None
+                            };
+
+                            let jitter_target = session.jitter_target_ms.clone();
+
+                            let spawn_result = thread::Builder::new()
+                                .name(format!("wasapi-subscribe-{port}"))
+                                .spawn(move || {
+                                    let result = audio_core::receive_and_play_bus_filtered_with_status_jitter_and_cipher(
+                                        &bind_addr,
+                                        device_name,
+                                        volume,
+                                        record_path,
+                                        worker_running.clone(),
+                                        Some(reconnect_stream_id),
+                                        Some(worker_status.clone()),
+                                        Some(jitter_target),
+                                        cipher,
+                                    );
+
+                                    match result {
+                                        Ok(()) => {}
+                                        Err(error) => {
+                                            let friendly = friendly_error(&error);
+                                            set_shared_status(&worker_status, format!("Error: {friendly}"));
+                                            set_shared_optional_message(&worker_banner, Some(friendly));
+                                        }
+                                    }
+
+                                    worker_running.store(false, Ordering::Release);
+                                });
+
+                            if let Err(error) = spawn_result {
+                                running.store(false, Ordering::Release);
+                                let message = format!("Could not start playback thread: {error}");
+                                set_shared_status(&status, &message);
+                                set_shared_optional_message(&error_banner, Some(message));
+                            }
+                        }
+                        Err(error) => {
+                            set_shared_optional_message(&error_banner, Some(friendly_error(&error)));
+                        }
+                    }
+                }
+                _ => {
+                    set_shared_optional_message(
+                        &error_banner,
+                        Some("Select a discovered stream and enter a valid UDP port.".to_string()),
+                    );
+                }
+            }
+        }
+    }
+
+    fn start_publish_session(&mut self, index: usize) {
+        let error_banner = self.error_banner.clone();
+        let subscribers = self.subscribers_by_stream.clone();
+        if let Some(session) = self.publish_sessions.get_mut(index) {
+            session.last_toggle = Instant::now();
+            set_shared_optional_message(&error_banner, None);
+
+            let node_name = session.node_name.clone();
+            let stream_name = session.stream_name.clone();
+            let stream_id = session.stream_id;
+            let device_name = session.selected_input.clone();
+            let is_loopback = session.is_loopback;
+            let channel_labels = session.channel_labels.clone();
+            let cipher = if session.encrypted && !session.passphrase.is_empty() {
+                Some(Arc::new(audio_core::StreamCipher::from_passphrase(&session.passphrase)))
+            } else {
+                None
+            };
+            let record_path = if session.record {
+                Some(audio_core::generate_record_path(&format!("publish_{stream_id}")))
+            } else {
+                None
+            };
+            let running = session.running.clone();
+            let worker_running = running.clone();
+            let status = session.status.clone();
+            let worker_status = status.clone();
+            let worker_error_banner = error_banner.clone();
+
+            running.store(true, Ordering::Release);
+            set_shared_status(
+                &status,
+                if is_loopback { "Starting loopback capture..." } else { "Starting input capture..." },
+            );
+
+            let spawn_result = thread::Builder::new()
+                .name(format!("wasapi-publish-{stream_id}"))
+                .spawn(move || {
+                    let result = if is_loopback {
+                        audio_core::transmit_loopback_with_discovery_labeled_encrypted(
+                            node_name,
+                            stream_name,
+                            stream_id,
+                            device_name,
+                            subscribers,
+                            record_path,
+                            Some(channel_labels),
+                            worker_running.clone(),
+                            cipher,
+                        )
+                    } else {
+                        audio_core::transmit_with_discovery_labeled_encrypted(
+                            node_name,
+                            stream_name,
+                            stream_id,
+                            device_name,
+                            subscribers,
+                            record_path,
+                            Some(channel_labels),
+                            worker_running.clone(),
+                            cipher,
+                        )
+                    };
+                    match result {
+                        Ok(()) => set_shared_status(&worker_status, "Stopped."),
+                        Err(error) => {
+                            let friendly = friendly_error(&error);
+                            set_shared_status(&worker_status, format!("Error: {friendly}"));
+                            set_shared_optional_message(&worker_error_banner, Some(friendly));
+                        }
+                    }
+                    worker_running.store(false, Ordering::Release);
+                });
+
+            if let Err(error) = spawn_result {
+                running.store(false, Ordering::Release);
+                let message = format!("Could not start the publisher thread: {error}");
+                set_shared_status(&session.status, &message);
+                set_shared_optional_message(&error_banner, Some(message));
+            }
+        }
+    }
+
+    fn start_combine_publish_session(&mut self, index: usize) {
+        let error_banner = self.error_banner.clone();
+        let subscribers = self.subscribers_by_stream.clone();
+        if let Some(session) = self.combine_publish_sessions.get_mut(index) {
+            session.last_toggle = Instant::now();
+            set_shared_optional_message(&error_banner, None);
+
+            let node_name = session.node_name.clone();
+            let stream_name = session.stream_name.clone();
+            let stream_id = session.stream_id;
+            let sources = session
+                .channel_sources
+                .iter()
+                .map(|(device_name, is_loopback)| audio_core::ChannelSource {
+                    device_name: device_name.clone(),
+                    is_loopback: *is_loopback,
+                })
+                .collect::<Vec<_>>();
+            let record_each = session.record;
+            let channel_labels = session.channel_labels.clone();
+            let running = session.running.clone();
+            let worker_running = running.clone();
+            let status = session.status.clone();
+            let worker_status = status.clone();
+            let worker_error_banner = error_banner.clone();
+
+            running.store(true, Ordering::Release);
+            set_shared_status(&status, "Starting combined capture...");
+
+            let cipher = if session.encrypted && !session.passphrase.is_empty() {
+                Some(Arc::new(audio_core::StreamCipher::from_passphrase(&session.passphrase)))
+            } else {
+                None
+            };
+
+            let spawn_result = thread::Builder::new()
+                .name(format!("combined-publish-{stream_id}"))
+                .spawn(move || {
+                    let result = audio_core::capture_and_combine_with_labels_encrypted(
+                        node_name,
+                        stream_name,
+                        stream_id,
+                        sources,
+                        subscribers,
+                        record_each,
+                        Some(channel_labels),
+                        cipher,
+                        worker_running.clone(),
+                    );
+                    match result {
+                        Ok(()) => set_shared_status(&worker_status, "Stopped."),
+                        Err(error) => {
+                            let friendly = friendly_error(&error);
+                            set_shared_status(&worker_status, format!("Error: {friendly}"));
+                            set_shared_optional_message(&worker_error_banner, Some(friendly));
+                        }
+                    }
+                    worker_running.store(false, Ordering::Release);
+                });
+
+            if let Err(error) = spawn_result {
+                running.store(false, Ordering::Release);
+                let message = format!("Could not start the combined publisher thread: {error}");
+                set_shared_status(&session.status, &message);
+                set_shared_optional_message(&error_banner, Some(message));
+            }
+        }
+    }
+
+    fn start_asio_publish_session(&mut self, index: usize) {
+        let error_banner = self.error_banner.clone();
+        let subscribers = self.subscribers_by_stream.clone();
+        if let Some(session) = self.asio_publish_sessions.get_mut(index) {
+            session.last_toggle = Instant::now();
+            set_shared_optional_message(&error_banner, None);
+
+            let node_name = session.node_name.clone();
+            let stream_name = session.stream_name.clone();
+            let stream_id = session.stream_id;
+            let driver_name = match session.selected_driver.clone() {
+                Some(name) => name,
+                None => return,
+            };
+            let channel_indices = session.channel_indices.clone();
+            let channel_labels = session.channel_labels.clone();
+            let running = session.running.clone();
+            let worker_running = running.clone();
+            let status = session.status.clone();
+            let worker_status = status.clone();
+            let worker_error_banner = error_banner.clone();
+
+            if let Err(error) = reserve_asio_device(&driver_name) {
+                set_shared_optional_message(&worker_error_banner, Some(error));
+                set_shared_status(&status, "ASIO driver busy.");
+                return;
+            }
+
+            running.store(true, Ordering::Release);
+            set_shared_status(&status, format!("Publishing via '{driver_name}'..."));
+
+            let worker_driver_name = driver_name.clone();
+            let spawn_result = thread::Builder::new()
+                .name(format!("asio-publish-{stream_id}"))
+                .spawn(move || {
+                    let result = audio_core::capture_asio_with_channel_labels(
+                        node_name,
+                        stream_name,
+                        stream_id,
+                        worker_driver_name.clone(),
+                        channel_indices,
+                        channel_labels,
+                        subscribers,
+                        worker_running.clone(),
+                    );
+                    match result {
+                        Ok(()) => set_shared_status(&worker_status, "Stopped."),
+                        Err(error) => {
+                            let friendly = friendly_error(&error);
+                            set_shared_status(&worker_status, format!("Error: {friendly}"));
+                            set_shared_optional_message(&worker_error_banner, Some(friendly));
+                        }
+                    }
+                    release_asio_device(&worker_driver_name);
+                    worker_running.store(false, Ordering::Release);
+                });
+
+            if let Err(error) = spawn_result {
+                release_asio_device(&driver_name);
+                running.store(false, Ordering::Release);
+                let message = format!("Could not start ASIO publish thread: {error}");
+                set_shared_status(&session.status, &message);
+                set_shared_optional_message(&error_banner, Some(message));
+            }
+        }
+    }
+
+    fn start_split_subscribe_session(&mut self, index: usize) {
+        let error_banner = self.error_banner.clone();
+        let discovered_nodes = match self.discovery_directory.lock() {
+            Ok(directory) => directory.clone(),
+            Err(poisoned) => poisoned.into_inner().clone(),
+        };
+
+        if let Some(session) = self.split_subscribe_sessions.get_mut(index) {
+            session.last_toggle = Instant::now();
+            set_shared_optional_message(&error_banner, None);
+
+            let node = session
+                .selected_discovered_node_id
+                .as_ref()
+                .and_then(|node_id| discovered_nodes.get(node_id))
+                .cloned();
+
+            let port = session.bind_port.parse::<u16>();
+
+            match (node, port) {
+                (Some(node), Ok(port)) if port != 0 => {
+                    let _ = audio_core::send_subscribe_request(
+                        &node.ip,
+                        node.control_port,
+                        node.stream_id,
+                        port,
+                    );
+                    let bind_addr = format!("0.0.0.0:{port}");
+                    let device_targets = session.channel_devices.clone();
+                    let target_count = device_targets.len();
+                    let record_each = session.record;
+                    let running = session.running.clone();
+                    let worker_running = running.clone();
+                    let status = session.status.clone();
+                    let worker_status = status.clone();
+                    let worker_banner = error_banner.clone();
+
+                    running.store(true, Ordering::Release);
+
+                    let reconnect_running = running.clone();
+                    let reconnect_ip = node.ip.clone();
+                    let reconnect_control_port = node.control_port;
+                    let reconnect_stream_id = node.stream_id;
+                    thread::spawn(move || {
+                        while reconnect_running.load(Ordering::Acquire) {
+                            let _ = audio_core::send_subscribe_request(
+                                &reconnect_ip,
+                                reconnect_control_port,
+                                reconnect_stream_id,
+                                port,
+                            );
+                            for _ in 0..10 {
+                                if !reconnect_running.load(Ordering::Acquire) {
+                                    return;
+                                }
+                                thread::sleep(Duration::from_millis(100));
+                            }
+                        }
+                    });
+
+                    set_shared_status(
+                        &status,
+                        format!(
+                            "Receiving '{}' and routing {} channel(s)...",
+                            node.stream_name, target_count
+                        ),
+                    );
+
+                    let cipher = if session.encrypted && !session.passphrase.trim().is_empty() {
+                        Some(Arc::new(audio_core::StreamCipher::from_passphrase(&session.passphrase)))
+                    } else {
+                        None
+                    };
+
+                    let spawn_result = thread::Builder::new()
+                        .name(format!("split-subscribe-{port}"))
+                        .spawn(move || {
+                            let result = audio_core::receive_and_split_to_devices_with_cipher(
+                                &bind_addr,
+                                device_targets,
+                                record_each,
+                                cipher,
+                                worker_running.clone(),
+                            );
+
+                            match result {
+                                Ok(()) => {
+                                    set_shared_status(&worker_status, "Stopped.");
+                                }
+                                Err(error) => {
+                                    let friendly = friendly_error(&error);
+                                    set_shared_status(&worker_status, format!("Error: {friendly}"));
+                                    set_shared_optional_message(&worker_banner, Some(friendly));
+                                }
+                            }
+
+                            worker_running.store(false, Ordering::Release);
+                        });
+
+                    if let Err(error) = spawn_result {
+                        running.store(false, Ordering::Release);
+                        let message = format!("Could not start the split subscription thread: {error}");
+                        set_shared_status(&session.status, &message);
+                        set_shared_optional_message(&error_banner, Some(message));
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    fn start_all_sessions(&mut self) {
+        for idx in 0..self.publish_sessions.len() {
+            if !self.publish_sessions[idx].running.load(Ordering::Acquire) {
+                self.start_publish_session(idx);
+            }
+        }
+        for idx in 0..self.combine_publish_sessions.len() {
+            if !self.combine_publish_sessions[idx].running.load(Ordering::Acquire) {
+                self.start_combine_publish_session(idx);
+            }
+        }
+        for idx in 0..self.asio_publish_sessions.len() {
+            if !self.asio_publish_sessions[idx].running.load(Ordering::Acquire) {
+                self.start_asio_publish_session(idx);
+            }
+        }
+        for idx in 0..self.subscribe_sessions.len() {
+            if !self.subscribe_sessions[idx].running.load(Ordering::Acquire) {
+                self.start_subscribe_session(idx);
+            }
+        }
+        for idx in 0..self.split_subscribe_sessions.len() {
+            if !self.split_subscribe_sessions[idx].running.load(Ordering::Acquire) {
+                self.start_split_subscribe_session(idx);
+            }
+        }
+    }
+
+    #[allow(dead_code)]
+    fn stop_all_sessions(&mut self) {
+        for session in &self.publish_sessions {
+            session.running.store(false, Ordering::Release);
+        }
+        for session in &self.combine_publish_sessions {
+            session.running.store(false, Ordering::Release);
+        }
+        for session in &self.asio_publish_sessions {
+            session.running.store(false, Ordering::Release);
+        }
+        for session in &self.subscribe_sessions {
+            session.running.store(false, Ordering::Release);
+        }
+        for session in &self.split_subscribe_sessions {
+            session.running.store(false, Ordering::Release);
+        }
+    }
+
+    fn render_patchbay_page(&mut self, ui: &mut egui::Ui) {
+        let discovered_nodes = match self.discovery_directory.lock() {
+            Ok(directory) => directory.clone(),
+            Err(poisoned) => poisoned.into_inner().clone(),
+        };
+
+        let pings = match self.node_pings.lock() {
+            Ok(pings) => pings.clone(),
+            Err(poisoned) => poisoned.into_inner().clone(),
+        };
+
+        let mut discovered_entries = discovered_nodes
+            .iter()
+            .map(|(node_id, node)| (node_id.clone(), node.clone()))
+            .collect::<Vec<_>>();
+
+        discovered_entries.sort_by(|left, right| {
+            left.1
+                .node_name
+                .to_lowercase()
+                .cmp(&right.1.node_name.to_lowercase())
+                .then_with(|| {
+                    left.1
+                        .stream_name
+                        .to_lowercase()
+                        .cmp(&right.1.stream_name.to_lowercase())
+                })
+        });
+
+        struct DestinationOption {
+            id: String,
+            label: String,
+            device_opt: Option<String>,
+        }
+
+        let mut destinations: Vec<DestinationOption> = Vec::new();
+        destinations.push(DestinationOption {
+            id: "__system_default__".to_string(),
+            label: "System Default".to_string(),
+            device_opt: None,
+        });
+        for dev in &self.output_devices {
+            destinations.push(DestinationOption {
+                id: dev.name.clone(),
+                label: dev.name.clone(),
+                device_opt: Some(dev.name.clone()),
+            });
+        }
+
+        // Sync PatchbayMatrix
+        self.patchbay_matrix.publishers.clear();
+        for (id, node) in &discovered_entries {
+            self.patchbay_matrix.add_publisher(
+                id,
+                format!("{} - {}", node.node_name, node.stream_name),
+                node.channel_count as usize,
+                &node.ip,
+            );
+        }
+
+        self.patchbay_matrix.receivers.clear();
+        for dest in &destinations {
+            self.patchbay_matrix.add_receiver(&dest.id, &dest.label, 2, "local");
+        }
+
+        self.patchbay_matrix.clear_patches();
+        for session in &self.subscribe_sessions {
+            if session.running.load(Ordering::Acquire) {
+                if let Some(ref pub_id) = session.selected_discovered_node_id {
+                    let dest_id = match &session.selected_output {
+                        None => "__system_default__".to_string(),
+                        Some(d) => d.clone(),
+                    };
+                    self.patchbay_matrix.set_patched(pub_id, &dest_id, true);
+                }
+            }
+        }
+
+        let mut toggle_patch_action: Option<(String, String, Option<String>)> = None;
+        let mut clear_all_action = false;
+        let mut quick_patch_action = false;
+
+        section_frame().show(ui, |ui| {
+            ui.horizontal(|ui| {
+                ui.label(
+                    egui::RichText::new("Visual Audio Patchbay Matrix")
+                        .size(18.0)
+                        .strong()
+                        .color(Theme::TEXT_PRIMARY),
+                );
+
+                ui.label(
+                    egui::RichText::new("Interactive 2D Crossbar Routing Grid")
+                        .size(11.0)
+                        .color(Theme::TEXT_SECONDARY),
+                );
+            });
+
+            ui.add_space(4.0);
+
+            ui.label(
+                egui::RichText::new(
+                    "Click any crosspoint to route or disconnect network audio streams directly to your local audio playback devices.",
+                )
+                .size(11.0)
+                .color(Theme::TEXT_SECONDARY),
+            );
+
+            ui.add_space(10.0);
+
+            // Summary bar & actions
+            card_frame().show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    let active_count = self.patchbay_matrix.active_patches.len();
+
+                    ui.label(
+                        egui::RichText::new(format!("Sources: {}", discovered_entries.len()))
+                            .strong()
+                            .color(Theme::ACCENT_BLUE),
+                    );
+                    ui.label(egui::RichText::new("•").color(Theme::TEXT_SECONDARY));
+
+                    ui.label(
+                        egui::RichText::new(format!("Destinations: {}", destinations.len()))
+                            .strong()
+                            .color(Theme::TEXT_PRIMARY),
+                    );
+                    ui.label(egui::RichText::new("•").color(Theme::TEXT_SECONDARY));
+
+                    let active_color = if active_count > 0 {
+                        Theme::ACCENT_GREEN
+                    } else {
+                        Theme::TEXT_SECONDARY
+                    };
+                    ui.label(
+                        egui::RichText::new(format!("Active Routes: {active_count}"))
+                            .strong()
+                            .color(active_color),
+                    );
+
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if ui
+                            .add_enabled(
+                                active_count > 0,
+                                egui::Button::new(
+                                    egui::RichText::new("✕ Disconnect All")
+                                        .color(egui::Color32::WHITE)
+                                        .size(11.0),
+                                )
+                                .fill(Theme::ACCENT_RED)
+                                .rounding(6.0),
+                            )
+                            .clicked()
+                        {
+                            clear_all_action = true;
+                        }
+
+                        if ui
+                            .add_enabled(
+                                !discovered_entries.is_empty(),
+                                egui::Button::new(
+                                    egui::RichText::new("⚡ Quick Patch Default")
+                                        .color(egui::Color32::WHITE)
+                                        .size(11.0),
+                                )
+                                .fill(Theme::ACCENT_BLUE)
+                                .rounding(6.0),
+                            )
+                            .clicked()
+                        {
+                            quick_patch_action = true;
+                        }
+                    });
+                });
+            });
+
+            ui.add_space(12.0);
+
+            if discovered_entries.is_empty() {
+                egui::Frame::none()
+                    .fill(Theme::BG_SECONDARY)
+                    .rounding(8.0)
+                    .inner_margin(16.0)
+                    .show(ui, |ui| {
+                        ui.vertical_centered(|ui| {
+                            ui.label(
+                                egui::RichText::new("No Network Audio Sources Discovered")
+                                    .size(14.0)
+                                    .strong()
+                                    .color(Theme::TEXT_PRIMARY),
+                            );
+                            ui.add_space(4.0);
+                            ui.label(
+                                egui::RichText::new(
+                                    "Start a publisher stream or DAW plugin (VST3) on any machine on your network to begin routing audio.",
+                                )
+                                .color(Theme::TEXT_SECONDARY),
+                            );
+                        });
+                    });
+            } else {
+                egui::ScrollArea::both()
+                    .id_source("patchbay_matrix_scroll_area")
+                    .show(ui, |ui| {
+                        egui::Grid::new("patchbay_crosspoint_grid")
+                            .striped(true)
+                            .spacing([12.0, 10.0])
+                            .show(ui, |ui| {
+                                // Header row
+                                ui.label(
+                                    egui::RichText::new("Network Sources ↓ \\ Output Devices →")
+                                        .strong()
+                                        .size(11.0)
+                                        .color(Theme::TEXT_SECONDARY),
+                                );
+
+                                for dest in &destinations {
+                                    let label_text = if dest.label.len() > 22 {
+                                        format!("🔊 {}...", &dest.label[..20])
+                                    } else {
+                                        format!("🔊 {}", dest.label)
+                                    };
+
+                                    ui.label(
+                                        egui::RichText::new(label_text)
+                                            .strong()
+                                            .size(11.0)
+                                            .color(Theme::TEXT_PRIMARY),
+                                    )
+                                    .on_hover_text(&dest.label);
+                                }
+                                ui.end_row();
+
+                                // Data rows
+                                for (node_id, node) in &discovered_entries {
+                                    // Row header (Source)
+                                    ui.vertical(|ui| {
+                                        let source_title = format!("{} — \"{}\"", node.node_name, node.stream_name);
+                                        ui.label(
+                                            egui::RichText::new(source_title)
+                                                .strong()
+                                                .size(12.0)
+                                                .color(Theme::TEXT_PRIMARY),
+                                        );
+                                        ui.horizontal(|ui| {
+                                            ui.label(
+                                                egui::RichText::new(format!(
+                                                    "{} ch • {}:{}",
+                                                    node.channel_count, node.ip, node.control_port
+                                                ))
+                                                .size(10.0)
+                                                .color(Theme::TEXT_SECONDARY),
+                                            );
+                                            if node.encrypted {
+                                                ui.label(
+                                                    egui::RichText::new("🔒 Encrypted")
+                                                        .size(9.0)
+                                                        .color(Theme::ACCENT_BLUE)
+                                                        .strong(),
+                                                );
+                                            }
+                                            if let Some(ping) = pings.get(node_id) {
+                                                render_rtt_badge(ui, ping);
+                                            }
+                                        });
+                                    });
+
+                                    // Matrix crosspoints
+                                    for dest in &destinations {
+                                        let is_patched = self.patchbay_matrix.is_patched(node_id, &dest.id);
+
+                                        let button = if is_patched {
+                                            egui::Button::new(
+                                                egui::RichText::new("● ACTIVE")
+                                                    .color(egui::Color32::WHITE)
+                                                    .strong()
+                                                    .size(11.0),
+                                            )
+                                            .fill(Theme::ACCENT_GREEN)
+                                            .rounding(6.0)
+                                            .min_size(egui::vec2(85.0, 30.0))
+                                        } else {
+                                            egui::Button::new(
+                                                egui::RichText::new("┼ Connect")
+                                                    .color(Theme::TEXT_SECONDARY)
+                                                    .size(11.0),
+                                            )
+                                            .fill(Theme::BG_CARD)
+                                            .rounding(6.0)
+                                            .min_size(egui::vec2(85.0, 30.0))
+                                        };
+
+                                        let hover_msg = if is_patched {
+                                            format!("Route active: click to disconnect '{}' from '{}'", node.stream_name, dest.label)
+                                        } else {
+                                            format!("Click to route '{}' to '{}'", node.stream_name, dest.label)
+                                        };
+
+                                        if ui.add(button).on_hover_text(hover_msg).clicked() {
+                                            toggle_patch_action = Some((node_id.clone(), dest.id.clone(), dest.device_opt.clone()));
+                                        }
+                                    }
+                                    ui.end_row();
+                                }
+                            });
+                    });
+            }
+
+            ui.add_space(14.0);
+
+            ui.label(
+                egui::RichText::new(
+                    "💡 Pro tip: For fine-grained per-stream volume sliders, dynamic jitter buffer presets (LAN/Wi-Fi/Safe), or WAV recording, navigate to the Subscribe tab.",
+                )
+                .size(11.0)
+                .italics()
+                .color(Theme::TEXT_SECONDARY),
+            );
+        });
+
+        // Execute actions outside UI borrow
+        if clear_all_action {
+            for idx in 0..self.subscribe_sessions.len() {
+                if self.subscribe_sessions[idx].running.load(Ordering::Acquire) {
+                    self.stop_subscribe_session(idx);
+                }
+            }
+            self.patchbay_matrix.clear_patches();
+        } else if quick_patch_action {
+            if let Some((first_pub_id, _)) = discovered_entries.first() {
+                // Find or create session for (first_pub_id, None)
+                let existing_idx = self.subscribe_sessions.iter().position(|s| {
+                    s.selected_discovered_node_id.as_deref() == Some(first_pub_id.as_str()) && s.selected_output.is_none()
+                });
+
+                if let Some(idx) = existing_idx {
+                    if !self.subscribe_sessions[idx].running.load(Ordering::Acquire) {
+                        self.start_subscribe_session(idx);
+                    }
+                } else {
+                    let id = self.take_next_id();
+                    let port = 6980u64.saturating_add(id).min(u16::MAX as u64);
+                    let is_enc = discovered_nodes.get(first_pub_id).map(|n| n.encrypted).unwrap_or(false);
+                    self.subscribe_sessions.push(SubscribeSession {
+                        id,
+                        selected_discovered_node_id: Some(first_pub_id.clone()),
+                        bind_port: port.to_string(),
+                        selected_output: None,
+                        volume: audio_core::new_volume_control(1.0),
+                        record: false,
+                        encrypted: is_enc,
+                        passphrase: String::new(),
+                        running: Arc::new(AtomicBool::new(false)),
+                        status: Arc::new(Mutex::new("Starting...".to_string())),
+                        last_toggle: Instant::now() - Duration::from_secs(1),
+                        jitter_target_ms: Arc::new(AtomicU32::new(20)),
+                    });
+                    let new_idx = self.subscribe_sessions.len() - 1;
+                    self.start_subscribe_session(new_idx);
+                }
+            }
+        } else if let Some((target_pub_id, target_dest_id, target_device_opt)) = toggle_patch_action {
+            // Find existing session
+            let existing_idx = self.subscribe_sessions.iter().position(|s| {
+                s.selected_discovered_node_id.as_deref() == Some(target_pub_id.as_str()) && s.selected_output == target_device_opt
+            });
+
+            if let Some(idx) = existing_idx {
+                let is_running = self.subscribe_sessions[idx].running.load(Ordering::Acquire);
+                if is_running {
+                    self.stop_subscribe_session(idx);
+                    self.patchbay_matrix.set_patched(&target_pub_id, &target_dest_id, false);
+                } else {
+                    self.start_subscribe_session(idx);
+                    self.patchbay_matrix.set_patched(&target_pub_id, &target_dest_id, true);
+                }
+            } else {
+                let id = self.take_next_id();
+                let port = 6980u64.saturating_add(id).min(u16::MAX as u64);
+                let is_enc = discovered_nodes.get(&target_pub_id).map(|n| n.encrypted).unwrap_or(false);
+                self.subscribe_sessions.push(SubscribeSession {
+                    id,
+                    selected_discovered_node_id: Some(target_pub_id.clone()),
+                    bind_port: port.to_string(),
+                    selected_output: target_device_opt,
+                    volume: audio_core::new_volume_control(1.0),
+                    record: false,
+                    encrypted: is_enc,
+                    passphrase: String::new(),
+                    running: Arc::new(AtomicBool::new(false)),
+                    status: Arc::new(Mutex::new("Starting...".to_string())),
+                    last_toggle: Instant::now() - Duration::from_secs(1),
+                    jitter_target_ms: Arc::new(AtomicU32::new(20)),
+                });
+                let new_idx = self.subscribe_sessions.len() - 1;
+                self.start_subscribe_session(new_idx);
+                self.patchbay_matrix.set_patched(&target_pub_id, &target_dest_id, true);
+            }
         }
     }
 }
@@ -4001,6 +5436,11 @@ impl OpenAudioApp {
 
         let discovered_nodes = match self.discovery_directory.lock() {
             Ok(directory) => directory.clone(),
+            Err(poisoned) => poisoned.into_inner().clone(),
+        };
+
+        let pings = match self.node_pings.lock() {
+            Ok(pings) => pings.clone(),
             Err(poisoned) => poisoned.into_inner().clone(),
         };
 
@@ -4106,6 +5546,20 @@ impl OpenAudioApp {
                                 egui::RichText::new("Record each channel to WAV")
                                     .color(Theme::TEXT_PRIMARY),
                             );
+
+                            ui.checkbox(
+                                &mut session.encrypted,
+                                egui::RichText::new("🔒 Stream is Encrypted (AES-256-GCM)").color(Theme::TEXT_PRIMARY),
+                            );
+                            if session.encrypted {
+                                ui.label(egui::RichText::new("Passphrase:").color(Theme::TEXT_SECONDARY));
+                                ui.add(
+                                    egui::TextEdit::singleline(&mut session.passphrase)
+                                        .password(true)
+                                        .hint_text("Enter decryption passphrase")
+                                        .desired_width(180.0),
+                                );
+                            }
                         });
 
                         ui.add_space(10.0);
@@ -4135,12 +5589,29 @@ impl OpenAudioApp {
                                     node.node_name, node.stream_name, node.channel_count, node.ip,
                                 );
 
-                                if ui.selectable_label(selected, label).clicked() {
-                                    session.selected_discovered_node_id = Some(node_id.clone());
+                                ui.horizontal(|ui| {
+                                    let response = ui.selectable_label(selected, label);
+                                    if node.encrypted {
+                                        ui.label(
+                                            egui::RichText::new("🔒 Encrypted")
+                                                .size(9.0)
+                                                .color(Theme::ACCENT_BLUE)
+                                                .strong(),
+                                        );
+                                    }
+                                    if let Some(ping) = pings.get(node_id) {
+                                        render_rtt_badge(ui, ping);
+                                    }
+                                    if response.clicked() {
+                                        session.selected_discovered_node_id = Some(node_id.clone());
+                                        if node.encrypted {
+                                            session.encrypted = true;
+                                        }
 
-                                    session.channel_devices =
-                                        vec![None; node.channel_count as usize];
-                                }
+                                        session.channel_devices =
+                                            vec![None; node.channel_count as usize];
+                                    }
+                                });
                             }
                         }
 
@@ -4415,15 +5886,22 @@ impl OpenAudioApp {
                                                     ),
                                                 );
 
+                                                let cipher = if session.encrypted && !session.passphrase.trim().is_empty() {
+                                                    Some(Arc::new(audio_core::StreamCipher::from_passphrase(&session.passphrase)))
+                                                } else {
+                                                    None
+                                                };
+
                                                 let spawn_result = thread::Builder::new()
                                                     .name(format!("split-subscribe-{port}"))
                                                     .spawn(move || {
                                                         let result =
                                                                 audio_core::
-                                                                receive_and_split_to_devices(
+                                                                receive_and_split_to_devices_with_cipher(
                                                                     &bind_addr,
                                                                     device_targets,
                                                                     record_each,
+                                                                    cipher,
                                                                     worker_running
                                                                         .clone(),
                                                                 );
@@ -4614,6 +6092,8 @@ impl OpenAudioApp {
                 bind_port: port.to_string(),
                 channel_devices: Vec::new(),
                 record: false,
+                encrypted: false,
+                passphrase: String::new(),
                 running: Arc::new(AtomicBool::new(false)),
                 status: Arc::new(Mutex::new("Not started.".to_string())),
                 last_toggle: Instant::now() - Duration::from_secs(1),
@@ -5280,11 +6760,155 @@ fn load_icon() -> egui::IconData {
 }
 
 // ============================================================================
-// MAIN
+// CLI & HEADLESS SERVICE MODE
 // ============================================================================
 
-fn main() -> eframe::Result<()> {
+struct CliArgs {
+    headless: bool,
+    preset: Option<String>,
+    auto_start: bool,
+    interface: Option<String>,
+    help: bool,
+    version: bool,
+}
+
+fn parse_cli_args() -> CliArgs {
+    let mut args = std::env::args().skip(1);
+    let mut cli = CliArgs {
+        headless: false,
+        preset: None,
+        auto_start: false,
+        interface: None,
+        help: false,
+        version: false,
+    };
+
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "--headless" => cli.headless = true,
+            "--auto-start" => cli.auto_start = true,
+            "-p" | "--preset" => {
+                if let Some(path) = args.next() {
+                    cli.preset = Some(path);
+                }
+            }
+            "-i" | "--interface" => {
+                if let Some(iface) = args.next() {
+                    cli.interface = Some(iface);
+                }
+            }
+            "-h" | "--help" => cli.help = true,
+            "-V" | "--version" => cli.version = true,
+            _ => {}
+        }
+    }
+
+    cli
+}
+
+fn run_headless(
+    preset_path: Option<&str>,
+    auto_start: bool,
+    interface: Option<String>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    println!("==========================================================");
+    println!(" OpenAudio Headless Service v{}", env!("CARGO_PKG_VERSION"));
+    println!(" (Ultra-low latency audio routing background service)");
+    println!("==========================================================");
+
+    let mut app = OpenAudioApp::default();
+
+    if let Some(path) = preset_path {
+        println!("[INFO] Loading preset from: {path}");
+        let json = std::fs::read_to_string(path)?;
+        let preset: preset::PresetFile = serde_json::from_str(&json)?;
+        app.apply_preset(preset)?;
+        println!("[OK] Preset successfully applied.");
+    }
+
+    if let Some(iface) = interface {
+        println!("[INFO] Selecting network interface: {iface}");
+        app.set_selected_interface(Some(iface));
+    }
+
+    if auto_start || preset_path.is_some() {
+        println!("[INFO] Starting all configured audio sessions...");
+        app.start_all_sessions();
+    }
+
+    let running = Arc::new(AtomicBool::new(true));
+    let r = running.clone();
+
+    if let Err(e) = ctrlc::set_handler(move || {
+        println!("\n[INFO] Shutdown signal received. Stopping OpenAudio headless service...");
+        r.store(false, Ordering::SeqCst);
+    }) {
+        eprintln!("[WARN] Could not set Ctrl+C handler: {e}");
+    }
+
+    println!("[INFO] OpenAudio is running. Press Ctrl+C to terminate.\n");
+
+    let mut last_report = Instant::now();
+    while running.load(Ordering::Relaxed) {
+        thread::sleep(Duration::from_millis(250));
+
+        if last_report.elapsed() >= Duration::from_secs(10) {
+            last_report = Instant::now();
+            let pub_active = app.publish_sessions.iter().filter(|s| s.running.load(Ordering::Relaxed)).count();
+            let comb_active = app.combine_publish_sessions.iter().filter(|s| s.running.load(Ordering::Relaxed)).count();
+            let asio_active = app.asio_publish_sessions.iter().filter(|s| s.running.load(Ordering::Relaxed)).count();
+            let sub_active = app.subscribe_sessions.iter().filter(|s| s.running.load(Ordering::Relaxed)).count();
+            let split_active = app.split_subscribe_sessions.iter().filter(|s| s.running.load(Ordering::Relaxed)).count();
+
+            println!(
+                "[STATUS] Active Sessions: {} publish, {} combined, {} ASIO, {} subscribe, {} split",
+                pub_active, comb_active, asio_active, sub_active, split_active
+            );
+        }
+    }
+
+    println!("[INFO] Shutting down active streams...");
+    app.stop_all_sessions();
+
+    thread::sleep(Duration::from_millis(200));
+    println!("[OK] OpenAudio cleanly stopped.");
+    Ok(())
+}
+
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let cli = parse_cli_args();
+
+    if cli.help {
+        println!(
+            "OpenAudio v{} - Ultra-low latency multichannel network audio\n\n\
+             USAGE:\n    \
+                 OpenAudio.exe [OPTIONS]\n\n\
+             OPTIONS:\n    \
+                 --headless             Run in headless background mode without a GUI window\n    \
+                 -p, --preset <PATH>    Load routing preset JSON on launch\n    \
+                 --auto-start           Automatically start all sessions in the preset\n    \
+                 -i, --interface <IP>   Bind audio transport & discovery to a specific network interface IP\n    \
+                 -h, --help             Print help information\n    \
+                 -V, --version          Print version information",
+            env!("CARGO_PKG_VERSION")
+        );
+        return Ok(());
+    }
+
+    if cli.version {
+        println!("OpenAudio v{}", env!("CARGO_PKG_VERSION"));
+        return Ok(());
+    }
+
     audio_core::prepare_realtime_process();
+
+    if cli.headless {
+        return run_headless(cli.preset.as_deref(), cli.auto_start, cli.interface);
+    }
+
+    let initial_preset_path = cli.preset.clone();
+    let auto_start = cli.auto_start;
+    let initial_interface = cli.interface.clone();
 
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
@@ -5297,6 +6921,24 @@ fn main() -> eframe::Result<()> {
     eframe::run_native(
         "Ferronme's Open Audio",
         options,
-        Box::new(|_creation_context| Ok(Box::new(OpenAudioApp::default()))),
-    )
+        Box::new(move |_creation_context| {
+            let mut app = OpenAudioApp::default();
+            if let Some(ref path) = initial_preset_path {
+                if let Ok(json) = std::fs::read_to_string(path) {
+                    if let Ok(preset) = serde_json::from_str::<preset::PresetFile>(&json) {
+                        let _ = app.apply_preset(preset);
+                        if auto_start {
+                            app.start_all_sessions();
+                        }
+                    }
+                }
+            }
+            if let Some(iface) = initial_interface {
+                app.set_selected_interface(Some(iface));
+            }
+            Ok(Box::new(app))
+        }),
+    )?;
+
+    Ok(())
 }

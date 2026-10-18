@@ -1,4 +1,5 @@
 use crate::backend::get_backend;
+use crate::crypto::StreamCipher;
 use crate::ensure_realtime_audio_thread;
 use crate::protocol::{float32_payload, parse_packet};
 use crate::recording::{
@@ -18,6 +19,22 @@ pub fn receive_and_split_to_devices(
     bind_addr: &str,
     device_targets: Vec<Option<String>>,
     record_each_channel: bool,
+    keep_running: Arc<AtomicBool>,
+) -> Result<(), String> {
+    receive_and_split_to_devices_with_cipher(
+        bind_addr,
+        device_targets,
+        record_each_channel,
+        None,
+        keep_running,
+    )
+}
+
+pub fn receive_and_split_to_devices_with_cipher(
+    bind_addr: &str,
+    device_targets: Vec<Option<String>>,
+    record_each_channel: bool,
+    cipher: Option<Arc<StreamCipher>>,
     keep_running: Arc<AtomicBool>,
 ) -> Result<(), String> {
     ensure_realtime_audio_thread();
@@ -47,9 +64,26 @@ pub fn receive_and_split_to_devices(
 
         match socket.recv_from(&mut packet_buffer) {
             Ok((packet_length, _source)) => {
-                if let Some(parsed) = parse_packet(&packet_buffer[..packet_length]) {
-                    let Some(payload) = float32_payload(&packet_buffer[..packet_length], &parsed)
-                    else {
+                let raw_packet = &packet_buffer[..packet_length];
+                let decrypted_buf: Vec<u8>;
+                let packet: &[u8] = if let Some(ref c) = cipher {
+                    if raw_packet.len() >= 6 && raw_packet[5] == network_core::protocol::PACKET_TYPE_AUDIO_ENCRYPTED {
+                        match crate::crypto::decrypt_audio_packet(c, raw_packet) {
+                            Ok(dec) => {
+                                decrypted_buf = dec;
+                                &decrypted_buf
+                            }
+                            Err(_) => continue,
+                        }
+                    } else {
+                        continue;
+                    }
+                } else {
+                    raw_packet
+                };
+
+                if let Some(parsed) = parse_packet(packet) {
+                    let Some(payload) = float32_payload(packet, &parsed) else {
                         continue;
                     };
                     break (
@@ -228,7 +262,23 @@ pub fn receive_and_split_to_devices(
             }
         };
 
-        let packet = &packet_buffer[..packet_length];
+        let raw_packet = &packet_buffer[..packet_length];
+        let decrypted_buf: Vec<u8>;
+        let packet: &[u8] = if let Some(ref c) = cipher {
+            if raw_packet.len() >= 6 && raw_packet[5] == network_core::protocol::PACKET_TYPE_AUDIO_ENCRYPTED {
+                match crate::crypto::decrypt_audio_packet(c, raw_packet) {
+                    Ok(dec) => {
+                        decrypted_buf = dec;
+                        &decrypted_buf
+                    }
+                    Err(_) => continue,
+                }
+            } else {
+                continue;
+            }
+        } else {
+            raw_packet
+        };
 
         let Some(parsed) = parse_packet(packet) else {
             continue;

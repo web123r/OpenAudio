@@ -2,6 +2,40 @@
 
 All notable changes to the OpenAudio project will be documented in this file.
 
+## [0.3.0] - 2026-10-16
+
+### 🚀 Highlights & New Features
+
+#### 🔔 **Automatic Background GitHub Update Checker**
+* Integrated background update checker (`apps/sender/src/updater.rs`) that periodically queries the GitHub Releases API for `web123r/OpenAudio`.
+* Added non-intrusive in-app banner alert showing the newly published version, release title, and immediate one-click action buttons to download or view the release notes on GitHub.
+* Added manual "Check for Updates" trigger and status indicator to the desktop GUI status bar.
+
+#### ⚡ **Real-Time Audio Safety & Zero-Allocation Queues**
+* Re-engineered `BoundedAudioQueue` (`crates/audio-core/src/util.rs`) with pre-allocated buffer recycling to guarantee zero heap allocations on high-priority audio callback threads.
+* Eliminated blocking `eprintln!` I/O logging inside audio callback loops in `crates/audio-core/src/transmit.rs`, preventing priority inversion and audio dropouts under network backpressure.
+* Added atomic drop metrics tracking for explicit, observable buffer overrun monitoring.
+
+#### 🎛️ **Non-Blocking VST3 DAW Plugin Lifecycle**
+* Decoupled runtime initialization, socket rebinding, and thread joins from the DAW audio `process()` path (`apps/plugin/src/lib.rs`).
+* Introduced staged parameter updates via atomic dirty flags, ensuring REAPER, Ableton Live, and Cubase audio processing continues uninterrupted when toggling publishing or changing PINs.
+* Hardened multi-instance DAW isolation with strict per-packet stream identity validation.
+
+#### 🎯 **Precision Packet Loss Concealment (PLC)**
+* Dynamically sized PLC concealment synthesis in `crates/audio-core/src/bus.rs` and `apps/receiver/src/main.rs` to match exact stream packet duration and channel count rather than a fixed 128-sample estimate.
+* Ensured sequence continuity and phase alignment across packet loss events.
+
+#### 🔒 **Cryptographic Hardening & Key Derivation**
+* Upgraded stream password key derivation from SHA-256 to memory-hard `Argon2id` using a dedicated domain salt (`OpenAudio-V1-Argon2id-Salt`) (`crates/audio-core/src/crypto.rs`).
+* Hardened AES-256-GCM symmetric transport by binding the 24-byte packet header as Associated Authenticated Data (AAD), thwarting header tampering and stream spoofing.
+* Enforced nonce uniqueness by incorporating nanosecond presentation timestamps into AES-GCM nonces, preventing nonce reuse across restarts and sequence rollovers.
+
+#### 🛡️ **Preset Security & Windows Firewall Hardening**
+* Prevented accidental credential leakage by skipping serialization of sensitive passphrases in preset files (`.oapreset`).
+* Restricted firewall configuration script (`scripts/setup-firewall.ps1`) to `Private,Domain` network profiles, avoiding open port exposure on untrusted public Wi-Fi networks.
+
+---
+
 ## [0.2.0] - 2026-10-10
 
 ### 🚀 Added Features & Major Architecture Upgrades

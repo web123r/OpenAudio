@@ -5,5 +5,7 @@
 
 pub mod aes67;
 pub mod discovery;
+pub mod fec;
+pub mod plc;
 pub mod protocol;
 pub mod receiver;

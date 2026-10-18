@@ -1,6 +1,9 @@
 use crate::discovery::{send_subscribe_request, DiscoveredNode};
 use crate::ensure_realtime_audio_thread;
 use crate::protocol::{float32_payload, parse_packet, SAMPLE_FORMAT_FLOAT32};
+use network_core::fec::FecDecoder;
+use network_core::plc::PacketLossConcealer;
+use network_core::protocol::{parse_fec_packet, peek_packet_type, PACKET_TYPE_FEC};
 
 use argon2::password_hash::{rand_core::OsRng, PasswordHash, PasswordHasher, SaltString};
 use argon2::{Argon2, PasswordVerifier};
@@ -1223,6 +1226,16 @@ fn relay_audio_to_websocket(
     let mut last_audio_packet = None;
     let mut stream_disconnected = false;
 
+    let mut packets_received = 0u64;
+    let mut packets_lost = 0u64;
+    let mut fec_recovered = 0u64;
+    let mut next_expected_seq: Option<u32> = None;
+    let mut interval_packets = 0u32;
+    let mut last_metrics_report = Instant::now();
+
+    let mut fec_decoder = FecDecoder::new(32);
+    let mut plc: Option<PacketLossConcealer> = None;
+
     loop {
         if !global_keep_running.load(Ordering::Acquire) {
             return Ok(());
@@ -1231,6 +1244,27 @@ fn relay_audio_to_websocket(
         match socket.recv_from(&mut buffer) {
             Ok((length, _source)) => {
                 let packet = &buffer[..length];
+
+                if let Some(packet_type) = peek_packet_type(packet) {
+                    if packet_type == PACKET_TYPE_FEC {
+                        if let Some(fec) = parse_fec_packet(packet) {
+                            if fec.stream_id == node.stream_id {
+                                let payload = &packet[fec.payload_offset..fec.payload_offset + fec.payload_len];
+                                if let Some((_rec_pkt, rec_pcm)) = fec_decoder.decode_fec(&fec, payload) {
+                                    fec_recovered = fec_recovered.saturating_add(1);
+                                    if batched_payload.is_empty() {
+                                        batch_started = Instant::now();
+                                    }
+                                    for sample in &rec_pcm {
+                                        batched_payload.extend_from_slice(&sample.to_le_bytes());
+                                    }
+                                    batched_frames += rec_pcm.len() / (fec.channel_count as usize);
+                                }
+                            }
+                        }
+                        continue;
+                    }
+                }
 
                 let Some(parsed) = parse_packet(packet) else {
                     continue;
@@ -1254,6 +1288,40 @@ fn relay_audio_to_websocket(
                 let Some(payload) = float32_payload(packet, &parsed) else {
                     continue;
                 };
+
+                fec_decoder.record_received(parsed.sequence_number, payload);
+
+                if plc.is_none() {
+                    plc = Some(PacketLossConcealer::new(channels));
+                }
+
+                let seq = parsed.sequence_number;
+                match next_expected_seq {
+                    None => {
+                        next_expected_seq = Some(seq.wrapping_add(1));
+                    }
+                    Some(expected) => {
+                        if seq == expected {
+                            next_expected_seq = Some(seq.wrapping_add(1));
+                        } else {
+                            let dist = seq.wrapping_sub(expected);
+                            if dist < 0x8000_0000 {
+                                packets_lost = packets_lost.saturating_add(dist as u64);
+                                next_expected_seq = Some(seq.wrapping_add(1));
+                                if let Some(plc_inst) = &mut plc {
+                                    let missing_frames = (dist as usize) * (parsed.samples_per_channel as usize);
+                                    let concealed = plc_inst.synthesize_concealment(missing_frames);
+                                    for sample in &concealed {
+                                        batched_payload.extend_from_slice(&sample.to_le_bytes());
+                                    }
+                                    batched_frames += missing_frames;
+                                }
+                            }
+                        }
+                    }
+                }
+                packets_received = packets_received.saturating_add(1);
+                interval_packets = interval_packets.saturating_add(1);
 
                 let packet_format = (parsed.channel_count as u16, parsed.sample_rate);
 
@@ -1308,7 +1376,18 @@ fn relay_audio_to_websocket(
                     batch_started = Instant::now();
                 }
 
-                batched_payload.extend_from_slice(payload);
+                let mut pcm: Vec<f32> = payload
+                    .chunks_exact(4)
+                    .map(|bytes| f32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
+                    .collect();
+
+                if let Some(plc_inst) = &mut plc {
+                    plc_inst.process_incoming(&mut pcm);
+                }
+
+                for sample in &pcm {
+                    batched_payload.extend_from_slice(&sample.to_le_bytes());
+                }
                 batched_frames += parsed.samples_per_channel as usize;
 
                 if batched_frames >= target_batch_frames {
@@ -1316,6 +1395,31 @@ fn relay_audio_to_websocket(
                         return Ok(());
                     }
                     batched_frames = 0;
+                }
+
+                if last_metrics_report.elapsed() >= Duration::from_secs(1) {
+                    let elapsed_secs = last_metrics_report.elapsed().as_secs_f64();
+                    let total = packets_received.saturating_add(packets_lost);
+                    let delivery_pct = if total > 0 {
+                        (packets_received as f64 / total as f64) * 100.0
+                    } else {
+                        100.0
+                    };
+                    let packet_rate = interval_packets as f64 / elapsed_secs;
+                    if send_ws_metrics(
+                        ws,
+                        delivery_pct,
+                        packets_received,
+                        packets_lost,
+                        fec_recovered,
+                        packet_rate,
+                    )
+                    .is_err()
+                    {
+                        return Ok(());
+                    }
+                    interval_packets = 0;
+                    last_metrics_report = Instant::now();
                 }
             }
 
@@ -1330,6 +1434,31 @@ fn relay_audio_to_websocket(
                         return Ok(());
                     }
                     batched_frames = 0;
+                }
+
+                if last_metrics_report.elapsed() >= Duration::from_secs(1) && packets_received > 0 {
+                    let elapsed_secs = last_metrics_report.elapsed().as_secs_f64();
+                    let total = packets_received.saturating_add(packets_lost);
+                    let delivery_pct = if total > 0 {
+                        (packets_received as f64 / total as f64) * 100.0
+                    } else {
+                        100.0
+                    };
+                    let packet_rate = interval_packets as f64 / elapsed_secs;
+                    if send_ws_metrics(
+                        ws,
+                        delivery_pct,
+                        packets_received,
+                        packets_lost,
+                        fec_recovered,
+                        packet_rate,
+                    )
+                    .is_err()
+                    {
+                        return Ok(());
+                    }
+                    interval_packets = 0;
+                    last_metrics_report = Instant::now();
                 }
 
                 if !stream_disconnected
@@ -1355,6 +1484,26 @@ fn relay_audio_to_websocket(
             }
         }
     }
+}
+
+fn send_ws_metrics(
+    ws: &mut tungstenite::WebSocket<TcpStream>,
+    delivery_pct: f64,
+    received: u64,
+    lost: u64,
+    recovered: u64,
+    packet_rate: f64,
+) -> Result<(), tungstenite::Error> {
+    let payload = serde_json::json!({
+        "type": "metrics",
+        "deliveryPct": delivery_pct,
+        "received": received,
+        "lost": lost,
+        "recovered": recovered,
+        "packetRate": packet_rate,
+    });
+
+    ws.send(Message::Text(payload.to_string().into()))
 }
 
 fn flush_web_audio_batch(

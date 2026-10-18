@@ -1,6 +1,8 @@
 use crate::discovery::send_subscribe_request;
+use crate::fec::FecDecoder;
 use crate::protocol::{
-    decode_float32, parse_packet, sample_format_name, ParsedPacket, SAMPLE_FORMAT_FLOAT32,
+    decode_float32, float32_payload, parse_fec_packet, parse_packet, peek_packet_type,
+    sample_format_name, ParsedPacket, PACKET_TYPE_FEC, SAMPLE_FORMAT_FLOAT32,
 };
 use std::collections::{BTreeMap, VecDeque};
 use std::net::{Ipv4Addr, UdpSocket};
@@ -23,6 +25,7 @@ pub struct PacketReorderWindow {
     next_expected_seq: Option<u32>,
     buffer: BTreeMap<u32, (ParsedPacket, Vec<f32>)>,
     gap_started: Option<Instant>,
+    gap_timeout: Duration,
 }
 
 impl PacketReorderWindow {
@@ -32,14 +35,23 @@ impl PacketReorderWindow {
             next_expected_seq: None,
             buffer: BTreeMap::new(),
             gap_started: None,
+            gap_timeout: REORDER_GAP_TIMEOUT,
         }
     }
 
-    fn flush_expired_gap(&mut self) -> Vec<ReceiveEvent> {
+    pub fn set_gap_timeout(&mut self, timeout: Duration) {
+        self.gap_timeout = timeout;
+    }
+
+    pub fn gap_timeout(&self) -> Duration {
+        self.gap_timeout
+    }
+
+    pub fn flush_expired_gap(&mut self) -> Vec<ReceiveEvent> {
         let Some(gap_started) = self.gap_started else {
             return Vec::new();
         };
-        if gap_started.elapsed() < REORDER_GAP_TIMEOUT {
+        if gap_started.elapsed() < self.gap_timeout {
             return Vec::new();
         }
 
@@ -134,7 +146,7 @@ impl PacketReorderWindow {
                 return events;
             }
 
-            if diff > 2 {
+            if diff > self.capacity as u32 {
                 events.push(ReceiveEvent::Dropped(diff));
                 self.next_expected_seq = Some(seq.wrapping_add(1));
                 events.push(ReceiveEvent::Packet(packet, pcm));
@@ -165,6 +177,47 @@ impl PacketReorderWindow {
 
         events
     }
+
+    /// Inserts a missing packet reconstructed by FEC into the reorder window.
+    pub fn push_recovered(&mut self, packet: ParsedPacket, pcm: Vec<f32>) -> Vec<ReceiveEvent> {
+        let mut events = Vec::new();
+        let seq = packet.sequence_number;
+
+        let expected = match self.next_expected_seq {
+            Some(e) => e,
+            None => {
+                self.next_expected_seq = Some(seq.wrapping_add(1));
+                events.push(ReceiveEvent::Packet(packet, pcm));
+                return events;
+            }
+        };
+
+        if seq == expected {
+            self.next_expected_seq = Some(seq.wrapping_add(1));
+            events.push(ReceiveEvent::Packet(packet, pcm));
+
+            while let Some(next_exp) = self.next_expected_seq {
+                if let Some((next_pkt, next_pcm)) = self.buffer.remove(&next_exp) {
+                    self.next_expected_seq = Some(next_exp.wrapping_add(1));
+                    events.push(ReceiveEvent::Packet(next_pkt, next_pcm));
+                } else {
+                    break;
+                }
+            }
+            self.gap_started = if self.buffer.is_empty() {
+                None
+            } else {
+                Some(Instant::now())
+            };
+        } else {
+            let diff = seq.wrapping_sub(expected);
+            if diff < 0x8000_0000 && diff <= self.capacity as u32 {
+                self.buffer.insert(seq, (packet, pcm));
+            }
+        }
+
+        events
+    }
 }
 
 pub struct StreamReceiver {
@@ -175,6 +228,7 @@ pub struct StreamReceiver {
     my_receive_port: u16,
 
     reorder_window: PacketReorderWindow,
+    fec_decoder: FecDecoder,
     last_receive: Instant,
     current_format: Option<(u8, u32)>,
     is_connected: bool,
@@ -202,6 +256,7 @@ impl StreamReceiver {
             stream_id,
             my_receive_port,
             reorder_window: PacketReorderWindow::new(32),
+            fec_decoder: FecDecoder::new(32),
             last_receive: Instant::now() - Duration::from_secs(10),
             current_format: None,
             is_connected: false,
@@ -210,6 +265,14 @@ impl StreamReceiver {
 
         receiver.resubscribe();
         Ok(receiver)
+    }
+
+    pub fn fec_recovered_count(&self) -> u64 {
+        self.fec_decoder.recovered_count()
+    }
+
+    pub fn set_gap_timeout(&mut self, timeout: Duration) {
+        self.reorder_window.set_gap_timeout(timeout);
     }
 
     fn resubscribe(&mut self) {
@@ -255,12 +318,35 @@ impl StreamReceiver {
             Err(e) => return Err(format!("receive error: {e}")),
         };
 
-        let Some(packet) = parse_packet(&buf[..len]) else {
+        let packet_data = &buf[..len];
+
+        if let Some(packet_type) = peek_packet_type(packet_data) {
+            if packet_type == PACKET_TYPE_FEC {
+                if let Some(fec) = parse_fec_packet(packet_data) {
+                    if fec.stream_id == self.stream_id {
+                        let payload = &packet_data[fec.payload_offset..fec.payload_offset + fec.payload_len];
+                        if let Some((rec_pkt, rec_pcm)) = self.fec_decoder.decode_fec(&fec, payload) {
+                            let events = self.reorder_window.push_recovered(rec_pkt, rec_pcm);
+                            for ev in events {
+                                self.event_queue.push_back(ev);
+                            }
+                        }
+                    }
+                }
+                return Ok(self.event_queue.pop_front());
+            }
+        }
+
+        let Some(packet) = parse_packet(packet_data) else {
             return Ok(None);
         };
 
         if packet.stream_id != self.stream_id {
             return Ok(None);
+        }
+
+        if let Some(payload) = float32_payload(packet_data, &packet) {
+            self.fec_decoder.record_received(packet.sequence_number, payload);
         }
 
         if packet.sample_format != SAMPLE_FORMAT_FLOAT32 {

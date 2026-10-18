@@ -323,6 +323,13 @@
     color: #6ee7b7;
   }
 
+  .buffer-preset-btn.active {
+    background: rgba(99,102,241,0.3) !important;
+    border-color: #6366f1 !important;
+    color: #fff !important;
+    box-shadow: 0 0 10px rgba(99,102,241,0.25);
+  }
+
   /* buttons */
   .btn-row {
     display: flex;
@@ -602,6 +609,28 @@
       </div>
     </div>
 
+    <div id="bufferSection" style="margin-bottom: 1.1rem; background: rgba(0,0,0,0.25); border: 1px solid rgba(255,255,255,0.07); border-radius: 14px; padding: 0.9rem;">
+      <div style="font-size: 0.72rem; text-transform: uppercase; letter-spacing: 0.05em; color: #888; margin-bottom: 0.6rem; display: flex; justify-content: space-between; align-items: center;">
+        <span>⚡ Latency & Jitter Buffer</span>
+        <span id="bufferTargetDisplay" style="color: #a5b4fc; font-weight: 600; text-transform: none;">Wi-Fi (50ms)</span>
+      </div>
+      <div style="display: flex; gap: 0.5rem; margin-bottom: 0.6rem;">
+        <button type="button" class="buffer-preset-btn" data-ms="20" onclick="setBufferMode(20, this)" style="flex:1; padding:0.5rem; font-size:0.75rem; border-radius:8px; background:rgba(255,255,255,0.06); border:1px solid rgba(255,255,255,0.1); color:#ccc;">
+          🚀 LAN (20ms)
+        </button>
+        <button type="button" class="buffer-preset-btn active" data-ms="50" onclick="setBufferMode(50, this)" style="flex:1; padding:0.5rem; font-size:0.75rem; border-radius:8px; background:rgba(99,102,241,0.25); border:1px solid #6366f1; color:#fff;">
+          📶 Wi-Fi (50ms)
+        </button>
+        <button type="button" class="buffer-preset-btn" data-ms="120" onclick="setBufferMode(120, this)" style="flex:1; padding:0.5rem; font-size:0.75rem; border-radius:8px; background:rgba(255,255,255,0.06); border:1px solid rgba(255,255,255,0.1); color:#ccc;">
+          🛡️ Safe (120ms)
+        </button>
+      </div>
+      <div style="display: flex; align-items: center; gap: 0.8rem;">
+        <input type="range" id="bufferSlider" min="15" max="200" step="5" value="50" oninput="onBufferSliderChange(this.value)" style="flex: 1; accent-color: #6366f1; cursor: pointer;">
+        <span style="font-size: 0.75rem; color: #888; min-width: 45px; text-align: right;" id="bufferSliderVal">50 ms</span>
+      </div>
+    </div>
+
     <div class="btn-row">
       <button
         id="refreshBtn"
@@ -645,6 +674,13 @@
         <span>
           🎚️
           <span class="ch-active-badge" id="npChannels">
+            —
+          </span>
+        </span>
+
+        <span>
+          📶
+          <span class="engine-badge" id="npDelivery" style="background: rgba(52,211,153,0.15); color: #34d399; border: 1px solid rgba(52,211,153,0.3);">
             —
           </span>
         </span>
@@ -733,6 +769,117 @@
     document.getElementById("channelSection");
   const chGrid =
     document.getElementById("channelGrid");
+  const npDelivery =
+    document.getElementById("npDelivery");
+
+  let latestMetrics = null;
+  let lastBufferStats = { ms: 0, underruns: 0, targetMs: 0 };
+  let currentBufferTargetMs = 50;
+
+  function setBufferMode(ms, btn) {
+    currentBufferTargetMs = Number(ms);
+    document.querySelectorAll(".buffer-preset-btn").forEach(b => b.classList.remove("active"));
+    if (btn) {
+      btn.classList.add("active");
+    }
+    const slider = document.getElementById("bufferSlider");
+    if (slider) {
+      slider.value = ms;
+    }
+    const sliderVal = document.getElementById("bufferSliderVal");
+    if (sliderVal) {
+      sliderVal.textContent = `${ms} ms`;
+    }
+    const display = document.getElementById("bufferTargetDisplay");
+    if (display) {
+      const label = ms <= 25 ? `LAN (${ms}ms)` : (ms <= 75 ? `Wi-Fi (${ms}ms)` : `Safe (${ms}ms)`);
+      display.textContent = label;
+    }
+    if (workletNode && workletNode.port) {
+      workletNode.port.postMessage({
+        type: "set_target",
+        targetMs: ms
+      });
+    }
+    if (typeof updateFallbackPrebuffer === "function") {
+      updateFallbackPrebuffer(ms);
+    }
+  }
+
+  function onBufferSliderChange(val) {
+    currentBufferTargetMs = Number(val);
+    document.querySelectorAll(".buffer-preset-btn").forEach(b => {
+      b.classList.toggle("active", Number(b.dataset.ms) === currentBufferTargetMs);
+    });
+    const sliderVal = document.getElementById("bufferSliderVal");
+    if (sliderVal) {
+      sliderVal.textContent = `${currentBufferTargetMs} ms`;
+    }
+    const display = document.getElementById("bufferTargetDisplay");
+    if (display) {
+      const label = currentBufferTargetMs <= 25 ? `LAN (${currentBufferTargetMs}ms)` : (currentBufferTargetMs <= 75 ? `Wi-Fi (${currentBufferTargetMs}ms)` : `Safe (${currentBufferTargetMs}ms)`);
+      display.textContent = label;
+    }
+    if (workletNode && workletNode.port) {
+      workletNode.port.postMessage({
+        type: "set_target",
+        targetMs: currentBufferTargetMs
+      });
+    }
+    if (typeof updateFallbackPrebuffer === "function") {
+      updateFallbackPrebuffer(currentBufferTargetMs);
+    }
+  }
+
+  function renderStats() {
+    const parts = [];
+    if (lastBufferStats && lastBufferStats.ms !== undefined && (lastBufferStats.ms > 0 || lastBufferStats.underruns > 0)) {
+      parts.push(`Buffered: ${lastBufferStats.ms}ms`);
+      parts.push(`Underruns: ${lastBufferStats.underruns}`);
+      parts.push(`Target: ${lastBufferStats.targetMs}ms`);
+    }
+    if (latestMetrics) {
+      const pct = Number(latestMetrics.deliveryPct).toFixed(1);
+      const lost = latestMetrics.lost;
+      const rec = Number(latestMetrics.recovered || 0);
+      const rate = Number(latestMetrics.packetRate).toFixed(0);
+      if (rec > 0) {
+        parts.push(`Delivery: ${pct}% (${lost} lost, ${rec} recovered via FEC)`);
+      } else {
+        parts.push(`Delivery: ${pct}% (${lost} lost)`);
+      }
+      parts.push(`${rate} pkts/s`);
+    }
+    statsEl.textContent = parts.join(" · ");
+  }
+
+  function updateDeliveryBadge(metrics) {
+    if (!npDelivery) {
+      return;
+    }
+    if (!metrics) {
+      npDelivery.textContent = "—";
+      npDelivery.style.background = "rgba(255,255,255,0.05)";
+      npDelivery.style.color = "#888";
+      npDelivery.style.border = "1px solid rgba(255,255,255,0.1)";
+      return;
+    }
+    const pct = Number(metrics.deliveryPct);
+    npDelivery.textContent = `${pct.toFixed(1)}% delivered`;
+    if (pct >= 99.0) {
+      npDelivery.style.background = "rgba(52,211,153,0.15)";
+      npDelivery.style.color = "#34d399";
+      npDelivery.style.border = "1px solid rgba(52,211,153,0.3)";
+    } else if (pct >= 95.0) {
+      npDelivery.style.background = "rgba(245,158,11,0.15)";
+      npDelivery.style.color = "#fcd34d";
+      npDelivery.style.border = "1px solid rgba(245,158,11,0.3)";
+    } else {
+      npDelivery.style.background = "rgba(248,113,113,0.15)";
+      npDelivery.style.color = "#fca5a5";
+      npDelivery.style.border = "1px solid rgba(248,113,113,0.3)";
+    }
+  }
 
   function setStatus(text, className) {
     statusEl.textContent = text;
@@ -1356,10 +1503,10 @@
           sourceSampleRate * prebufferSeconds
         );
         this.minimumPrebufferSamples = Math.floor(
-          sourceSampleRate * 0.08
+          sourceSampleRate * Math.max(0.010, prebufferSeconds * 0.4)
         );
         this.maximumPrebufferSamples = Math.floor(
-          sourceSampleRate * 0.5
+          sourceSampleRate * Math.max(0.050, prebufferSeconds * 3.0)
         );
 
         this.underrunCount = 0;
@@ -1378,6 +1525,11 @@
             this.phase = 0;
             this.available = 0;
             this.started = false;
+          } else if (event.data.type === "set_target") {
+            const targetSecs = event.data.targetMs / 1000.0;
+            this.prebufferSamples = Math.floor(this.sourceSampleRate * targetSecs);
+            this.minimumPrebufferSamples = Math.floor(this.sourceSampleRate * Math.max(0.010, targetSecs * 0.4));
+            this.maximumPrebufferSamples = Math.floor(this.sourceSampleRate * Math.max(0.050, targetSecs * 3.0));
           }
         };
       }
@@ -1565,7 +1717,7 @@
                 sourceSampleRate: sampleRate,
                 capacitySamples:
                   Math.ceil(sampleRate * 2),
-                prebufferSeconds: 0.15
+                prebufferSeconds: (currentBufferTargetMs || 50) / 1000.0
               }
             }
           );
@@ -1575,18 +1727,25 @@
             if (
               event.data.type === "stats"
             ) {
-                  const milliseconds =
+              const milliseconds =
                 (
                   event.data.available /
-                      sampleRate *
+                  sampleRate *
+                  1000
+                ).toFixed(0);
+              const targetMs =
+                (
+                  event.data.target /
+                  sampleRate *
                   1000
                 ).toFixed(0);
 
-              statsEl.textContent =
-                `Buffered: ${milliseconds}ms · ` +
-                `Underruns: ` +
-                `${event.data.underruns} · ` +
-                `Target: ${(event.data.target / sampleRate * 1000).toFixed(0)}ms`;
+              lastBufferStats = {
+                ms: milliseconds,
+                underruns: event.data.underruns,
+                targetMs: targetMs
+              };
+              renderStats();
             }
           };
 
@@ -1618,9 +1777,15 @@
     ringAvailable = 0;
     fallbackUnderruns = 0;
 
+    const effectiveTargetMs = (typeof currentBufferTargetMs !== "undefined" && currentBufferTargetMs) ? currentBufferTargetMs : 150;
     let prebuffer = Math.floor(
-      sampleRate * 0.15
+      sampleRate * (effectiveTargetMs / 1000.0)
     );
+    if (typeof window !== "undefined") {
+      window.updateFallbackPrebuffer = function(ms) {
+        prebuffer = Math.floor(sampleRate * (ms / 1000.0));
+      };
+    }
     let stableCallbacks = 0;
 
     let started = false;
@@ -1721,15 +1886,29 @@
           ringPhase -= consumed;
         }
 
-        statsEl.textContent =
-          `Buffered: ` +
-          `${(
+        const milliseconds =
+          (
             ringAvailable /
             sampleRate *
             1000
-          ).toFixed(0)}ms · ` +
-          `Underruns: ${fallbackUnderruns} · ` +
-          `Target: ${(prebuffer / sampleRate * 1000).toFixed(0)}ms`;
+          ).toFixed(0);
+        const targetMs =
+          (
+            prebuffer /
+            sampleRate *
+            1000
+          ).toFixed(0);
+
+        if (typeof lastBufferStats !== "undefined") {
+          lastBufferStats = {
+            ms: milliseconds,
+            underruns: fallbackUnderruns,
+            targetMs: targetMs
+          };
+        }
+        if (typeof renderStats === "function") {
+          renderStats();
+        }
       };
 
     processorNode.connect(
@@ -1877,6 +2056,9 @@
     ringBuffers = [];
     ringCapacity = 0;
     ringAvailable = 0;
+    latestMetrics = null;
+    lastBufferStats = { ms: 0, underruns: 0, targetMs: 0 };
+    updateDeliveryBadge(null);
 
     setLive(false);
     statsEl.textContent = "";
@@ -2048,6 +2230,10 @@
                 resumeBtn.classList
                   .add("show");
               }
+            } else if (message.type === "metrics") {
+              latestMetrics = message;
+              updateDeliveryBadge(latestMetrics);
+              renderStats();
             } else if (
               message.type === "error"
             ) {

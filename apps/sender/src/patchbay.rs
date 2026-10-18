@@ -1,5 +1,6 @@
 use std::collections::HashSet;
 
+#[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub struct PatchbayNode {
     pub id: String,
@@ -9,6 +10,7 @@ pub struct PatchbayNode {
     pub is_publisher: bool,
 }
 
+#[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub struct PatchbayMatrix {
     pub publishers: Vec<PatchbayNode>,
@@ -65,6 +67,7 @@ impl PatchbayMatrix {
         });
     }
 
+    #[allow(dead_code)]
     pub fn toggle_patch(&mut self, pub_id: &str, rec_id: &str) -> bool {
         let key = (pub_id.to_string(), rec_id.to_string());
         if self.active_patches.contains(&key) {
@@ -79,6 +82,19 @@ impl PatchbayMatrix {
     pub fn is_patched(&self, pub_id: &str, rec_id: &str) -> bool {
         self.active_patches
             .contains(&(pub_id.to_string(), rec_id.to_string()))
+    }
+
+    pub fn set_patched(&mut self, pub_id: &str, rec_id: &str, patched: bool) {
+        let key = (pub_id.to_string(), rec_id.to_string());
+        if patched {
+            self.active_patches.insert(key);
+        } else {
+            self.active_patches.remove(&key);
+        }
+    }
+
+    pub fn clear_patches(&mut self) {
+        self.active_patches.clear();
     }
 }
 

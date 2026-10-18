@@ -1,6 +1,6 @@
 use std::time::{Duration, Instant};
 
-const MIN_JITTER_TARGET_MS: f64 = 6.0;
+const MIN_JITTER_TARGET_MS: f64 = 3.0;
 const MAX_JITTER_TARGET_MS: f64 = 120.0;
 const DEFAULT_JITTER_TARGET_MS: f64 = 20.0;
 const MAX_CLOCK_CORRECTION_PPM: f64 = 500.0;
@@ -16,6 +16,10 @@ pub struct AdaptiveJitterController {
 
 impl AdaptiveJitterController {
     pub fn new(sample_rate: u32) -> Self {
+        Self::with_target_ms(sample_rate, DEFAULT_JITTER_TARGET_MS)
+    }
+
+    pub fn with_target_ms(sample_rate: u32, target_ms: f64) -> Self {
         let mut controller = Self {
             target_frames: 0.0,
             sample_rate: sample_rate.max(1),
@@ -23,8 +27,14 @@ impl AdaptiveJitterController {
             overruns: 0,
             last_adjustment: Instant::now(),
         };
-        controller.target_frames = controller.frames_for_ms(DEFAULT_JITTER_TARGET_MS);
+        let clamped = target_ms.clamp(MIN_JITTER_TARGET_MS, MAX_JITTER_TARGET_MS);
+        controller.target_frames = controller.frames_for_ms(clamped);
         controller
+    }
+
+    pub fn set_target_ms(&mut self, target_ms: f64) {
+        let clamped = target_ms.clamp(MIN_JITTER_TARGET_MS, MAX_JITTER_TARGET_MS);
+        self.target_frames = self.frames_for_ms(clamped);
     }
 
     pub fn target_frames(&self) -> usize {

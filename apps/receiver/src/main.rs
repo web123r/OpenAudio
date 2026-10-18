@@ -236,19 +236,28 @@ fn play_stream(
     let mut format = None;
     let mut _stream = None;
     let mut resampler: Option<StreamingLinearResampler> = None;
+    let mut plc: Option<network_core::plc::PacketLossConcealer> = None;
     let buffer: Arc<Mutex<VecDeque<f32>>> = Arc::new(Mutex::new(VecDeque::new()));
 
     let mut packets = 0u64;
     let mut dropped = 0u64;
+    let mut last_packet_frames = 0usize;
 
     while Instant::now() < deadline {
         match receiver.next_event()? {
-            Some(ReceiveEvent::Packet(_packet, pcm)) => {
+            Some(ReceiveEvent::Packet(packet, mut pcm)) => {
                 packets += 1;
+                let ch = (packet.channel_count as usize).max(1);
+                last_packet_frames = pcm.len() / ch;
+                let recovered = receiver.fec_recovered_count();
                 if packets % 100 == 0 {
                     println!(
-                        "source={publisher} packets={packets} dropped={dropped} format={format:?}"
+                        "source={publisher} packets={packets} dropped={dropped} (fec_recovered={recovered}) format={format:?}"
                     );
+                }
+
+                if let Some(plc_inst) = &mut plc {
+                    plc_inst.process_incoming(&mut pcm);
                 }
 
                 if let Some((channels, _)) = format {
@@ -269,6 +278,27 @@ fn play_stream(
             }
             Some(ReceiveEvent::Dropped(count)) => {
                 dropped += count as u64;
+                if let Some(plc_inst) = &mut plc {
+                    let frames_per_packet = if last_packet_frames > 0 {
+                        last_packet_frames
+                    } else if let Some((channels, _)) = format {
+                        network_core::protocol::max_float32_frames_per_packet(channels as usize).unwrap_or(58)
+                    } else {
+                        58
+                    };
+                    let frames = (count as usize) * frames_per_packet;
+                    let concealed = plc_inst.synthesize_concealment(frames);
+                    if let Some(resamp) = resampler.as_mut() {
+                        if let Ok(to_push) = resamp.process(&concealed) {
+                            let mut jitter_buf = buffer.lock().unwrap();
+                            jitter_buf.extend(to_push);
+                            if let Some((channels, _)) = format {
+                                let max_frames = (output_sample_rate as f64 * 0.2) as usize;
+                                trim_interleaved_queue(&mut jitter_buf, max_frames, channels as usize);
+                            }
+                        }
+                    }
+                }
             }
             Some(ReceiveEvent::FormatChanged {
                 channels,
@@ -277,6 +307,7 @@ fn play_stream(
                 validate_output_channel_count(channels, output_channels)?;
 
                 format = Some((channels, sample_rate));
+                plc = Some(network_core::plc::PacketLossConcealer::new(channels as usize));
                 resampler = Some(StreamingLinearResampler::new(
                     channels as usize,
                     sample_rate,
@@ -515,11 +546,12 @@ mod tests {
 
             // Send seq 4 after reconnect
             socket.send_to(&make_packet(stream_id, 4), &target).unwrap();
+            thread::sleep(Duration::from_millis(50));
         });
 
         // Leave room for the reconnect timeout and slower CI scheduling.
         let (packets, dropped) =
-            inspect_stream("127.0.0.1", control_port, stream_id, receive_port, 5).unwrap();
+            inspect_stream("127.0.0.1", control_port, stream_id, receive_port, 6).unwrap();
 
         assert_eq!(packets, 4, "Should have received exactly 4 packets");
         assert_eq!(

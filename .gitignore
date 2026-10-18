@@ -32,3 +32,4 @@ Thumbs.db
 *.mp3
 /installer_staging/
 *.oapreset
+/dist/

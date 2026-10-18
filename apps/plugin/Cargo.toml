@@ -2,7 +2,7 @@
 name = "openaudio-plugin"
 version = "0.1.0"
 edition = "2021"
-description = "OpenAudio VST3 sender for mono and stereo DAW tracks."
+description = "OpenAudio VST3 sender for mono, stereo, and multichannel DAW tracks (up to 64 channels)."
 
 [lib]
 crate-type = ["cdylib", "rlib"]
