@@ -15,8 +15,10 @@ default = []
 #   $env:CPAL_ASIO_DIR = "C:\path\to\asio_sdk"
 #   cargo build --features asio
 asio = ["cpal/asio"]
+opus = ["dep:rusty-opus"]
 
 [dependencies]
+rusty-opus = { version = "1.0.2", optional = true }
 network-core = { path = "../network-core" }
 cpal = { version = "0.15", features = [] }
 hound = "3.5"

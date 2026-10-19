@@ -47,6 +47,59 @@ impl PublisherDestinations {
     }
 }
 
+/// Represents a grouped subset of audio channels bundled into a single network stream.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChannelGroup {
+    pub stream_id: u32,
+    pub stream_name: String,
+    pub channel_indices: Vec<usize>,
+    pub channel_labels: Vec<String>,
+}
+
+/// Helper that partitions a total channel count into groups of at most `max_channels_per_group` (default 8).
+pub fn create_channel_groups(
+    base_stream_id: u32,
+    base_stream_name: &str,
+    channel_count: usize,
+    channel_labels: &[String],
+    max_channels_per_group: usize,
+) -> Vec<ChannelGroup> {
+    let group_size = max_channels_per_group.clamp(1, 8);
+    let mut groups = Vec::new();
+    let num_groups = (channel_count + group_size - 1) / group_size;
+
+    for g in 0..num_groups {
+        let start = g * group_size;
+        let end = (start + group_size).min(channel_count);
+        let indices: Vec<usize> = (start..end).collect();
+        let labels: Vec<String> = indices
+            .iter()
+            .map(|&idx| {
+                channel_labels
+                    .get(idx)
+                    .cloned()
+                    .unwrap_or_else(|| format!("Ch {}", idx + 1))
+            })
+            .collect();
+
+        let stream_id = base_stream_id.wrapping_add(g as u32);
+        let stream_name = if num_groups == 1 {
+            base_stream_name.to_string()
+        } else {
+            format!("{base_stream_name} (Ch {}-{})", start + 1, end)
+        };
+
+        groups.push(ChannelGroup {
+            stream_id,
+            stream_name,
+            channel_indices: indices,
+            channel_labels: labels,
+        });
+    }
+
+    groups
+}
+
 pub fn transmit(duration_secs: u64, dest_addr: &str, stream_id: u32) -> Result<(), String> {
     transmit_multi(duration_secs, &[dest_addr], stream_id)
 }
@@ -656,86 +709,92 @@ fn spawn_capture_publisher(
                 last_drop_report = Instant::now();
             }
 
+            // --- Stage 1: Demand-based gating ---
+            // Snapshot subscribers BEFORE dequeuing audio.  If nobody is
+            // listening we still drain the queue (to prevent backlog growth)
+            // but skip every allocation, encoding, FEC, and UDP send.
+            let destinations = destinations_source.snapshot(stream_id);
+
             if let Some(block) = audio_queue.try_pop() {
                 let data = block.samples;
                 if let Some(writer) = &writer {
                     write_samples(writer, &data);
                 }
 
-                let destinations = destinations_source.snapshot(stream_id);
+                // No subscribers → discard this block; zero network cost.
+                let Some(destinations) = destinations else {
+                    continue;
+                };
 
-                if let Some(destinations) = destinations {
-                    let frame_count = data.len() / channels as usize;
-                    let mut frame_offset = 0usize;
+                let frame_count = data.len() / channels as usize;
+                let mut frame_offset = 0usize;
 
-                    while frame_offset < frame_count {
-                        let frames_this_packet =
-                            (frame_count - frame_offset).min(max_frames_per_packet);
-                        let sequence_number = packets_sent.fetch_add(1, Ordering::Relaxed);
-                        let header = PacketHeader {
-                            sub_stream_index: 0,
-                            stream_id,
-                            sequence_number,
-                            presentation_timestamp_ns: block.presentation_timestamp_ns,
-                        };
+                while frame_offset < frame_count {
+                    let frames_this_packet =
+                        (frame_count - frame_offset).min(max_frames_per_packet);
+                    let sequence_number = packets_sent.fetch_add(1, Ordering::Relaxed);
+                    let header = PacketHeader {
+                        sub_stream_index: 0,
+                        stream_id,
+                        sequence_number,
+                        presentation_timestamp_ns: block.presentation_timestamp_ns,
+                    };
 
-                        let sample_start = frame_offset * channels as usize;
-                        let sample_end = (frame_offset + frames_this_packet) * channels as usize;
-                        let sample_rate = network_core::protocol::code_to_sample_rate(rate_code);
-                        let packet = match network_core::protocol::encode_float32_packet(
-                            &header,
-                            channels as u8,
-                            sample_rate,
-                            &data[sample_start..sample_end],
-                        ) {
-                            Ok(packet) => packet,
+                    let sample_start = frame_offset * channels as usize;
+                    let sample_end = (frame_offset + frames_this_packet) * channels as usize;
+                    let sample_rate = network_core::protocol::code_to_sample_rate(rate_code);
+                    let packet = match network_core::protocol::encode_float32_packet(
+                        &header,
+                        channels as u8,
+                        sample_rate,
+                        &data[sample_start..sample_end],
+                    ) {
+                        Ok(packet) => packet,
+                        Err(error) => {
+                            eprintln!("audio-core: failed to encode audio packet: {error}");
+                            frame_offset += frames_this_packet;
+                            continue;
+                        }
+                    };
+
+                    let packet_to_send = if let Some(ref cipher) = cipher {
+                        match crate::crypto::encrypt_audio_packet(cipher, &packet) {
+                            Ok(enc) => enc,
                             Err(error) => {
-                                eprintln!("audio-core: failed to encode audio packet: {error}");
+                                eprintln!("audio-core: failed to encrypt audio packet: {error}");
                                 frame_offset += frames_this_packet;
                                 continue;
                             }
-                        };
-
-                        let packet_to_send = if let Some(ref cipher) = cipher {
-                            match crate::crypto::encrypt_audio_packet(cipher, &packet) {
-                                Ok(enc) => enc,
-                                Err(error) => {
-                                    eprintln!("audio-core: failed to encrypt audio packet: {error}");
-                                    frame_offset += frames_this_packet;
-                                    continue;
-                                }
-                            }
-                        } else {
-                            packet.clone()
-                        };
-
-                        for address in &destinations {
-                            if let Err(error) = socket.send_to(&packet_to_send, address) {
-                                eprintln!("audio-core: send to {address} failed: {error}");
-                            }
                         }
+                    } else {
+                        packet.clone()
+                    };
 
-                        if cipher.is_none() && packet.len() >= 32 {
-                            let maybe_fec = fec_encoder.push_audio_packet(
-                                stream_id,
-                                sequence_number,
-                                header.presentation_timestamp_ns,
-                                channels as u8,
-                                sample_rate,
-                                frames_this_packet as u16,
-                                &packet[32..],
-                            );
-                            if let Some(fec_packet) = maybe_fec {
-                                for address in &destinations {
-                                    let _ = socket.send_to(&fec_packet, address);
-                                }
-                            }
+                    for address in &destinations {
+                        if let Err(error) = socket.send_to(&packet_to_send, address) {
+                            eprintln!("audio-core: send to {address} failed: {error}");
                         }
-
-                        frame_offset += frames_this_packet;
                     }
+
+                    if cipher.is_none() && packet.len() >= 32 {
+                        let maybe_fec = fec_encoder.push_audio_packet(
+                            stream_id,
+                            sequence_number,
+                            header.presentation_timestamp_ns,
+                            channels as u8,
+                            sample_rate,
+                            frames_this_packet as u16,
+                            &packet[32..],
+                        );
+                        if let Some(fec_packet) = maybe_fec {
+                            for address in &destinations {
+                                let _ = socket.send_to(&fec_packet, address);
+                            }
+                        }
+                    }
+
+                    frame_offset += frames_this_packet;
                 }
-                continue;
             }
 
             if audio_queue.is_closed_and_empty() {
@@ -881,4 +940,43 @@ fn transmit_silence(
 
     println!("Publish: silent stream stopped.");
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn create_channel_groups_splits_48_channels() {
+        let labels: Vec<String> = (1..=48).map(|i| format!("Mic {i}")).collect();
+        let groups = create_channel_groups(100, "Studio Live", 48, &labels, 8);
+
+        // 48 channels / 8 per group = 6 groups
+        assert_eq!(groups.len(), 6);
+
+        // Check group 0
+        assert_eq!(groups[0].stream_id, 100);
+        assert_eq!(groups[0].stream_name, "Studio Live (Ch 1-8)");
+        assert_eq!(groups[0].channel_indices, vec![0, 1, 2, 3, 4, 5, 6, 7]);
+        assert_eq!(groups[0].channel_labels[0], "Mic 1");
+        assert_eq!(groups[0].channel_labels[7], "Mic 8");
+
+        // Check group 5 (final group, channels 41-48)
+        assert_eq!(groups[5].stream_id, 105);
+        assert_eq!(groups[5].stream_name, "Studio Live (Ch 41-48)");
+        assert_eq!(groups[5].channel_indices, (40..48).collect::<Vec<_>>());
+        assert_eq!(groups[5].channel_labels[7], "Mic 48");
+    }
+
+    #[test]
+    fn create_channel_groups_preserves_single_group_under_limit() {
+        let labels: Vec<String> = vec!["Left".to_string(), "Right".to_string()];
+        let groups = create_channel_groups(50, "Stereo Out", 2, &labels, 8);
+
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0].stream_id, 50);
+        assert_eq!(groups[0].stream_name, "Stereo Out");
+        assert_eq!(groups[0].channel_indices, vec![0, 1]);
+        assert_eq!(groups[0].channel_labels, labels);
+    }
 }

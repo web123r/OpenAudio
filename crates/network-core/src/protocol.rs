@@ -202,6 +202,45 @@ pub fn encode_float32_packet(
     Ok(packet)
 }
 
+pub fn encode_opus_packet(
+    header: &PacketHeader,
+    channel_count: u8,
+    sample_rate: u32,
+    samples_per_channel: u16,
+    opus_payload: &[u8],
+) -> Result<Vec<u8>, String> {
+    if channel_count != 1 && channel_count != 2 {
+        return Err(format!("unsupported opus channel count: {channel_count}"));
+    }
+
+    let sample_rate_code = sample_rate_to_code(sample_rate);
+    if sample_rate_code == 0 {
+        return Err(format!("unsupported sample rate: {sample_rate}"));
+    }
+
+    if opus_payload.is_empty() {
+        return Err("opus packet payload cannot be empty".to_string());
+    }
+
+    let packet_bytes = OPENAUDIO_HEADER_BYTES
+        .checked_add(opus_payload.len())
+        .ok_or_else(|| "Opus packet size overflow".to_string())?;
+
+    let mut packet = Vec::with_capacity(packet_bytes);
+    packet.extend_from_slice(&header.to_bytes());
+    packet.extend_from_slice(
+        &AudioPayloadHeader {
+            channel_count,
+            sample_format: SAMPLE_FORMAT_OPUS,
+            sample_rate_code,
+            samples_per_channel,
+        }
+        .to_bytes(),
+    );
+    packet.extend_from_slice(opus_payload);
+    Ok(packet)
+}
+
 pub fn parse_packet(buf: &[u8]) -> Option<ParsedPacket> {
     if buf.len() < 32 || &buf[0..4] != b"OAv1" || buf[4] != 1 || buf[5] != 0x01 {
         return None;
@@ -250,6 +289,14 @@ pub fn float32_payload<'a>(buf: &'a [u8], packet: &ParsedPacket) -> Option<&'a [
     let payload_len = samples.checked_mul(std::mem::size_of::<f32>())?;
     let payload_end = packet.payload_offset.checked_add(payload_len)?;
     buf.get(packet.payload_offset..payload_end)
+}
+
+/// Returns the raw Opus payload bytes from a parsed Opus packet.
+pub fn opus_payload<'a>(buf: &'a [u8], packet: &ParsedPacket) -> Option<&'a [u8]> {
+    if packet.sample_format != SAMPLE_FORMAT_OPUS || packet.payload_offset > buf.len() {
+        return None;
+    }
+    buf.get(packet.payload_offset..)
 }
 
 /// Decodes a complete interleaved little-endian Float32 audio packet.

@@ -40,6 +40,9 @@ mod web_gateway;
 pub mod web_publish;
 mod web_stream;
 
+pub mod opus;
+pub use opus::{OpusChannelDecoder, OpusChannelEncoder};
+
 pub mod asio;
 mod asio_subscribe;
 pub mod crypto;
@@ -81,10 +84,10 @@ pub use receive::receive_to_wav;
 // ── Network publishing ──────────────────────────────────────────────────
 
 pub use transmit::{
-    transmit, transmit_loopback_with_discovery, transmit_loopback_with_discovery_labeled,
-    transmit_loopback_with_discovery_labeled_encrypted, transmit_multi, transmit_with_control,
-    transmit_with_discovery, transmit_with_discovery_labeled,
-    transmit_with_discovery_labeled_encrypted,
+    create_channel_groups, transmit, transmit_loopback_with_discovery,
+    transmit_loopback_with_discovery_labeled, transmit_loopback_with_discovery_labeled_encrypted,
+    transmit_multi, transmit_with_control, transmit_with_discovery,
+    transmit_with_discovery_labeled, transmit_with_discovery_labeled_encrypted, ChannelGroup,
 };
 
 // ── Synthetic diagnostic publishing ─────────────────────────────────────

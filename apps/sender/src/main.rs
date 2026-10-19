@@ -2428,13 +2428,21 @@ fn render_asio_bandwidth_estimate(ui: &mut egui::Ui, selected_channels: usize) {
     let (color, message) = if selected_channels == 0 {
         (Theme::ACCENT_RED, "No channels selected".to_string())
     } else if selected_channels <= 2 {
-        (Theme::ACCENT_GREEN, "Low channel load".to_string())
+        (
+            Theme::ACCENT_GREEN,
+            "Low channel load • Demand-gated (0 Mbps when idle)".to_string(),
+        )
     } else if selected_channels <= 16 {
-        (Theme::ACCENT_ORANGE, "Moderate channel load".to_string())
+        (
+            Theme::ACCENT_ORANGE,
+            "Moderate channel load • Demand-gated (0 Mbps when idle)".to_string(),
+        )
     } else {
         (
             egui::Color32::YELLOW,
-            "High-bandwidth multichannel stream".to_string(),
+            format!(
+                "Multichannel load ({selected_channels} ch) • Demand-gating active: 0 Mbps when idle, only active subscribers consume bandwidth"
+            ),
         )
     };
 
