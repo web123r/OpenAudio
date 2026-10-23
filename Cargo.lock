@@ -391,7 +391,7 @@ checksum = "21e4227379beff4205943696e6c3e0cd809bacdf3f0edd6e3dd153e2269571a4"
 
 [[package]]
 name = "audio-core"
-version = "0.1.0"
+version = "0.3.1"
 dependencies = [
  "aes-gcm",
  "argon2",
@@ -2149,7 +2149,7 @@ dependencies = [
 
 [[package]]
 name = "network-core"
-version = "0.1.0"
+version = "0.3.1"
 dependencies = [
  "if-addrs",
  "serde",
@@ -2584,7 +2584,7 @@ checksum = "c08d65885ee38876c4f86fa503fb49d7b507c2b62552df7c70b2fce627e06381"
 
 [[package]]
 name = "openaudio-gui"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "audio-core",
  "ctrlc",
@@ -2599,7 +2599,7 @@ dependencies = [
 
 [[package]]
 name = "openaudio-plugin"
-version = "0.1.0"
+version = "0.3.1"
 dependencies = [
  "audio-core",
  "crossbeam",
@@ -2904,7 +2904,7 @@ checksum = "20675572f6f24e9e76ef639bc5552774ed45f1c30e2951e1e99c59888861c539"
 
 [[package]]
 name = "receiver"
-version = "0.1.0"
+version = "0.3.1"
 dependencies = [
  "audio-core",
  "network-core",

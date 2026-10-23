@@ -2,7 +2,7 @@
 
 All notable changes to the OpenAudio project will be documented in this file.
 
-## [0.3.0] - 2026-10-16
+## [0.3.1] - 2026-10-23
 
 ### 🚀 Highlights & New Features
 
@@ -28,6 +28,16 @@ All notable changes to the OpenAudio project will be documented in this file.
 #### 🚀 **Headless CLI Publishing Mode**
 * Added `receiver publish` subcommand to `apps/receiver` for running lightweight audio publisher nodes on headless machines, Linux servers, or Raspberry Pis.
 * Supports physical input device selection (`--device`), listing audio devices (`--list-devices`), Opus or PCM compression (`--codec opus`), bitrate configuration, AES-256-GCM encryption, and concurrent archival recording.
+
+#### 🎧 **Headless Receiver CLI Channel Selection & Dynamic Downmixing**
+* Added `--channels <1,2,...>` option to `apps/receiver` for extracting and listening to specific channel subsets from high-channel streams (e.g. listening to channels 1 & 2 from a 48-channel broadcast stream).
+* Added automatic dynamic downmixing and channel remapping (`remap_frame_into`) so incoming streams with any channel layout play seamlessly through default output hardware without channel count mismatch errors.
+
+#### 🍏 **macOS Real-Time Thread Priority via `mach_timebase_info`**
+* Replaced zeroed `thread_time_constraint_policy` parameters in `platform.rs` with accurate Mach absolute time unit conversions queried dynamically via `mach_timebase_info`.
+* Enforces 10ms real-time scheduling periods with 5ms computation slices and 8ms deadline constraints on CoreAudio threads.
+
+## [0.3.0] - 2026-10-18
 
 #### 🎚️ **Demand-Based Gating & Channel Grouping**
 * Implemented demand-based network gating in `transmit.rs` and `asio.rs`: publishers automatically bypass sample encoding and UDP transmissions when no active subscribers are connected, reducing idle CPU and network consumption to zero.

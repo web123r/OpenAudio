@@ -598,6 +598,7 @@ fn run_publish(options: PublishOptions) -> Result<(), String> {
     }
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 fn validate_output_channel_count(input_channels: u8, output_channels: usize) -> Result<(), String> {
     if input_channels as usize != output_channels {
         return Err(format!(

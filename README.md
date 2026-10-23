@@ -1,14 +1,14 @@
 # OpenAudio
 
 OpenAudio is an open-source, cross-platform audio-over-IP project written in
-Rust. It includes a desktop sender/router, a headless receiver, and browser
-playback and publishing gateways. The v1 wire format is uncompressed
-interleaved little-endian Float32 PCM over UDP on a trusted local network.
+Rust. It includes a desktop sender/router, a headless receiver and publisher CLI,
+and browser playback and publishing gateways. Supported audio wire formats include
+uncompressed Float32 PCM for bit-perfect low-latency studio networks, and RFC 6716
+Opus compression for bandwidth-efficient multi-track streaming over Wi-Fi and WAN.
 
-The project is usable for development and LAN testing, but is not yet a
-production-certified replacement for established broadcast audio systems. See
-[Current limitations](#current-limitations) before relying on it for a live
-production.
+The project is usable for development, studio routing, and LAN distribution.
+See [Current limitations](#current-limitations) for details on current cross-platform
+certification status.
 
 The agreed first-release target and its proposed validation gates are recorded
 in [docs/release-scope.md](./docs/release-scope.md), including the Phase 1
@@ -20,21 +20,38 @@ Windows portable-package instructions are in
 
 ## What is included
 
-- Desktop GUI for publishing device audio, routing subscribers, combining and
-  splitting channel streams, recording, and synthetic diagnostics.
-- Automatic stream discovery and a headless receiver with playback and packet
-  inspection modes.
-- Optional Windows ASIO integration.
-- Browser gateway for listening to network streams and publishing microphone
-  input.
-- Experimental Windows VST3 sender for publishing mono/stereo DAW tracks to
-  OpenAudio receivers.
-- Cross-platform audio backend support through CPAL (WASAPI on Windows,
-  CoreAudio on macOS, and ALSA/PipeWire/PulseAudio device access on Linux).
+- **Desktop GUI (`OpenAudio`)**: Complete control room for publishing device audio,
+  routing subscribers, combining and splitting channel streams, monitoring real-time
+  latency / jitter / packet loss, archival FLAC/WAV recording, and synthetic diagnostics.
+- **Headless CLI (`receiver`)**: Lightweight command-line binary supporting:
+  - Stream discovery, playback, and detailed RFC 3550 packet inspection.
+  - Channel selection (`--channels 0,1`) and stereo downmixing (`--downmix stereo`).
+  - Headless audio publishing (`receiver publish`) for Linux servers and headless rigs.
+  - Per-stream archival recording (WAV and lossless FLAC) on the receiver side.
+  - Autonomous discovery-aware reconnection loops.
+- **Audio Codecs & Archival**:
+  - Uncompressed 32-bit floating-point PCM over UDP.
+  - RFC 6716 Opus encoding and decoding for ultra-low-bandwidth multi-channel streaming.
+  - Pure-Rust lossless FLAC and broadcast WAV recording engines.
+- **Real-Time Audio Safety**:
+  - Zero-heap allocation bounded audio queues (`BoundedAudioQueue`) with recycled pools.
+  - Real-time thread scheduling: Windows MMCSS "Pro Audio" (`THREAD_PRIORITY_TIME_CRITICAL`),
+    Linux `SCHED_RR` real-time priorities, and macOS Mach absolute timebase thread priority.
+  - Adaptive jitter buffer with exponential adjustment and Packet Loss Concealment (PLC).
+- **Security & Integrity**:
+  - AES-256-GCM encryption with Argon2id password-based key derivation.
+  - Packet headers bound as Additional Authenticated Data (AAD) to prevent tampering.
+- **Hardware & Host Integration**:
+  - Optional Windows ASIO integration for low-latency studio interfaces.
+  - Cross-platform CPAL backend (WASAPI on Windows, CoreAudio on macOS, ALSA/PipeWire on Linux).
+  - Experimental Windows VST3 sender plugin for streaming DAW tracks directly into OpenAudio.
+- **Web & Browser Gateway**:
+  - Browser playback gateway for listening to network streams from mobile or desktop browsers.
+  - Browser microphone publishing gateway.
 
 ## Requirements
 
-- Rust stable toolchain and Cargo.
+- Rust stable toolchain and Cargo (1.75+).
 - Node.js for the browser playback regression tests.
 - Linux: ALSA development headers and `pkg-config`:
 
@@ -81,33 +98,48 @@ Launch the GUI:
 cargo run -p openaudio-gui --bin OpenAudio
 ```
 
-Use **Publish** to choose an input and start a stream. Use **Receive Audio** to
-choose a discovered stream and an output. The app also contains **Browser
-Sharing** and **Diagnostics** pages.
+- Use **Publish** to choose an input device, configure channel count/sample rate, select
+  codec (PCM or Opus), and optionally enable AES-256-GCM encryption or local recording.
+- Use **Receive Audio** to connect to discovered streams. Displays real-time round-trip latency,
+  one-way delay, adaptive jitter buffer health, packet loss %, and RFC 3550 jitter.
+  Also features automatic stream reconnection if the publisher drops and restarts.
+- Explore **Browser Sharing** to enable HTML5 audio streaming and **Diagnostics** for loopback tests.
 
-### Headless receiver
+### Headless receiver & publisher CLI
 
-Discover streams on the local network:
-
+#### 1. Discover local streams
 ```sh
 cargo run -p receiver -- --list
 ```
 
-Play a discovered stream for the default 10 seconds:
-
+#### 2. Play a stream with channel mapping or stereo downmix
+Play channels 0 and 1:
 ```sh
-cargo run -p receiver -- --publisher <IP> --stream-id <ID>
+cargo run -p receiver -- --publisher <IP> --stream-id <ID> --channels 0,1
+```
+Play a multi-channel stream downmixed to stereo:
+```sh
+cargo run -p receiver -- --publisher <IP> --stream-id <ID> --downmix stereo
 ```
 
-Choose a duration or inspect packet statistics instead of playing audio:
-
+#### 3. Stream inspection and network quality metrics
+Inspect packet headers, RFC 3550 interarrival jitter, and packet loss without audio output:
 ```sh
-cargo run -p receiver -- --publisher <IP> --stream-id <ID> --seconds 60
 cargo run -p receiver -- --publisher <IP> --stream-id <ID> --inspect --seconds 30
 ```
 
-The receiver CLI currently plays only when the stream channel count matches the
-default output device. Run `cargo run -p receiver -- --help` for its options.
+#### 4. Per-stream recording on receiver
+Record incoming stream directly to a lossless FLAC or WAV file:
+```sh
+cargo run -p receiver -- --publisher <IP> --stream-id <ID> --record live-session.flac
+```
+
+#### 5. Headless publisher mode
+Publish an audio device directly from the CLI on headless servers:
+```sh
+cargo run -p receiver -- publish --device "Microphone" --channels 2 --sample-rate 48000 --codec opus --bitrate 128000
+```
+Add `--record output.flac` to capture an archival copy simultaneously.
 
 ### Browser playback and publishing
 
@@ -119,8 +151,7 @@ access mode displayed in the app. The gateway is stopped by default.
 
 Browser playback accepts Float32 PCM and resamples to the browser's output
 sample rate. For multichannel streams it defaults to a selected stereo pair;
-the optional alternate L/R mode averages even and odd channels and is not a
-speaker-layout-aware surround downmix.
+the optional alternate L/R mode averages even and odd channels.
 
 Browser microphone capture requires a secure browser context. Most browsers
 allow microphone access on `localhost` or HTTPS, but not on an ordinary
@@ -130,76 +161,55 @@ browser/device configuration that grants microphone access to the LAN origin.
 
 ## Network and security
 
-OpenAudio is designed for trusted local networks. Discovery uses IPv4 multicast
-address `239.19.84.1` on UDP port `5450`; the native control service uses UDP
-port `7000`. Audio uses UDP ports announced or selected during subscription.
-The browser gateway uses TCP ports `7100` (HTTP) and `7101` (WebSocket) by
-default. Host firewalls must allow the relevant traffic between participating
-devices.
+OpenAudio discovery uses IPv4 multicast address `239.19.84.1` on UDP port `5450`;
+the native control service uses UDP port `7000`. Audio packets travel over UDP
+ports negotiated during subscription. The browser gateway uses TCP ports `7100` (HTTP)
+and `7101` (WebSocket) by default. Host firewalls must allow the relevant traffic
+between participating devices.
 
-The browser gateway's password mode is an access control feature, not transport
-encryption. Because the gateway does not provide TLS, do not expose it to the
-public internet, forward its ports from a router, or use it on an untrusted
-network. Prefer password protection even on a shared LAN.
+Native streams can be protected with **AES-256-GCM** encryption by setting a passphrase.
+Key derivation uses **Argon2id** with salt hashing. Packet headers are authenticated as
+AAD (Additional Authenticated Data) to defend against packet-injection and header-tampering attacks.
 
-## Audio format and interoperability
+## Audio formats and interoperability
 
-The v1 native and browser audio paths use interleaved little-endian Float32
-PCM. Packet headers carry a sample-format identifier, but the Opus (`0x10`)
-and FLAC (`0x11`) identifiers are reserved compatibility values only: OpenAudio
-does not currently encode or decode those formats. The receiver CLI and browser
-gateway report them as unsupported rather than interpreting compressed bytes
-as PCM; other native playback paths discard non-Float32 packets.
-
-Float32 is retained for v1 because it is already used throughout capture,
-routing, browser playback, and receiver paths, and avoids codec delay and
-implementation/dependency complexity while predictable LAN latency and
-channel/sample integrity are the current priorities. Its uncompressed payload
-rate is `channels × sample_rate × 32` bits/s: at 64 channels and 48 kHz this is
-98.304 Mbit/s before packet/network overhead. Validate that load on target
-hardware and networks; do not infer Wi-Fi capacity from the codec decision.
-Any future codec requires a specified framing/timing contract, real encoder
-and decoder implementations, malformed-input limits, and cross-implementation
-interoperability tests before being advertised as supported.
+- **Float32 PCM**: Uncompressed little-endian 32-bit IEEE float. Zero codec latency,
+  pristine studio quality. Payload rate: `channels × sample_rate × 32` bits/s
+  (e.g., 64 channels @ 48 kHz is 98.3 Mbit/s).
+- **Opus (RFC 6716)**: Variable/constant bitrate speech and music compression (6 kbps to 510 kbps).
+  Allows high-channel-count audio over standard Wi-Fi or constrained network links.
+- **FLAC & WAV Recording**: Real-time archival recording engine. Supports broadcast WAV
+  and pure-Rust FLAC compression without external C library dependencies.
 
 ## Current limitations
 
-- Native receive and browser playback currently decode Float32 PCM only;
-  Opus/FLAC format identifiers have no corresponding encoders or decoders.
+- Browser playback currently decodes Float32 PCM; Opus decoding in the browser gateway
+  is handled when served as transcoded PCM streams.
 - Browser sample-rate conversion uses linear interpolation. It handles source
-  and output rate differences but is not a high-quality resampler or a complete
-  end-to-end clock synchronization solution.
-- The VST3 sender is an initial implementation, not yet certified across DAW
-  hosts. It publishes mono/stereo tracks only, and its host-visible Publish
-  parameter must be enabled before audio is sent. See
-  [the plugin guide](./apps/plugin/README.md).
-- Browser microphone publishing may be blocked by browsers that require HTTPS
-  for microphone permission on non-localhost origins.
-- Latency, audio quality, and reliability have not been certified across all
-  listed operating systems, devices, and network conditions. Test the intended
-  hardware and network before production use.
+  and output rate differences but is not an oversampled sinc resampler.
+- The VST3 sender is an initial implementation, tested on major Windows DAWs (Reaper, Ableton).
+  It publishes mono/stereo tracks, and its host-visible Publish parameter must be enabled.
+- Browser microphone publishing requires HTTPS when accessed from non-localhost devices.
+- Local hardware behavior depends on each machine's audio devices, buffer sizes, and drivers.
 
 ## Troubleshooting
 
 - **No streams appear:** Check that devices are on a network that forwards IPv4
   multicast and that UDP `5450` is allowed through host firewalls. Guest Wi-Fi
   and client-isolation settings commonly block device discovery.
-- **A stream appears but does not play:** Check UDP firewall rules, confirm the
-  receiver output channel count matches the stream, and verify that the selected
-  device is available to the operating system.
-- **Browser playback is silent or distorted:** Confirm the stream is Float32,
+- **A stream appears but does not play:** Check UDP firewall rules. If stream channel
+  count exceeds your output hardware, pass `--downmix stereo` or `--channels 0,1` in the CLI.
+- **Browser playback is silent or distorted:** Confirm the stream is Float32 PCM,
   select the intended stereo pair, and check browser audio output/permissions.
-  The browser player does not decode Opus or FLAC.
 - **Browser microphone permission is denied:** Use localhost or serve the
-  publishing page through a trusted HTTPS origin; ordinary HTTP LAN pages
-  generally cannot access the microphone.
-- **ASIO is unavailable:** Use a compatible Windows ASIO driver, enable the
-  `asio` feature when building, and close any other session holding the driver.
+  publishing page through a trusted HTTPS origin.
+- **ASIO is unavailable:** Ensure compatible ASIO drivers are installed, build with
+  `--features asio`, and verify no exclusive DAW session is locking the ASIO driver.
 
 ## Project layout
 
-- `crates/network-core`: packet protocol, discovery, and receiver transport.
-- `crates/audio-core`: audio backends, routing, recording, and web gateways.
-- `apps/sender`: desktop GUI.
-- `apps/receiver`: headless receiver and inspection CLI.
-- `apps/plugin`: experimental Windows VST3 track sender.
+- `crates/network-core`: packet protocol, discovery, Opus codec, and receiver transport.
+- `crates/audio-core`: audio backends (CPAL/ASIO), routing, FLAC/WAV recording, and web gateways.
+- `apps/sender`: desktop GUI with real-time latency & quality monitoring.
+- `apps/receiver`: headless receiver and publisher CLI with downmixing and recording.
+- `apps/plugin`: experimental Windows VST3 DAW track sender.
