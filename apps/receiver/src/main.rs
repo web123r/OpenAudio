@@ -14,6 +14,8 @@ struct Options {
     stream_id: Option<u32>,
     receive_port: u16,
     seconds: u64,
+    channels: Option<Vec<usize>>,
+    downmix: bool,
 }
 
 fn main() -> Result<(), String> {
@@ -65,6 +67,7 @@ fn main() -> Result<(), String> {
             stream_id,
             options.receive_port,
             options.seconds,
+            options.channels.as_deref(),
         )?;
     }
     Ok(())
@@ -205,12 +208,60 @@ fn inspect_stream(
     Ok((packets, dropped))
 }
 
+fn map_or_downmix_pcm(
+    pcm: &[f32],
+    input_channels: usize,
+    output_channels: usize,
+    channel_selection: Option<&[usize]>,
+) -> Vec<f32> {
+    if input_channels == 0 || output_channels == 0 {
+        return Vec::new();
+    }
+    let frames = pcm.len() / input_channels;
+    if frames == 0 {
+        return Vec::new();
+    }
+
+    if let Some(sel) = channel_selection {
+        let sel_count = sel.len();
+        let mut mapped = Vec::with_capacity(frames * output_channels);
+        let mut frame_buf = vec![0.0f32; sel_count];
+        let mut out_frame = vec![0.0f32; output_channels];
+
+        for f in 0..frames {
+            let offset = f * input_channels;
+            for (out_idx, &in_ch) in sel.iter().enumerate() {
+                frame_buf[out_idx] = if in_ch < input_channels {
+                    pcm[offset + in_ch]
+                } else {
+                    0.0
+                };
+            }
+            audio_core::remap_frame_into(&frame_buf, &mut out_frame);
+            mapped.extend_from_slice(&out_frame);
+        }
+        mapped
+    } else if input_channels == output_channels {
+        pcm.to_vec()
+    } else {
+        let mut mapped = Vec::with_capacity(frames * output_channels);
+        let mut out_frame = vec![0.0f32; output_channels];
+        for f in 0..frames {
+            let in_frame = &pcm[f * input_channels..(f + 1) * input_channels];
+            audio_core::remap_frame_into(in_frame, &mut out_frame);
+            mapped.extend_from_slice(&out_frame);
+        }
+        mapped
+    }
+}
+
 fn play_stream(
     publisher: &str,
     control_port: u16,
     stream_id: u32,
     receive_port: u16,
     seconds: u64,
+    channel_selection: Option<&[usize]>,
 ) -> Result<(), String> {
     use audio_core::backend::get_backend;
     use audio_core::{ensure_realtime_audio_thread, StreamingLinearResampler};
@@ -223,10 +274,27 @@ fn play_stream(
     );
 
     let mut receiver = StreamReceiver::new(publisher, control_port, stream_id, receive_port)?;
+
+    let mut opus_decoder: Option<audio_core::OpusChannelDecoder> = None;
+    receiver.set_custom_decoder(move |packet, payload| {
+        if packet.sample_format == network_core::protocol::SAMPLE_FORMAT_OPUS {
+            if opus_decoder.is_none() {
+                opus_decoder = audio_core::OpusChannelDecoder::new(packet.sample_rate, packet.channel_count as usize).ok();
+            }
+            if let Some(ref mut dec) = opus_decoder {
+                dec.decode_packet(payload)
+            } else {
+                Err("failed to initialize Opus decoder".to_string())
+            }
+        } else {
+            Err(format!("unsupported audio format 0x{:02x}", packet.sample_format))
+        }
+    });
+
     let deadline = Instant::now() + Duration::from_secs(seconds);
 
     let backend = get_backend();
-    let (_device_label, output_config) = backend.get_output_config(None)?;
+    let (device_label, output_config) = backend.get_output_config(None)?;
     let output_sample_rate = output_config.sample_rate;
     let output_channels = output_config.channels as usize;
     if output_channels == 0 {
@@ -261,19 +329,24 @@ fn play_stream(
                 }
 
                 if let Some((channels, _)) = format {
+                    let remapped = map_or_downmix_pcm(
+                        &pcm,
+                        channels as usize,
+                        output_channels,
+                        channel_selection,
+                    );
                     let to_push = resampler
                         .as_mut()
                         .ok_or_else(|| "stream resampler was not initialized".to_string())?
-                        .process(&pcm)?;
+                        .process(&remapped)?;
 
                     let mut jitter_buf = buffer.lock().unwrap();
                     jitter_buf.extend(to_push);
 
                     // Keep the queue bounded without dropping only part of
                     // an interleaved audio frame.
-                    let channel_count = channels as usize;
                     let max_frames = (output_sample_rate as f64 * 0.2) as usize;
-                    trim_interleaved_queue(&mut jitter_buf, max_frames, channel_count);
+                    trim_interleaved_queue(&mut jitter_buf, max_frames, output_channels);
                 }
             }
             Some(ReceiveEvent::Dropped(count)) => {
@@ -288,14 +361,19 @@ fn play_stream(
                     };
                     let frames = (count as usize) * frames_per_packet;
                     let concealed = plc_inst.synthesize_concealment(frames);
+                    let in_channels = format.map(|f| f.0 as usize).unwrap_or(output_channels);
+                    let remapped = map_or_downmix_pcm(
+                        &concealed,
+                        in_channels,
+                        output_channels,
+                        channel_selection,
+                    );
                     if let Some(resamp) = resampler.as_mut() {
-                        if let Ok(to_push) = resamp.process(&concealed) {
+                        if let Ok(to_push) = resamp.process(&remapped) {
                             let mut jitter_buf = buffer.lock().unwrap();
                             jitter_buf.extend(to_push);
-                            if let Some((channels, _)) = format {
-                                let max_frames = (output_sample_rate as f64 * 0.2) as usize;
-                                trim_interleaved_queue(&mut jitter_buf, max_frames, channels as usize);
-                            }
+                            let max_frames = (output_sample_rate as f64 * 0.2) as usize;
+                            trim_interleaved_queue(&mut jitter_buf, max_frames, output_channels);
                         }
                     }
                 }
@@ -304,12 +382,16 @@ fn play_stream(
                 channels,
                 sample_rate,
             }) => {
-                validate_output_channel_count(channels, output_channels)?;
+                if channels as usize != output_channels {
+                    println!(
+                        "Receiver: incoming {channels}ch stream -> {output_channels}ch device '{device_label}' (active channel remapping/downmix)"
+                    );
+                }
 
                 format = Some((channels, sample_rate));
                 plc = Some(network_core::plc::PacketLossConcealer::new(channels as usize));
                 resampler = Some(StreamingLinearResampler::new(
-                    channels as usize,
+                    output_channels,
                     sample_rate,
                     output_sample_rate,
                 )?);
@@ -391,6 +473,8 @@ fn parse_options() -> Result<Options, String> {
         stream_id: None,
         receive_port: 7050,
         seconds: 10,
+        channels: None,
+        downmix: false,
     };
     let mut args = env::args().skip(1);
 
@@ -398,6 +482,26 @@ fn parse_options() -> Result<Options, String> {
         match argument.as_str() {
             "--list" => options.list = true,
             "--inspect" => options.inspect = true,
+            "--downmix" => options.downmix = true,
+            "--channels" => {
+                let val = next_value(&mut args, "--channels")?;
+                let indices = val
+                    .split(',')
+                    .map(|s| {
+                        s.trim()
+                            .parse::<usize>()
+                            .map_err(|_| "--channels must be comma-separated integers, e.g. 1,2".to_string())
+                            .and_then(|idx| {
+                                if idx > 0 {
+                                    Ok(idx - 1)
+                                } else {
+                                    Err("channel numbers must be 1-based (>= 1)".to_string())
+                                }
+                            })
+                    })
+                    .collect::<Result<Vec<_>, _>>()?;
+                options.channels = Some(indices);
+            }
             "--publisher" => options.publisher = Some(next_value(&mut args, "--publisher")?),
             "--stream-id" => {
                 options.stream_id = Some(
@@ -421,7 +525,7 @@ fn parse_options() -> Result<Options, String> {
                     "OpenAudio receiver\n\n\
                      Usage:\n\
                        receiver --list\n\
-                       receiver --publisher <IP> --stream-id <ID> [--port <UDP>] [--seconds <N>]\n\
+                       receiver --publisher <IP> --stream-id <ID> [--port <UDP>] [--seconds <N>] [--channels <CH1,CH2,...>] [--downmix]\n\
                        receiver --publisher <IP> --stream-id <ID> --inspect [--port <UDP>] [--seconds <N>]\n\n\
                      Options:\n\
                        --list              Discover OpenAudio streams\n\
@@ -430,6 +534,8 @@ fn parse_options() -> Result<Options, String> {
                        --inspect           Count packets and sequence gaps without playback\n\
                        --port <UDP>        Local receive port (default: 7050)\n\
                        --seconds <N>       Run duration (default: 10)\n\
+                       --channels <list>   Select 1-based channel subset (e.g. --channels 1,2)\n\
+                       --downmix           Downmix multichannel stream to match output device\n\
                        --help, -h          Show this help"
                 );
                 std::process::exit(0);
@@ -503,6 +609,26 @@ mod tests {
     }
 
     #[test]
+    fn test_map_or_downmix_pcm_multichannel_to_stereo() {
+        // 4 frames of 4-channel audio
+        let in_pcm = vec![
+            1.0, 0.5, 0.2, 0.8, // frame 0
+            0.4, 0.6, 0.1, 0.9, // frame 1
+            0.0, 0.0, 1.0, 1.0, // frame 2
+            0.5, 0.5, 0.5, 0.5, // frame 3
+        ];
+        let downmixed = map_or_downmix_pcm(&in_pcm, 4, 2, None);
+        assert_eq!(downmixed.len(), 4 * 2);
+
+        // Test channel selection: selecting channels 1 and 3 (0-based: 0, 2)
+        let selected = map_or_downmix_pcm(&in_pcm, 4, 2, Some(&[0, 2]));
+        assert_eq!(selected.len(), 4 * 2);
+        // frame 0: ch0 = 1.0, ch2 = 0.2
+        assert!((selected[0] - 1.0).abs() < 1e-4);
+        assert!((selected[1] - 0.2).abs() < 1e-4);
+    }
+
+    #[test]
     fn test_inspect_stream_integration() {
         let control_socket = UdpSocket::bind("127.0.0.1:0").unwrap();
         let control_port = control_socket.local_addr().unwrap().port();
@@ -551,7 +677,7 @@ mod tests {
 
         // Leave room for the reconnect timeout and slower CI scheduling.
         let (packets, dropped) =
-            inspect_stream("127.0.0.1", control_port, stream_id, receive_port, 6).unwrap();
+            inspect_stream("127.0.0.1", control_port, stream_id, receive_port, 7).unwrap();
 
         assert_eq!(packets, 4, "Should have received exactly 4 packets");
         assert_eq!(

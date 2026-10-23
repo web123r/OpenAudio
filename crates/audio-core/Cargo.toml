@@ -9,7 +9,7 @@ name = "audio_core"
 path = "src/lib.rs"
 
 [features]
-default = []
+default = ["opus"]
 # Enable this feature when the Steinberg ASIO SDK is available on the build machine.
 # Set the CPAL_ASIO_DIR environment variable to the SDK root before building:
 #   $env:CPAL_ASIO_DIR = "C:\path\to\asio_sdk"

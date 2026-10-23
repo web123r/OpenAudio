@@ -131,26 +131,47 @@ fn prepare_realtime_audio_thread_macos() {
     };
     use std::io::Error;
 
+    #[repr(C)]
+    struct MachTimebaseInfo {
+        numer: u32,
+        denom: u32,
+    }
+
+    extern "C" {
+        fn mach_timebase_info(info: *mut MachTimebaseInfo) -> i32;
+    }
+
     unsafe {
         let thread = mach_thread_self();
 
-        // Values are typically hardware/clock dependent. We use common
-        // conservative hints for audio time constraints.
-        // HZ = sample rate (e.g. 48000), buffer = 512 frames.
-        // Conversion requires knowing the Mach absolute timebase, but for
-        // a simple boost, approximate values or 0s are often accepted,
-        // or we use a general high priority.
-
-        let mut policy = thread_time_constraint_policy {
-            period: 0,
-            computation: 0,
-            constraint: 0,
-            preemptible: 1,
+        let mut timebase = MachTimebaseInfo { numer: 0, denom: 0 };
+        let (period, computation, constraint) = if mach_timebase_info(&mut timebase) == 0
+            && timebase.numer > 0
+            && timebase.denom > 0
+        {
+            // Convert nanoseconds to Mach absolute time units:
+            // mach_units = (ns * denom) / numer
+            let ns_to_mach = |ns: u64| -> u32 {
+                let units = (ns as u128 * timebase.denom as u128) / (timebase.numer as u128);
+                units.min(u32::MAX as u128) as u32
+            };
+            // 10 ms nominal audio cycle (~480 frames @ 48 kHz), 5 ms computation slice, 8 ms deadline constraint
+            (
+                ns_to_mach(10_000_000),
+                ns_to_mach(5_000_000),
+                ns_to_mach(8_000_000),
+            )
+        } else {
+            // Fallback default cycles if timebase query fails
+            (10_000_000, 5_000_000, 8_000_000)
         };
 
-        // Note: For production macOS audio, we should query mach_timebase_info
-        // to set these accurately based on buffer sizes, but this opts us into
-        // the realtime band safely for now.
+        let mut policy = thread_time_constraint_policy {
+            period,
+            computation,
+            constraint,
+            preemptible: 1,
+        };
 
         let result = thread_policy_set(
             thread,

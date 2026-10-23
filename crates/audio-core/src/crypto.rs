@@ -22,6 +22,13 @@ impl StreamCipher {
         Self::new(&key)
     }
 
+    /// Derives a 256-bit key from a user-provided passphrase and credential-specific salt.
+    /// This prevents precomputation / rainbow table attacks across different sessions or streams.
+    pub fn from_passphrase_with_salt(passphrase: &str, salt: &[u8]) -> Self {
+        let key = derive_key_from_passphrase_with_salt(passphrase, salt);
+        Self::new(&key)
+    }
+
     pub fn encrypt(&self, nonce_bytes: &[u8; 12], plaintext: &[u8]) -> Result<Vec<u8>, String> {
         let nonce = Nonce::from_slice(nonce_bytes);
         self.cipher
@@ -59,14 +66,26 @@ impl StreamCipher {
     }
 }
 
-/// Derives a 32-byte key from a user passphrase using Argon2id with OpenAudio domain salt.
+/// Default OpenAudio domain separation salt.
+pub const DEFAULT_ARGON2_DOMAIN_SALT: &[u8] = b"OpenAudio-V1-Argon2id-Salt";
+
+/// Derives a 32-byte key from a user passphrase using Argon2id with default domain salt.
 pub fn derive_key_from_passphrase(passphrase: &str) -> [u8; 32] {
+    derive_key_from_passphrase_with_salt(passphrase, DEFAULT_ARGON2_DOMAIN_SALT)
+}
+
+/// Derives a 32-byte key from a user passphrase using Argon2id with a custom per-stream/per-user salt.
+pub fn derive_key_from_passphrase_with_salt(passphrase: &str, salt: &[u8]) -> [u8; 32] {
+    let effective_salt = if salt.is_empty() {
+        DEFAULT_ARGON2_DOMAIN_SALT
+    } else {
+        salt
+    };
     let mut key = [0u8; 32];
-    let salt = b"OpenAudio-V1-Argon2id-Salt";
     let argon2 = Argon2::default();
-    if argon2.hash_password_into(passphrase.as_bytes(), salt, &mut key).is_err() {
+    if argon2.hash_password_into(passphrase.as_bytes(), effective_salt, &mut key).is_err() {
         let mut hasher = sha2::Sha256::new();
-        sha2::Digest::update(&mut hasher, salt);
+        sha2::Digest::update(&mut hasher, effective_salt);
         sha2::Digest::update(&mut hasher, passphrase.as_bytes());
         let result = sha2::Digest::finalize(hasher);
         key.copy_from_slice(&result);
@@ -185,6 +204,13 @@ mod tests {
         let parsed = network_core::protocol::parse_packet(&decrypted).expect("parse decrypted packet");
         let decoded = network_core::protocol::decode_float32(&decrypted, &parsed).expect("decode float32");
         assert_eq!(decoded, samples);
+    }
+
+    #[test]
+    fn test_custom_salt_derives_distinct_key() {
+        let key1 = derive_key_from_passphrase("StudioPass");
+        let key2 = derive_key_from_passphrase_with_salt("StudioPass", b"custom-salt-12345");
+        assert_ne!(key1, key2, "Custom salt must produce distinct key for same passphrase");
     }
 
     #[test]

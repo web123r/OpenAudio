@@ -1,5 +1,13 @@
-/// WebRTC Audio Session manager for ultra-low latency (<10ms) browser streaming.
-/// Facilitates peer connections, ICE candidate exchange, and RTC track packetization.
+//! WebRTC Audio Gateway (Experimental / In Development)
+//!
+//! Note: Full WebRTC ICE/DTLS/SRTP media transport is deferred for future releases.
+//! For live production browser audio, OpenAudio uses the WebSocket/HTTP audio gateway (`web_gateway.rs`),
+//! which provides responsive sub-20ms streaming without third-party WebRTC native binary dependencies.
+//!
+//! This module provides the SDP offer/answer scaffolding for experimental signaling.
+
+/// WebRTC Audio Session manager for experimental browser streaming.
+/// Facilitates SDP offer/answer generation for browser peer connection handshakes.
 #[derive(Debug, Clone)]
 pub struct WebRtcAudioConfig {
     pub ice_servers: Vec<String>,

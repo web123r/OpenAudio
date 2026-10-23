@@ -47,6 +47,13 @@ impl PublisherDestinations {
     }
 }
 
+/// Supported network payload codecs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PayloadCodec {
+    Float32,
+    Opus { bitrate_kbps: i32 },
+}
+
 /// Represents a grouped subset of audio channels bundled into a single network stream.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ChannelGroup {
@@ -343,6 +350,32 @@ pub fn transmit_with_discovery_labeled_encrypted(
     keep_running: Arc<AtomicBool>,
     cipher: Option<Arc<crate::crypto::StreamCipher>>,
 ) -> Result<(), String> {
+    transmit_with_discovery_labeled_encrypted_codec(
+        node_name,
+        stream_name,
+        stream_id,
+        device_name,
+        subscribers_by_stream,
+        record_path,
+        channel_labels,
+        keep_running,
+        cipher,
+        PayloadCodec::Float32,
+    )
+}
+
+pub fn transmit_with_discovery_labeled_encrypted_codec(
+    node_name: String,
+    stream_name: String,
+    stream_id: u32,
+    device_name: Option<String>,
+    subscribers_by_stream: SubscriberRegistry,
+    record_path: Option<String>,
+    channel_labels: Option<Vec<String>>,
+    keep_running: Arc<AtomicBool>,
+    cipher: Option<Arc<crate::crypto::StreamCipher>>,
+    codec: PayloadCodec,
+) -> Result<(), String> {
     ensure_realtime_audio_thread();
 
     if is_skip(&device_name) {
@@ -450,7 +483,7 @@ pub fn transmit_with_discovery_labeled_encrypted(
         .play()
         .map_err(|error| format!("failed to start stream: {error}"))?;
 
-    let publisher_worker = spawn_capture_publisher(
+    let publisher_worker = spawn_capture_publisher_with_codec(
         audio_queue.clone(),
         PublisherDestinations::Discovery(subscribers_by_stream),
         stream_id,
@@ -461,6 +494,7 @@ pub fn transmit_with_discovery_labeled_encrypted(
         writer.clone(),
         Arc::new(AtomicU32::new(0)),
         cipher,
+        codec,
     );
 
     while keep_running.load(Ordering::Relaxed) {
@@ -653,7 +687,7 @@ pub fn transmit_loopback_with_discovery_labeled_encrypted(
         .play()
         .map_err(|error| format!("failed to start loopback stream: {error}"))?;
 
-    let publisher_worker = spawn_capture_publisher(
+    let publisher_worker = spawn_capture_publisher_with_codec(
         audio_queue.clone(),
         PublisherDestinations::Discovery(subscribers_by_stream),
         stream_id,
@@ -664,6 +698,7 @@ pub fn transmit_loopback_with_discovery_labeled_encrypted(
         writer.clone(),
         Arc::new(AtomicU32::new(0)),
         cipher,
+        PayloadCodec::Float32,
     );
 
     while keep_running.load(Ordering::Relaxed) {
@@ -695,10 +730,45 @@ fn spawn_capture_publisher(
     packets_sent: Arc<AtomicU32>,
     cipher: Option<Arc<crate::crypto::StreamCipher>>,
 ) -> std::thread::JoinHandle<()> {
+    spawn_capture_publisher_with_codec(
+        audio_queue,
+        destinations_source,
+        stream_id,
+        socket,
+        channels,
+        rate_code,
+        max_frames_per_packet,
+        writer,
+        packets_sent,
+        cipher,
+        PayloadCodec::Float32,
+    )
+}
+
+fn spawn_capture_publisher_with_codec(
+    audio_queue: Arc<BoundedAudioQueue>,
+    destinations_source: PublisherDestinations,
+    stream_id: u32,
+    socket: UdpSocket,
+    channels: u16,
+    rate_code: u16,
+    max_frames_per_packet: usize,
+    writer: Option<SharedWavWriter>,
+    packets_sent: Arc<AtomicU32>,
+    cipher: Option<Arc<crate::crypto::StreamCipher>>,
+    codec: PayloadCodec,
+) -> std::thread::JoinHandle<()> {
     std::thread::spawn(move || {
         let mut last_drop_report = Instant::now();
         let mut fec_encoder =
             network_core::fec::FecEncoder::new(network_core::fec::DEFAULT_FEC_GROUP_SIZE);
+        let sample_rate = network_core::protocol::code_to_sample_rate(rate_code);
+        let mut opus_encoder = match codec {
+            PayloadCodec::Opus { bitrate_kbps } if channels <= 2 => {
+                crate::opus::OpusChannelEncoder::new(sample_rate, channels as usize, bitrate_kbps).ok()
+            }
+            _ => None,
+        };
 
         loop {
             if last_drop_report.elapsed() >= Duration::from_secs(1) {
@@ -725,6 +795,57 @@ fn spawn_capture_publisher(
                 let Some(destinations) = destinations else {
                     continue;
                 };
+
+                // Opus compression path
+                if let Some(ref mut encoder) = opus_encoder {
+                    let mut offset = 0;
+                    let chunk_size = crate::opus::OPUS_FRAME_SAMPLES * channels as usize;
+                    while offset < data.len() {
+                        let end = (offset + chunk_size).min(data.len());
+                        let chunk = &data[offset..end];
+                        offset = end;
+
+                        if let Ok(Some(opus_pkt)) = encoder.push_samples(chunk) {
+                            let sequence_number = packets_sent.fetch_add(1, Ordering::Relaxed);
+                            let header = PacketHeader {
+                                sub_stream_index: 0,
+                                stream_id,
+                                sequence_number,
+                                presentation_timestamp_ns: block.presentation_timestamp_ns,
+                            };
+                            let packet = match network_core::protocol::encode_opus_packet(
+                                &header,
+                                channels as u8,
+                                sample_rate,
+                                crate::opus::OPUS_FRAME_SAMPLES as u16,
+                                &opus_pkt,
+                            ) {
+                                Ok(p) => p,
+                                Err(e) => {
+                                    eprintln!("audio-core: failed to encode opus packet: {e}");
+                                    continue;
+                                }
+                            };
+                            let packet_to_send = if let Some(ref cipher) = cipher {
+                                match crate::crypto::encrypt_audio_packet(cipher, &packet) {
+                                    Ok(enc) => enc,
+                                    Err(e) => {
+                                        eprintln!("audio-core: encryption error: {e}");
+                                        continue;
+                                    }
+                                }
+                            } else {
+                                packet
+                            };
+                            for address in &destinations {
+                                if let Err(e) = socket.send_to(&packet_to_send, address) {
+                                    eprintln!("audio-core: send to {address} failed: {e}");
+                                }
+                            }
+                        }
+                    }
+                    continue;
+                }
 
                 let frame_count = data.len() / channels as usize;
                 let mut frame_offset = 0usize;

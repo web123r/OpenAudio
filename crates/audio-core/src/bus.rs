@@ -204,7 +204,10 @@ pub fn receive_and_play_bus_filtered_with_status_jitter_and_cipher(
                             continue;
                         }
                     }
-                    if float32_payload(packet, &parsed).is_none() {
+                    let is_supported = float32_payload(packet, &parsed).is_some()
+                        || (parsed.sample_format == network_core::protocol::SAMPLE_FORMAT_OPUS
+                            && network_core::protocol::opus_payload(packet, &parsed).is_some());
+                    if !is_supported {
                         continue;
                     }
                     break (
@@ -550,9 +553,20 @@ fn prime_bus_buffers(
                     }
                     if parsed.channel_count as u16 == channel_count
                         && parsed.sample_rate == sample_rate
-                        && float32_payload(packet, &parsed).is_some()
                     {
-                        push_samples(buffers, resamplers, packet, &parsed, output_sample_rate)?;
+                        if parsed.sample_format == network_core::protocol::SAMPLE_FORMAT_FLOAT32
+                            && float32_payload(packet, &parsed).is_some()
+                        {
+                            push_samples(buffers, resamplers, packet, &parsed, output_sample_rate)?;
+                        } else if parsed.sample_format == network_core::protocol::SAMPLE_FORMAT_OPUS {
+                            if let Some(opus_data) = network_core::protocol::opus_payload(packet, &parsed) {
+                                if let Ok(mut dec) = crate::opus::OpusChannelDecoder::new(parsed.sample_rate, parsed.channel_count as usize) {
+                                    if let Ok(pcm) = dec.decode_packet(opus_data) {
+                                        push_pcm_samples(buffers, resamplers, parsed.stream_id, parsed.channel_count, parsed.sample_rate, output_sample_rate, &pcm)?;
+                                    }
+                                }
+                            }
+                        }
                     }
                 }
             }
@@ -659,6 +673,7 @@ fn run_receive_loop(
     let mut reorder_window = PacketReorderWindow::new(16);
     let mut plc = PacketLossConcealer::new(channel_count as usize);
     let mut last_frames_per_packet = 0usize;
+    let mut opus_decoders: HashMap<u32, crate::opus::OpusChannelDecoder> = HashMap::new();
 
     socket.set_read_timeout(Some(Duration::from_millis(5))).map_err(|e| e.to_string())?;
 
@@ -756,10 +771,6 @@ fn run_receive_loop(
             }
         }
 
-        if float32_payload(packet, &parsed).is_none() {
-            continue;
-        }
-
         if parsed.channel_count as u16 != channel_count {
             eprintln!(
                 "audio-core: bus dropping packet from stream \
@@ -769,13 +780,39 @@ fn run_receive_loop(
             continue;
         }
 
-        let Some(payload) = float32_payload(packet, &parsed) else {
-            continue;
-        };
-
-        fec_decoder.record_received(parsed.sequence_number, payload);
-
-        let Some(pcm) = decode_float32(packet, &parsed) else {
+        let pcm = if parsed.sample_format == network_core::protocol::SAMPLE_FORMAT_FLOAT32 {
+            let Some(payload) = float32_payload(packet, &parsed) else {
+                continue;
+            };
+            fec_decoder.record_received(parsed.sequence_number, payload);
+            let Some(pcm) = decode_float32(packet, &parsed) else {
+                continue;
+            };
+            pcm
+        } else if parsed.sample_format == network_core::protocol::SAMPLE_FORMAT_OPUS {
+            let Some(opus_data) = network_core::protocol::opus_payload(packet, &parsed) else {
+                continue;
+            };
+            let decoder = match opus_decoders.entry(parsed.stream_id) {
+                std::collections::hash_map::Entry::Occupied(entry) => entry.into_mut(),
+                std::collections::hash_map::Entry::Vacant(entry) => {
+                    match crate::opus::OpusChannelDecoder::new(parsed.sample_rate, parsed.channel_count as usize) {
+                        Ok(dec) => entry.insert(dec),
+                        Err(e) => {
+                            eprintln!("audio-core: failed to create Opus decoder for stream {}: {e}", parsed.stream_id);
+                            continue;
+                        }
+                    }
+                }
+            };
+            match decoder.decode_packet(opus_data) {
+                Ok(pcm) => pcm,
+                Err(e) => {
+                    eprintln!("audio-core: Opus decode error for stream {}: {e}", parsed.stream_id);
+                    continue;
+                }
+            }
+        } else {
             continue;
         };
 
@@ -916,7 +953,7 @@ fn run_headless_bus(
 }
 
 /// Remaps one input frame into a preallocated output frame.
-fn remap_frame_into(input: &[f32], output: &mut [f32]) {
+pub fn remap_frame_into(input: &[f32], output: &mut [f32]) {
     output.fill(0.0);
 
     let input_channels = input.len();

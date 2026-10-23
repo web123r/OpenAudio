@@ -6,6 +6,23 @@ All notable changes to the OpenAudio project will be documented in this file.
 
 ### 🚀 Highlights & New Features
 
+#### 🎙️ **Pure-Rust Opus End-to-End Transport (70x Bandwidth Reduction)**
+* Fully wired RFC 6716 Opus encoder (`OpusChannelEncoder`) and decoder (`OpusChannelDecoder`) into `transmit.rs`, `bus.rs`, and receiver applications.
+* Enables high-channel-count multi-track live streaming (36, 48, 64 channels) at ~1.5 to 3 Mbps total bandwidth compared to ~220 Mbps uncompressed PCM.
+* Integrated comfort-noise PLC generation (`decode_lost()`) on lost or delayed Opus packets.
+
+#### 🎚️ **Demand-Based Gating & Channel Grouping**
+* Implemented demand-based network gating in `transmit.rs` and `asio.rs`: publishers automatically bypass sample encoding and UDP transmissions when no active subscribers are connected, reducing idle CPU and network consumption to zero.
+* Added `ChannelGroup` partitioning (`create_channel_groups`) to chunk large multi-channel arrays into manageable 1-to-2 channel stereo streams.
+
+#### 🎧 **Headless Receiver CLI Channel Selection & Dynamic Downmixing**
+* Added `--channels <1,2,...>` option to `apps/receiver` for extracting and listening to specific channel subsets from high-channel streams (e.g. listening to channels 1 & 2 from a 48-channel broadcast stream).
+* Added automatic dynamic downmixing and channel remapping (`remap_frame_into`) so incoming streams with any channel layout play seamlessly through default output hardware without channel count mismatch errors.
+
+#### 🍏 **macOS Real-Time Thread Priority via `mach_timebase_info`**
+* Replaced zeroed `thread_time_constraint_policy` parameters in `platform.rs` with accurate Mach absolute time unit conversions queried dynamically via `mach_timebase_info`.
+* Enforces 10ms real-time scheduling periods with 5ms computation slices and 8ms deadline constraints on CoreAudio threads.
+
 #### 🔔 **Automatic Background GitHub Update Checker**
 * Integrated background update checker (`apps/sender/src/updater.rs`) that periodically queries the GitHub Releases API for `web123r/OpenAudio`.
 * Added non-intrusive in-app banner alert showing the newly published version, release title, and immediate one-click action buttons to download or view the release notes on GitHub.
@@ -61,8 +78,8 @@ All notable changes to the OpenAudio project will be documented in this file.
 #### 📻 **AES67 / RFC 4566 Broadcast Interoperability**
 * Created `Aes67StreamInfo` module (`aes67.rs`) in `network-core` for generating standard Session Description Protocol (SDP) metadata, enabling stream discovery by commercial broadcast hardware.
 
-#### 🌐 **WebRTC Browser Gateway**
-* Created `WebRtcAudioSession` module (`webrtc_gateway.rs`) in `audio-core` for sub-10ms browser audio publishing and playback using WebRTC SDP offers/answers.
+#### 🌐 **WebRTC Browser Gateway (Experimental Scaffold)**
+* Created `WebRtcAudioSession` module (`webrtc_gateway.rs`) in `audio-core` providing SDP offer/answer scaffolding for browser signaling. (Production browser streaming is handled via `web_gateway.rs`).
 
 #### 🎛️ **Visual Drag-and-Drop Patchbay UI**
 * Created `PatchbayMatrix` module (`patchbay.rs`) in `apps/sender` to render a 2D drag-and-drop routing matrix grid in `egui`.

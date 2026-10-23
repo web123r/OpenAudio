@@ -234,6 +234,8 @@ pub struct StreamReceiver {
     is_connected: bool,
 
     event_queue: VecDeque<ReceiveEvent>,
+    #[allow(clippy::type_complexity)]
+    custom_decoder: Option<Box<dyn FnMut(&ParsedPacket, &[u8]) -> Result<Vec<f32>, String> + Send>>,
 }
 
 impl StreamReceiver {
@@ -261,10 +263,19 @@ impl StreamReceiver {
             current_format: None,
             is_connected: false,
             event_queue: VecDeque::new(),
+            custom_decoder: None,
         };
 
         receiver.resubscribe();
         Ok(receiver)
+    }
+
+    /// Registers a custom payload decoder for compressed formats (e.g. Opus or FLAC).
+    pub fn set_custom_decoder<F>(&mut self, decoder: F)
+    where
+        F: FnMut(&ParsedPacket, &[u8]) -> Result<Vec<f32>, String> + Send + 'static,
+    {
+        self.custom_decoder = Some(Box::new(decoder));
     }
 
     pub fn fec_recovered_count(&self) -> u64 {
@@ -349,16 +360,19 @@ impl StreamReceiver {
             self.fec_decoder.record_received(packet.sequence_number, payload);
         }
 
-        if packet.sample_format != SAMPLE_FORMAT_FLOAT32 {
+        let pcm = if packet.sample_format == SAMPLE_FORMAT_FLOAT32 {
+            let Some(pcm) = decode_float32(&buf[..len], &packet) else {
+                return Err("invalid or truncated Float32 PCM payload".to_string());
+            };
+            pcm
+        } else if let Some(ref mut custom) = self.custom_decoder {
+            custom(&packet, &buf[packet.payload_offset..len])?
+        } else {
             let format = sample_format_name(packet.sample_format).unwrap_or("unknown");
             return Err(format!(
                 "unsupported audio format {format} (0x{:02x}); this receiver currently supports Float32 PCM only",
                 packet.sample_format
             ));
-        }
-
-        let Some(pcm) = decode_float32(&buf[..len], &packet) else {
-            return Err("invalid or truncated Float32 PCM payload".to_string());
         };
 
         if !self.is_connected {
@@ -612,5 +626,51 @@ mod tests {
         let error = receiver.next_event().unwrap_err();
         assert!(error.contains("invalid or truncated Float32 PCM payload"));
         assert!(!receiver.is_connected);
+    }
+
+    #[test]
+    fn receiver_supports_custom_decoder() {
+        use crate::protocol::{AudioPayloadHeader, PacketHeader, SAMPLE_FORMAT_OPUS};
+
+        let mut receiver = StreamReceiver::new("127.0.0.1", 17056, 7, 0).unwrap();
+        let receive_port = receiver.socket.local_addr().unwrap().port();
+        let sender = UdpSocket::bind("127.0.0.1:0").unwrap();
+
+        receiver.set_custom_decoder(|packet, payload| {
+            assert_eq!(packet.sample_format, SAMPLE_FORMAT_OPUS);
+            assert_eq!(payload, &[1, 2, 3, 4]);
+            Ok(vec![0.5, -0.5])
+        });
+
+        let mut packet = Vec::from(
+            PacketHeader {
+                sub_stream_index: 0,
+                stream_id: 7,
+                sequence_number: 1,
+                presentation_timestamp_ns: 0,
+            }
+            .to_bytes(),
+        );
+        packet.extend(
+            AudioPayloadHeader {
+                channel_count: 2,
+                sample_format: SAMPLE_FORMAT_OPUS,
+                sample_rate_code: 1,
+                samples_per_channel: 1,
+            }
+            .to_bytes(),
+        );
+        packet.extend([1, 2, 3, 4]);
+
+        sender
+            .send_to(&packet, ("127.0.0.1", receive_port))
+            .unwrap();
+
+        let ev1 = receiver.next_event().unwrap();
+        assert!(matches!(ev1, Some(ReceiveEvent::Reconnected)));
+        let ev2 = receiver.next_event().unwrap();
+        assert!(matches!(ev2, Some(ReceiveEvent::FormatChanged { channels: 2, sample_rate: 48000 })));
+        let ev3 = receiver.next_event().unwrap();
+        assert!(matches!(ev3, Some(ReceiveEvent::Packet(_, pcm)) if pcm == vec![0.5, -0.5]));
     }
 }

@@ -3,6 +3,7 @@ mod diagnostic_panel;
 mod file_dialog;
 mod patchbay;
 mod preset;
+mod session_models;
 mod signal_monitor;
 mod ui_shell;
 mod updater;
@@ -12,6 +13,10 @@ use diagnostic_panel::DiagnosticPanel;
 use preset::{
     AsioPublishPreset, BrowserPreset, CombinePublishPreset, PresetFile, PublishPreset,
     SplitSubscribePreset, SubscribePreset,
+};
+use session_models::{
+    AsioPublishSession, BrowserAccessMode, CombinePublishSession, NodePing, PublishSession,
+    SplitSubscribeSession, SubscribeSession,
 };
 use signal_monitor::SignalMonitor;
 use ui_shell::{AppPage, UiSummary};
@@ -87,106 +92,7 @@ mod tests {
     }
 }
 
-#[derive(Debug, Clone, Copy)]
-pub struct NodePing {
-    pub rtt_ms: f32,
-    pub last_seen: Instant,
-}
-
-// ============================================================================
-// PUBLISH SESSION TYPES
-// ============================================================================
-
-
-struct PublishSession {
-    id: u64,
-    node_name: String,
-    stream_name: String,
-    stream_id: u32,
-    selected_input: Option<String>,
-    is_loopback: bool,
-    record: bool,
-    channel_labels: Vec<String>,
-    encrypted: bool,
-    passphrase: String,
-    running: Arc<AtomicBool>,
-    status: Arc<Mutex<String>>,
-    last_toggle: Instant,
-}
-
-struct CombinePublishSession {
-    id: u64,
-    session_tag: String,
-    node_name: String,
-    stream_name: String,
-    stream_id: u32,
-    channel_count: usize,
-    channel_sources: Vec<(Option<String>, bool)>,
-    channel_labels: Vec<String>,
-    record: bool,
-    encrypted: bool,
-    passphrase: String,
-    running: Arc<AtomicBool>,
-    status: Arc<Mutex<String>>,
-    last_toggle: Instant,
-}
-
-struct AsioPublishSession {
-    id: u64,
-    node_name: String,
-    stream_name: String,
-    stream_id: u32,
-    selected_driver: Option<String>,
-    driver_channel_count: usize,
-    channel_indices: Vec<usize>,
-    channel_labels: Vec<String>,
-    running: Arc<AtomicBool>,
-    status: Arc<Mutex<String>>,
-    last_toggle: Instant,
-}
-
-// ============================================================================
-// SUBSCRIBE SESSION TYPES
-// ============================================================================
-
-struct SubscribeSession {
-    id: u64,
-    selected_discovered_node_id: Option<String>,
-    bind_port: String,
-    selected_output: Option<String>,
-    volume: audio_core::VolumeControl,
-    record: bool,
-    encrypted: bool,
-    passphrase: String,
-    running: Arc<AtomicBool>,
-    status: Arc<Mutex<String>>,
-    last_toggle: Instant,
-    jitter_target_ms: Arc<AtomicU32>,
-}
-
-struct SplitSubscribeSession {
-    id: u64,
-    session_tag: String,
-    selected_discovered_node_id: Option<String>,
-    bind_port: String,
-    channel_devices: Vec<Option<String>>,
-    running: Arc<AtomicBool>,
-    status: Arc<Mutex<String>>,
-    last_toggle: Instant,
-    record: bool,
-    encrypted: bool,
-    passphrase: String,
-}
-
-// Browser playback uses one application-level gateway rather than one
-// gateway per stream. It is disabled by default and explicitly started
-// or stopped from the Browser Sharing page.
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum BrowserAccessMode {
-    PasswordProtected,
-    OpenLan,
-}
+// Session data models and network state are defined in `session_models.rs`.
 
 // ============================================================================
 // APPLICATION STATE

@@ -87,7 +87,8 @@ pub use transmit::{
     create_channel_groups, transmit, transmit_loopback_with_discovery,
     transmit_loopback_with_discovery_labeled, transmit_loopback_with_discovery_labeled_encrypted,
     transmit_multi, transmit_with_control, transmit_with_discovery,
-    transmit_with_discovery_labeled, transmit_with_discovery_labeled_encrypted, ChannelGroup,
+    transmit_with_discovery_labeled, transmit_with_discovery_labeled_encrypted,
+    transmit_with_discovery_labeled_encrypted_codec, ChannelGroup, PayloadCodec,
 };
 
 // ── Synthetic diagnostic publishing ─────────────────────────────────────
@@ -106,7 +107,8 @@ pub use bus::{
     get_volume, new_volume_control, receive_and_play_bus, receive_and_play_bus_filtered,
     receive_and_play_bus_filtered_with_status, receive_and_play_bus_filtered_with_status_and_jitter,
     receive_and_play_bus_filtered_with_status_jitter_and_cipher,
-    receive_and_play_bus_with_control, receive_and_play_bus_with_volume, set_volume, VolumeControl,
+    receive_and_play_bus_with_control, receive_and_play_bus_with_volume, remap_frame_into,
+    set_volume, VolumeControl,
 };
 
 // ── Discovery and subscription control ──────────────────────────────────
