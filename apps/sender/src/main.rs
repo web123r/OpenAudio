@@ -646,6 +646,7 @@ impl OpenAudioApp {
                 selected_input: item.selected_input,
                 is_loopback: item.is_loopback,
                 record: item.record,
+                record_flac: false,
                 channel_labels: item.channel_labels,
                 encrypted: item.encrypted,
                 passphrase: item.passphrase,
@@ -667,6 +668,7 @@ impl OpenAudioApp {
                 channel_sources: item.channel_sources,
                 channel_labels: item.channel_labels,
                 record: item.record,
+                record_flac: false,
                 encrypted: item.encrypted,
                 passphrase: item.passphrase,
                 running: Arc::new(AtomicBool::new(false)),
@@ -707,6 +709,7 @@ impl OpenAudioApp {
                 selected_output: item.selected_output,
                 volume: audio_core::new_volume_control(item.volume.clamp(0.0, 2.0)),
                 record: item.record,
+                record_flac: false,
                 encrypted: item.encrypted,
                 passphrase: item.passphrase,
                 running: Arc::new(AtomicBool::new(false)),
@@ -725,6 +728,7 @@ impl OpenAudioApp {
                 bind_port: item.bind_port,
                 channel_devices: item.channel_devices,
                 record: item.record,
+                record_flac: false,
                 encrypted: item.encrypted,
                 passphrase: item.passphrase,
                 running: Arc::new(AtomicBool::new(false)),
@@ -2660,9 +2664,17 @@ impl OpenAudioApp {
 
                             ui.checkbox(
                                 &mut session.record,
-                                egui::RichText::new("Record stream to WAV")
+                                egui::RichText::new("Record stream to file")
                                     .color(Theme::TEXT_PRIMARY),
                             );
+
+                            if session.record {
+                                ui.checkbox(
+                                    &mut session.record_flac,
+                                    egui::RichText::new("Lossless FLAC (.flac)")
+                                        .color(egui::Color32::from_rgb(100, 210, 255)),
+                                );
+                            }
 
                             let is_enc = session.encrypted;
                             ui.checkbox(
@@ -2894,9 +2906,15 @@ impl OpenAudioApp {
                                 };
 
                                 let record_path = if session.record {
-                                    Some(audio_core::generate_record_path(&format!(
-                                        "publish_{stream_id}"
-                                    )))
+                                    if session.record_flac {
+                                        Some(audio_core::generate_flac_record_path(&format!(
+                                            "publish_{stream_id}"
+                                        )))
+                                    } else {
+                                        Some(audio_core::generate_record_path(&format!(
+                                            "publish_{stream_id}"
+                                        )))
+                                    }
                                 } else {
                                     None
                                 };
@@ -3092,6 +3110,7 @@ impl OpenAudioApp {
                 selected_input: None,
                 is_loopback: false,
                 record: false,
+                record_flac: false,
                 channel_labels: vec!["Channel 1".to_string(), "Channel 2".to_string()],
                 encrypted: false,
                 passphrase: String::new(),
@@ -3334,9 +3353,17 @@ impl OpenAudioApp {
 
                             ui.checkbox(
                                 &mut session.record,
-                                egui::RichText::new("Record each channel to WAV")
+                                egui::RichText::new("Record each channel to file")
                                     .color(Theme::TEXT_PRIMARY),
                             );
+
+                            if session.record {
+                                ui.checkbox(
+                                    &mut session.record_flac,
+                                    egui::RichText::new("Lossless FLAC (.flac)")
+                                        .color(egui::Color32::from_rgb(100, 210, 255)),
+                                );
+                            }
 
                             let is_enc = session.encrypted;
                             ui.checkbox(
@@ -3700,6 +3727,7 @@ impl OpenAudioApp {
                 channel_sources: vec![(None, false), (None, false)],
                 channel_labels: vec!["Channel 1".to_string(), "Channel 2".to_string()],
                 record: false,
+                record_flac: false,
                 encrypted: false,
                 passphrase: String::new(),
                 running: Arc::new(AtomicBool::new(false)),
@@ -3922,9 +3950,17 @@ impl OpenAudioApp {
 
                             ui.checkbox(
                                 &mut session.record,
-                                egui::RichText::new("Record mixed output to WAV")
+                                egui::RichText::new("Record output to file")
                                     .color(Theme::TEXT_PRIMARY),
                             );
+
+                            if session.record {
+                                ui.checkbox(
+                                    &mut session.record_flac,
+                                    egui::RichText::new("Lossless FLAC (.flac)")
+                                        .color(egui::Color32::from_rgb(100, 210, 255)),
+                                );
+                            }
 
                             let is_enc = session.encrypted;
                             ui.checkbox(
@@ -4155,9 +4191,15 @@ impl OpenAudioApp {
                                                 let volume = session.volume.clone();
 
                                                 let record_path = if session.record {
-                                                    Some(audio_core::generate_record_path(
-                                                        &format!("subscribe_{port}"),
-                                                    ))
+                                                    if session.record_flac {
+                                                        Some(audio_core::generate_flac_record_path(
+                                                            &format!("subscribe_{port}"),
+                                                        ))
+                                                    } else {
+                                                        Some(audio_core::generate_record_path(
+                                                            &format!("subscribe_{port}"),
+                                                        ))
+                                                    }
                                                 } else {
                                                     None
                                                 };
@@ -4179,12 +4221,23 @@ impl OpenAudioApp {
                                                 running.store(true, Ordering::Release);
 
                                                 let reconnect_running = running.clone();
-                                                let reconnect_ip = node.ip.clone();
-                                                let reconnect_control_port = node.control_port;
-                                                let reconnect_stream_id = node.stream_id;
+                                                let reconnect_directory = self.discovery_directory.clone();
+                                                let reconnect_node_id = selected_id.clone();
+                                                let mut reconnect_ip = node.ip.clone();
+                                                let mut reconnect_control_port = node.control_port;
+                                                let mut reconnect_stream_id = node.stream_id;
                                                 thread::spawn(move || {
                                                     while reconnect_running.load(Ordering::Acquire)
                                                     {
+                                                        if let Some(ref nid) = reconnect_node_id {
+                                                            if let Ok(dir) = reconnect_directory.lock() {
+                                                                if let Some(live_node) = dir.get(nid) {
+                                                                    reconnect_ip = live_node.ip.clone();
+                                                                    reconnect_control_port = live_node.control_port;
+                                                                    reconnect_stream_id = live_node.stream_id;
+                                                                }
+                                                            }
+                                                        }
                                                         let _ = audio_core::send_subscribe_request(
                                                             &reconnect_ip,
                                                             reconnect_control_port,
@@ -4338,6 +4391,31 @@ impl OpenAudioApp {
                                 .size(11.0)
                                 .color(Theme::TEXT_SECONDARY),
                             );
+
+                            if running {
+                                if let Some(ref node_id) = session.selected_discovered_node_id {
+                                    if let Some(ping) = pings.get(node_id) {
+                                        let rtt = ping.rtt_ms;
+                                        let one_way = rtt / 2.0;
+                                        let buf_ms = session.jitter_target_ms.load(Ordering::Relaxed) as f32;
+                                        let est_total = one_way + buf_ms;
+                                        ui.label(
+                                            egui::RichText::new(format!(
+                                                "⏱ RTT: {:.1}ms | 1-Way: {:.1}ms | Buffer: {:.0}ms | Total: ~{:.1}ms",
+                                                rtt, one_way, buf_ms, est_total
+                                            ))
+                                            .size(11.0)
+                                            .color(if est_total < 25.0 {
+                                                Theme::ACCENT_GREEN
+                                            } else if est_total < 50.0 {
+                                                Theme::ACCENT_BLUE
+                                            } else {
+                                                Theme::ACCENT_ORANGE
+                                            }),
+                                        );
+                                    }
+                                }
+                            }
                         });
                     });
                 });
@@ -4404,6 +4482,7 @@ impl OpenAudioApp {
                 selected_output: None,
                 volume: audio_core::new_volume_control(1.0),
                 record: false,
+                record_flac: false,
                 encrypted: false,
                 passphrase: String::new(),
                 running: Arc::new(AtomicBool::new(false)),
@@ -4462,7 +4541,11 @@ impl OpenAudioApp {
                             let device_name = session.selected_output.clone();
                             let volume = session.volume.clone();
                             let record_path = if session.record {
-                                Some(audio_core::generate_record_path(&format!("subscribe_{port}")))
+                                if session.record_flac {
+                                    Some(audio_core::generate_flac_record_path(&format!("subscribe_{port}")))
+                                } else {
+                                    Some(audio_core::generate_record_path(&format!("subscribe_{port}")))
+                                }
                             } else {
                                 None
                             };
@@ -4477,11 +4560,22 @@ impl OpenAudioApp {
                             running.store(true, Ordering::Release);
 
                             let reconnect_running = running.clone();
-                            let reconnect_ip = node.ip.clone();
-                            let reconnect_control_port = node.control_port;
-                            let reconnect_stream_id = node.stream_id;
+                            let reconnect_directory = self.discovery_directory.clone();
+                            let reconnect_node_id = selected_id.clone();
+                            let mut reconnect_ip = node.ip.clone();
+                            let mut reconnect_control_port = node.control_port;
+                            let mut reconnect_stream_id = node.stream_id;
                             thread::spawn(move || {
                                 while reconnect_running.load(Ordering::Acquire) {
+                                    if let Some(ref nid) = reconnect_node_id {
+                                        if let Ok(dir) = reconnect_directory.lock() {
+                                            if let Some(live_node) = dir.get(nid) {
+                                                reconnect_ip = live_node.ip.clone();
+                                                reconnect_control_port = live_node.control_port;
+                                                reconnect_stream_id = live_node.stream_id;
+                                            }
+                                        }
+                                    }
                                     let _ = audio_core::send_subscribe_request(
                                         &reconnect_ip,
                                         reconnect_control_port,
@@ -5286,6 +5380,7 @@ impl OpenAudioApp {
                         selected_output: None,
                         volume: audio_core::new_volume_control(1.0),
                         record: false,
+                        record_flac: false,
                         encrypted: is_enc,
                         passphrase: String::new(),
                         running: Arc::new(AtomicBool::new(false)),
@@ -5323,6 +5418,7 @@ impl OpenAudioApp {
                     selected_output: target_device_opt,
                     volume: audio_core::new_volume_control(1.0),
                     record: false,
+                    record_flac: false,
                     encrypted: is_enc,
                     passphrase: String::new(),
                     running: Arc::new(AtomicBool::new(false)),
@@ -5457,9 +5553,17 @@ impl OpenAudioApp {
 
                             ui.checkbox(
                                 &mut session.record,
-                                egui::RichText::new("Record each channel to WAV")
+                                egui::RichText::new("Record each channel to file")
                                     .color(Theme::TEXT_PRIMARY),
                             );
+
+                            if session.record {
+                                ui.checkbox(
+                                    &mut session.record_flac,
+                                    egui::RichText::new("Lossless FLAC (.flac)")
+                                        .color(egui::Color32::from_rgb(100, 210, 255)),
+                                );
+                            }
 
                             ui.checkbox(
                                 &mut session.encrypted,
@@ -6006,6 +6110,7 @@ impl OpenAudioApp {
                 bind_port: port.to_string(),
                 channel_devices: Vec::new(),
                 record: false,
+                record_flac: false,
                 encrypted: false,
                 passphrase: String::new(),
                 running: Arc::new(AtomicBool::new(false)),

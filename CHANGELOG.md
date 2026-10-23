@@ -11,6 +11,24 @@ All notable changes to the OpenAudio project will be documented in this file.
 * Enables high-channel-count multi-track live streaming (36, 48, 64 channels) at ~1.5 to 3 Mbps total bandwidth compared to ~220 Mbps uncompressed PCM.
 * Integrated comfort-noise PLC generation (`decode_lost()`) on lost or delayed Opus packets.
 
+#### ⏱️ **Live Stream Latency Breakdown & RFC 3550 Network Quality Indicator**
+* Added live latency breakdown to active playback sessions in the desktop UI: shows real-time UDP Round-Trip Time (RTT), estimated 1-way network delay, jitter buffer depth, and total estimated end-to-end latency with color-coded health badges.
+* Integrated RFC 3550 interarrival jitter calculation into both `bus.rs` and `network-core::StreamReceiver`.
+* Displayed live network quality metrics across GUI sessions and CLI receiver: packet delivery %, packet loss %, jitter in milliseconds, packet throughput rate, and buffer depth.
+
+#### 🔄 **Autonomous Stream Reconnection**
+* Subscribed sessions in both GUI and CLI receiver automatically detect stream disconnects and execute continuous re-subscription handshakes until transmission resumes.
+* In the GUI, the reconnect monitor continuously queries live network discovery advertisements, automatically resolving new dynamic IP addresses or refreshed control ports when a publisher host or process restarts.
+
+#### 💾 **Lossless FLAC Archival Recording & Receiver-Side Recording**
+* Integrated `flacenc` pure-Rust lossless FLAC encoder alongside standard 32-bit float WAV recording (`audio-core::recording`).
+* Added per-stream recording to the headless CLI receiver (`--record <file.flac|file.wav>`), allowing headless nodes to record live audio streams directly to disk.
+* Added FLAC recording option toggles for desktop publishers and subscribers.
+
+#### 🚀 **Headless CLI Publishing Mode**
+* Added `receiver publish` subcommand to `apps/receiver` for running lightweight audio publisher nodes on headless machines, Linux servers, or Raspberry Pis.
+* Supports physical input device selection (`--device`), listing audio devices (`--list-devices`), Opus or PCM compression (`--codec opus`), bitrate configuration, AES-256-GCM encryption, and concurrent archival recording.
+
 #### 🎚️ **Demand-Based Gating & Channel Grouping**
 * Implemented demand-based network gating in `transmit.rs` and `asio.rs`: publishers automatically bypass sample encoding and UDP transmissions when no active subscribers are connected, reducing idle CPU and network consumption to zero.
 * Added `ChannelGroup` partitioning (`create_channel_groups`) to chunk large multi-channel arrays into manageable 1-to-2 channel stereo streams.

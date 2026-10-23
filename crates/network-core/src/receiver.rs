@@ -236,6 +236,10 @@ pub struct StreamReceiver {
     event_queue: VecDeque<ReceiveEvent>,
     #[allow(clippy::type_complexity)]
     custom_decoder: Option<Box<dyn FnMut(&ParsedPacket, &[u8]) -> Result<Vec<f32>, String> + Send>>,
+    total_packets_received: u64,
+    total_packets_dropped: u64,
+    jitter_ms: f64,
+    last_transit: Option<(Instant, u64)>,
 }
 
 impl StreamReceiver {
@@ -264,10 +268,44 @@ impl StreamReceiver {
             is_connected: false,
             event_queue: VecDeque::new(),
             custom_decoder: None,
+            total_packets_received: 0,
+            total_packets_dropped: 0,
+            jitter_ms: 0.0,
+            last_transit: None,
         };
 
         receiver.resubscribe();
         Ok(receiver)
+    }
+
+    /// Total audio packets successfully received and parsed.
+    pub fn total_packets_received(&self) -> u64 {
+        self.total_packets_received
+    }
+
+    /// Total audio packets dropped/lost.
+    pub fn total_packets_dropped(&self) -> u64 {
+        self.total_packets_dropped
+    }
+
+    /// RFC 3550 interarrival jitter estimate in milliseconds.
+    pub fn jitter_ms(&self) -> f64 {
+        self.jitter_ms
+    }
+
+    /// Current packet loss percentage (0.0% to 100.0%).
+    pub fn packet_loss_pct(&self) -> f64 {
+        let total = self.total_packets_received + self.total_packets_dropped;
+        if total > 0 {
+            (self.total_packets_dropped as f64 / total as f64) * 100.0
+        } else {
+            0.0
+        }
+    }
+
+    /// Current connection status.
+    pub fn is_connected(&self) -> bool {
+        self.is_connected
     }
 
     /// Registers a custom payload decoder for compressed formats (e.g. Opus or FLAC).
@@ -286,7 +324,7 @@ impl StreamReceiver {
         self.reorder_window.set_gap_timeout(timeout);
     }
 
-    fn resubscribe(&mut self) {
+    pub fn resubscribe(&mut self) {
         let _ = send_subscribe_request(
             &self.publisher_ip,
             self.control_port,
@@ -296,8 +334,36 @@ impl StreamReceiver {
         self.last_receive = Instant::now();
     }
 
+    fn record_event(&mut self, event: &ReceiveEvent) {
+        match event {
+            ReceiveEvent::Packet(packet, _) => {
+                self.total_packets_received = self.total_packets_received.saturating_add(1);
+                let now = Instant::now();
+                if let Some((prev_arr, prev_ts)) = self.last_transit {
+                    let arr_delta = (now - prev_arr).as_secs_f64() * 1000.0;
+                    let ts_delta = (packet.presentation_timestamp_ns.saturating_sub(prev_ts)) as f64 / 1_000_000.0;
+                    let d = (arr_delta - ts_delta).abs();
+                    self.jitter_ms += (d - self.jitter_ms) / 16.0;
+                }
+                self.last_transit = Some((now, packet.presentation_timestamp_ns));
+            }
+            ReceiveEvent::Dropped(count) => {
+                self.total_packets_dropped = self.total_packets_dropped.saturating_add(*count as u64);
+            }
+            _ => {}
+        }
+    }
+
     /// Blocks until an event occurs or timeout, returning the next event.
     pub fn next_event(&mut self) -> Result<Option<ReceiveEvent>, String> {
+        let event = self.poll_next_event()?;
+        if let Some(ref ev) = event {
+            self.record_event(ev);
+        }
+        Ok(event)
+    }
+
+    fn poll_next_event(&mut self) -> Result<Option<ReceiveEvent>, String> {
         if let Some(event) = self.event_queue.pop_front() {
             return Ok(Some(event));
         }

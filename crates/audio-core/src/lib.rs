@@ -146,7 +146,11 @@ pub use web_stream::receive_and_serve_web;
 
 // ── Recording ───────────────────────────────────────────────────────────
 
-pub use recording::{create_wav_writer, finalize as finalize_recording, generate_record_path};
+pub use recording::{
+    create_audio_writer, create_wav_writer, finalize as finalize_recording,
+    generate_flac_record_path, generate_record_path, write_samples, AudioWriter,
+    SharedAudioWriter, SharedWavWriter,
+};
 
 // ── ASIO publishing and device enumeration ──────────────────────────────
 //

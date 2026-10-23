@@ -33,6 +33,7 @@ rand = "0.8"
 aes-gcm = "0.10"
 sha2 = "0.10"
 httparse = "1"
+flacenc = "0.5.1"
 
 
 

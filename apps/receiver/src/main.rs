@@ -4,7 +4,29 @@ use network_core::discovery::{
 use std::collections::HashMap;
 use std::env;
 use std::net::{Ipv4Addr, UdpSocket};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
+
+#[derive(Debug)]
+enum CliCommand {
+    Subscribe(Options),
+    Publish(PublishOptions),
+}
+
+#[derive(Debug)]
+struct PublishOptions {
+    list_devices: bool,
+    device: Option<String>,
+    stream_name: String,
+    node_name: String,
+    stream_id: u32,
+    control_port: u16,
+    codec: String,
+    bitrate_kbps: u32,
+    record: Option<String>,
+    seconds: u64,
+    passphrase: Option<String>,
+}
 
 #[derive(Debug)]
 struct Options {
@@ -16,61 +38,66 @@ struct Options {
     seconds: u64,
     channels: Option<Vec<usize>>,
     downmix: bool,
+    record: Option<String>,
 }
 
 fn main() -> Result<(), String> {
-    let options = parse_options()?;
+    match parse_options()? {
+        CliCommand::Publish(publish_options) => run_publish(publish_options),
+        CliCommand::Subscribe(options) => {
+            if options.list || (options.publisher.is_none() && options.stream_id.is_none()) {
+                let streams = discover_streams(Duration::from_secs(3))?;
+                if streams.is_empty() {
+                    println!("No OpenAudio streams discovered.");
+                } else {
+                    for (ip, stream) in streams.values() {
+                        println!(
+                            "{} / {} — {}ch @ labels {:?} — {}:{} — stream {}",
+                            stream.node_name,
+                            stream.stream_name,
+                            stream.channel_count,
+                            stream.channel_labels,
+                            ip,
+                            stream.control_port,
+                            stream.stream_id
+                        );
+                    }
+                }
 
-    if options.list || (options.publisher.is_none() && options.stream_id.is_none()) {
-        let streams = discover_streams(Duration::from_secs(3))?;
-        if streams.is_empty() {
-            println!("No OpenAudio streams discovered.");
-        } else {
-            for (ip, stream) in streams.values() {
-                println!(
-                    "{} / {} — {}ch @ labels {:?} — {}:{} — stream {}",
-                    stream.node_name,
-                    stream.stream_name,
-                    stream.channel_count,
-                    stream.channel_labels,
-                    ip,
-                    stream.control_port,
-                    stream.stream_id
-                );
+                if options.publisher.is_none() && options.stream_id.is_none() {
+                    return Ok(());
+                }
             }
-        }
 
-        if options.publisher.is_none() && options.stream_id.is_none() {
-            return Ok(());
+            let publisher = options
+                .publisher
+                .ok_or_else(|| "--publisher IP is required when subscribing".to_string())?;
+            let stream_id = options
+                .stream_id
+                .ok_or_else(|| "--stream-id is required when subscribing".to_string())?;
+
+            if options.inspect {
+                inspect_stream(
+                    &publisher,
+                    CONTROL_PORT,
+                    stream_id,
+                    options.receive_port,
+                    options.seconds,
+                )?;
+            } else {
+                play_stream(
+                    &publisher,
+                    CONTROL_PORT,
+                    stream_id,
+                    options.receive_port,
+                    options.seconds,
+                    options.channels.as_deref(),
+                    options.record.as_deref(),
+                )?;
+            }
+            Ok(())
         }
     }
-
-    let publisher = options
-        .publisher
-        .ok_or_else(|| "--publisher IP is required when subscribing".to_string())?;
-    let stream_id = options
-        .stream_id
-        .ok_or_else(|| "--stream-id is required when subscribing".to_string())?;
-
-    if options.inspect {
-        inspect_stream(
-            &publisher,
-            CONTROL_PORT,
-            stream_id,
-            options.receive_port,
-            options.seconds,
-        )?;
-    } else {
-        play_stream(
-            &publisher,
-            CONTROL_PORT,
-            stream_id,
-            options.receive_port,
-            options.seconds,
-            options.channels.as_deref(),
-        )?;
-    }
-    Ok(())
 }
 
 fn discover_streams(
@@ -262,6 +289,7 @@ fn play_stream(
     receive_port: u16,
     seconds: u64,
     channel_selection: Option<&[usize]>,
+    record_path: Option<&str>,
 ) -> Result<(), String> {
     use audio_core::backend::get_backend;
     use audio_core::{ensure_realtime_audio_thread, StreamingLinearResampler};
@@ -270,7 +298,8 @@ fn play_stream(
     use std::sync::{Arc, Mutex};
 
     println!(
-        "Subscribed to {publisher}, stream {stream_id}; listening on UDP port {receive_port} for {seconds}s."
+        "Subscribed to {publisher}, stream {stream_id}; listening on UDP port {receive_port} for {}s.",
+        if seconds == 0 { "∞".to_string() } else { seconds.to_string() }
     );
 
     let mut receiver = StreamReceiver::new(publisher, control_port, stream_id, receive_port)?;
@@ -291,7 +320,11 @@ fn play_stream(
         }
     });
 
-    let deadline = Instant::now() + Duration::from_secs(seconds);
+    let deadline = if seconds == 0 {
+        None
+    } else {
+        Some(Instant::now() + Duration::from_secs(seconds))
+    };
 
     let backend = get_backend();
     let (device_label, output_config) = backend.get_output_config(None)?;
@@ -300,6 +333,15 @@ fn play_stream(
     if output_channels == 0 {
         return Err("default output device exposes zero channels".to_string());
     }
+
+    let writer = match record_path {
+        Some(path) => {
+            let w = audio_core::create_audio_writer(path, output_channels as u16, output_sample_rate)?;
+            println!("Per-stream recording active -> {path}");
+            Some(w)
+        }
+        None => None,
+    };
 
     let mut format = None;
     let mut _stream = None;
@@ -310,19 +352,14 @@ fn play_stream(
     let mut packets = 0u64;
     let mut dropped = 0u64;
     let mut last_packet_frames = 0usize;
+    let mut last_quality_report = Instant::now();
 
-    while Instant::now() < deadline {
+    while deadline.map(|d| Instant::now() < d).unwrap_or(true) {
         match receiver.next_event()? {
             Some(ReceiveEvent::Packet(packet, mut pcm)) => {
                 packets += 1;
                 let ch = (packet.channel_count as usize).max(1);
                 last_packet_frames = pcm.len() / ch;
-                let recovered = receiver.fec_recovered_count();
-                if packets % 100 == 0 {
-                    println!(
-                        "source={publisher} packets={packets} dropped={dropped} (fec_recovered={recovered}) format={format:?}"
-                    );
-                }
 
                 if let Some(plc_inst) = &mut plc {
                     plc_inst.process_incoming(&mut pcm);
@@ -339,6 +376,10 @@ fn play_stream(
                         .as_mut()
                         .ok_or_else(|| "stream resampler was not initialized".to_string())?
                         .process(&remapped)?;
+
+                    if let Some(ref w) = writer {
+                        audio_core::write_samples(w, &to_push);
+                    }
 
                     let mut jitter_buf = buffer.lock().unwrap();
                     jitter_buf.extend(to_push);
@@ -370,6 +411,9 @@ fn play_stream(
                     );
                     if let Some(resamp) = resampler.as_mut() {
                         if let Ok(to_push) = resamp.process(&remapped) {
+                            if let Some(ref w) = writer {
+                                audio_core::write_samples(w, &to_push);
+                            }
                             let mut jitter_buf = buffer.lock().unwrap();
                             jitter_buf.extend(to_push);
                             let max_frames = (output_sample_rate as f64 * 0.2) as usize;
@@ -423,15 +467,135 @@ fn play_stream(
                 _stream = Some(s);
             }
             Some(ReceiveEvent::Disconnected) => {
+                println!("[WARN] Stream disconnected (no packets received). Auto-reconnecting to {publisher}:{control_port}...");
                 _stream = None;
+                receiver.resubscribe();
             }
-            Some(ReceiveEvent::Reconnected) => {}
+            Some(ReceiveEvent::Reconnected) => {
+                println!("[OK] Stream reconnected successfully! Resuming playback...");
+            }
             None => {}
+        }
+
+        if last_quality_report.elapsed() >= Duration::from_secs(1) {
+            let loss_pct = receiver.packet_loss_pct();
+            let jitter = receiver.jitter_ms();
+            let q_buf = buffer.lock().unwrap().len() / output_channels;
+            let q_buf_ms = q_buf as f64 / output_sample_rate as f64 * 1000.0;
+            let rec_count = receiver.total_packets_received();
+            let drop_count = receiver.total_packets_dropped();
+            let fec_rec = receiver.fec_recovered_count();
+            println!(
+                "[Network Quality] Delivery: {:.1}% | Loss: {:.1}% (dropped: {}, fec_rec: {}) | Jitter: {:.1}ms | Buffer: {} frames ({:.1}ms) | Pkts: {}",
+                100.0 - loss_pct, loss_pct, drop_count, fec_rec, jitter, q_buf, q_buf_ms, rec_count
+            );
+            last_quality_report = Instant::now();
+        }
+    }
+
+    if let Some(ref w) = writer {
+        audio_core::finalize_recording(w);
+        if let Some(p) = record_path {
+            println!("Recorded audio finalized and saved to '{p}'.");
         }
     }
 
     println!("Finished: packets={packets}, dropped={dropped}, format={format:?}");
     Ok(())
+}
+
+fn run_publish(options: PublishOptions) -> Result<(), String> {
+    if options.list_devices {
+        println!("Available audio input devices:");
+        let devices = audio_core::list_input_devices();
+        if devices.is_empty() {
+            println!("  (No input devices found)");
+        } else {
+            for dev in devices {
+                println!(
+                    "  • {} (channels: {}, default: {})",
+                    dev.name, dev.max_input_channels, dev.is_default
+                );
+            }
+        }
+        return Ok(());
+    }
+
+    let keep_running = Arc::new(std::sync::atomic::AtomicBool::new(true));
+    let subscribers_by_stream: audio_core::SubscriberRegistry =
+        Arc::new(Mutex::new(HashMap::new()));
+    let registry_for_ctrl = subscribers_by_stream.clone();
+    let keep_ctrl = keep_running.clone();
+
+    std::thread::Builder::new()
+        .name("headless-control-listener".to_string())
+        .spawn(move || {
+            let _ = audio_core::start_control_listener(registry_for_ctrl, keep_ctrl);
+        })
+        .map_err(|e| format!("failed to spawn control listener: {e}"))?;
+
+    let cipher = options.passphrase.filter(|p| !p.trim().is_empty()).map(|p| {
+        Arc::new(audio_core::StreamCipher::from_passphrase(&p))
+    });
+
+    let codec = match options.codec.to_lowercase().as_str() {
+        "opus" => audio_core::PayloadCodec::Opus {
+            bitrate_kbps: options.bitrate_kbps as i32,
+        },
+        _ => audio_core::PayloadCodec::Float32,
+    };
+
+    println!(
+        "OpenAudio Headless Publisher active:\n\
+         • Node name:    {}\n\
+         • Stream name:  {}\n\
+         • Stream ID:    {}\n\
+         • Input device: {}\n\
+         • Codec:        {:?}\n\
+         • Control port: {}\n\
+         • Recording:    {:?}",
+        options.node_name,
+        options.stream_name,
+        options.stream_id,
+        options.device.as_deref().unwrap_or("Default System Input"),
+        codec,
+        options.control_port,
+        options.record.as_deref().unwrap_or("None")
+    );
+    println!("Listening for subscribers... Running. (Press Ctrl+C to terminate)");
+
+    let transmit_running = keep_running.clone();
+    let handle = std::thread::spawn(move || {
+        audio_core::transmit_with_discovery_labeled_encrypted_codec(
+            options.node_name,
+            options.stream_name,
+            options.stream_id,
+            options.device,
+            subscribers_by_stream,
+            options.record,
+            None,
+            transmit_running,
+            cipher,
+            codec,
+        )
+    });
+
+    if options.seconds > 0 {
+        let deadline = Instant::now() + Duration::from_secs(options.seconds);
+        while Instant::now() < deadline && keep_running.load(std::sync::atomic::Ordering::Relaxed) {
+            std::thread::sleep(Duration::from_millis(200));
+        }
+        keep_running.store(false, std::sync::atomic::Ordering::Release);
+    } else {
+        while keep_running.load(std::sync::atomic::Ordering::Relaxed) {
+            std::thread::sleep(Duration::from_millis(500));
+        }
+    }
+
+    match handle.join() {
+        Ok(res) => res,
+        Err(_) => Err("publisher thread panicked".to_string()),
+    }
 }
 
 fn validate_output_channel_count(input_channels: u8, output_channels: usize) -> Result<(), String> {
@@ -465,7 +629,103 @@ fn trim_interleaved_queue(
     }
 }
 
-fn parse_options() -> Result<Options, String> {
+fn parse_options() -> Result<CliCommand, String> {
+    parse_args(env::args().skip(1).collect())
+}
+
+fn parse_args(mut raw_args: Vec<String>) -> Result<CliCommand, String> {
+    if raw_args.is_empty() {
+        return Ok(CliCommand::Subscribe(Options {
+            list: false,
+            inspect: false,
+            publisher: None,
+            stream_id: None,
+            receive_port: 7050,
+            seconds: 10,
+            channels: None,
+            downmix: false,
+            record: None,
+        }));
+    }
+
+    if raw_args[0] == "publish" {
+        raw_args.remove(0);
+        let mut publish_opts = PublishOptions {
+            list_devices: false,
+            device: None,
+            stream_name: "Headless Stream".to_string(),
+            node_name: "Headless Node".to_string(),
+            stream_id: 1,
+            control_port: CONTROL_PORT,
+            codec: "pcm".to_string(),
+            bitrate_kbps: 128,
+            record: None,
+            seconds: 0,
+            passphrase: None,
+        };
+
+        let mut iter = raw_args.into_iter();
+        while let Some(arg) = iter.next() {
+            match arg.as_str() {
+                "--list-devices" => publish_opts.list_devices = true,
+                "--device" => publish_opts.device = Some(next_value(&mut iter, "--device")?),
+                "--stream-name" => publish_opts.stream_name = next_value(&mut iter, "--stream-name")?,
+                "--node-name" => publish_opts.node_name = next_value(&mut iter, "--node-name")?,
+                "--stream-id" => {
+                    publish_opts.stream_id = next_value(&mut iter, "--stream-id")?
+                        .parse()
+                        .map_err(|_| "--stream-id must be an integer".to_string())?;
+                }
+                "--control-port" => {
+                    publish_opts.control_port = next_value(&mut iter, "--control-port")?
+                        .parse()
+                        .map_err(|_| "--control-port must be a valid UDP port".to_string())?;
+                }
+                "--codec" => publish_opts.codec = next_value(&mut iter, "--codec")?,
+                "--bitrate" => {
+                    publish_opts.bitrate_kbps = next_value(&mut iter, "--bitrate")?
+                        .parse()
+                        .map_err(|_| "--bitrate must be an integer (kbps)".to_string())?;
+                }
+                "--record" => {
+                    publish_opts.record = Some(next_value(&mut iter, "--record")?);
+                }
+                "--passphrase" => {
+                    publish_opts.passphrase = Some(next_value(&mut iter, "--passphrase")?);
+                }
+                "--seconds" => {
+                    publish_opts.seconds = next_value(&mut iter, "--seconds")?
+                        .parse()
+                        .map_err(|_| "--seconds must be an integer".to_string())?;
+                }
+                "--help" | "-h" => {
+                    println!(
+                        "OpenAudio headless publisher\n\n\
+                         Usage:\n\
+                           receiver publish [--device <NAME>] [--stream-name <NAME>] [--stream-id <ID>] [--codec <pcm|opus>] [--record <PATH>]\n\
+                           receiver publish --list-devices\n\n\
+                         Options:\n\
+                           --list-devices       List available input devices and exit\n\
+                           --device <NAME>      Input audio device name\n\
+                           --stream-name <NAME> Stream name to broadcast (default: 'Headless Stream')\n\
+                           --node-name <NAME>   Node name for discovery (default: 'Headless Node')\n\
+                           --stream-id <ID>     Stream ID (default: 1)\n\
+                           --control-port <P>   Discovery control port (default: 7001)\n\
+                           --codec <pcm|opus>   Audio codec (default: pcm)\n\
+                           --bitrate <kbps>     Opus bitrate in kbps (default: 128)\n\
+                           --record <PATH>      Record captured audio to WAV or FLAC (e.g. out.flac)\n\
+                           --passphrase <PASS>  AES-256-GCM encryption passphrase\n\
+                           --seconds <N>        Run duration in seconds (0 = indefinite)\n\
+                           --help, -h           Show this help"
+                    );
+                    std::process::exit(0);
+                }
+                unknown => return Err(format!("unknown publish argument '{unknown}'; use --help")),
+            }
+        }
+        return Ok(CliCommand::Publish(publish_opts));
+    }
+
     let mut options = Options {
         list: false,
         inspect: false,
@@ -475,14 +735,18 @@ fn parse_options() -> Result<Options, String> {
         seconds: 10,
         channels: None,
         downmix: false,
+        record: None,
     };
-    let mut args = env::args().skip(1);
+    let mut args = raw_args.into_iter();
 
     while let Some(argument) = args.next() {
         match argument.as_str() {
             "--list" => options.list = true,
             "--inspect" => options.inspect = true,
             "--downmix" => options.downmix = true,
+            "--record" => {
+                options.record = Some(next_value(&mut args, "--record")?);
+            }
             "--channels" => {
                 let val = next_value(&mut args, "--channels")?;
                 let indices = val
@@ -522,20 +786,22 @@ fn parse_options() -> Result<Options, String> {
             }
             "--help" | "-h" => {
                 println!(
-                    "OpenAudio receiver\n\n\
+                    "OpenAudio receiver CLI\n\n\
                      Usage:\n\
                        receiver --list\n\
-                       receiver --publisher <IP> --stream-id <ID> [--port <UDP>] [--seconds <N>] [--channels <CH1,CH2,...>] [--downmix]\n\
-                       receiver --publisher <IP> --stream-id <ID> --inspect [--port <UDP>] [--seconds <N>]\n\n\
+                       receiver --publisher <IP> --stream-id <ID> [--port <UDP>] [--seconds <N>] [--channels <CH1,CH2,...>] [--downmix] [--record <PATH>]\n\
+                       receiver --publisher <IP> --stream-id <ID> --inspect [--port <UDP>] [--seconds <N>]\n\
+                       receiver publish [--device <NAME>] [--codec <pcm|opus>] [--record <PATH>]\n\n\
                      Options:\n\
                        --list              Discover OpenAudio streams\n\
                        --publisher <IP>    Publisher IPv4 address\n\
                        --stream-id <ID>    Stream ID to receive\n\
                        --inspect           Count packets and sequence gaps without playback\n\
                        --port <UDP>        Local receive port (default: 7050)\n\
-                       --seconds <N>       Run duration (default: 10)\n\
+                       --seconds <N>       Run duration in seconds (0 = indefinite, default: 10)\n\
                        --channels <list>   Select 1-based channel subset (e.g. --channels 1,2)\n\
                        --downmix           Downmix multichannel stream to match output device\n\
+                       --record <PATH>     Record received stream to WAV or FLAC (e.g. rec.flac)\n\
                        --help, -h          Show this help"
                 );
                 std::process::exit(0);
@@ -544,7 +810,7 @@ fn parse_options() -> Result<Options, String> {
         }
     }
 
-    Ok(options)
+    Ok(CliCommand::Subscribe(options))
 }
 
 fn next_value(args: &mut impl Iterator<Item = String>, flag: &str) -> Result<String, String> {
@@ -684,5 +950,51 @@ mod tests {
             dropped, 1,
             "Should have detected exactly 1 dropped packet (seq 2)"
         );
+    }
+
+    #[test]
+    fn test_parse_publish_and_subscribe_arguments() {
+        // Test publish parsing
+        let pub_cmd = parse_args(vec![
+            "publish".into(),
+            "--device".into(),
+            "Desk Mic".into(),
+            "--codec".into(),
+            "opus".into(),
+            "--record".into(),
+            "rec.flac".into(),
+        ])
+        .unwrap();
+
+        match pub_cmd {
+            CliCommand::Publish(p) => {
+                assert_eq!(p.device.as_deref(), Some("Desk Mic"));
+                assert_eq!(p.codec, "opus");
+                assert_eq!(p.record.as_deref(), Some("rec.flac"));
+            }
+            _ => panic!("Expected Publish command"),
+        }
+
+        // Test subscribe parsing with recording
+        let sub_cmd = parse_args(vec![
+            "--publisher".into(),
+            "192.168.1.50".into(),
+            "--stream-id".into(),
+            "2".into(),
+            "--record".into(),
+            "received.flac".into(),
+            "--downmix".into(),
+        ])
+        .unwrap();
+
+        match sub_cmd {
+            CliCommand::Subscribe(s) => {
+                assert_eq!(s.publisher.as_deref(), Some("192.168.1.50"));
+                assert_eq!(s.stream_id, Some(2));
+                assert_eq!(s.record.as_deref(), Some("received.flac"));
+                assert!(s.downmix);
+            }
+            _ => panic!("Expected Subscribe command"),
+        }
     }
 }

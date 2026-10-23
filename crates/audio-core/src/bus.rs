@@ -668,6 +668,8 @@ fn run_receive_loop(
     let mut interval_packets = 0u32;
     let mut last_status_update = Instant::now();
     let mut streams_seen = HashSet::<u32>::new();
+    let mut jitter_ms = 0.0f64;
+    let mut last_packet_transit: Option<(Instant, u64)> = None;
 
     let mut fec_decoder = FecDecoder::new(32);
     let mut reorder_window = PacketReorderWindow::new(16);
@@ -820,6 +822,15 @@ fn run_receive_loop(
         packets_received = packets_received.saturating_add(1);
         interval_packets = interval_packets.saturating_add(1);
 
+        let now = Instant::now();
+        if let Some((prev_arr, prev_ts)) = last_packet_transit {
+            let arr_delta = (now - prev_arr).as_secs_f64() * 1000.0;
+            let ts_delta = (parsed.presentation_timestamp_ns.saturating_sub(prev_ts)) as f64 / 1_000_000.0;
+            let d = (arr_delta - ts_delta).abs();
+            jitter_ms += (d - jitter_ms) / 16.0;
+        }
+        last_packet_transit = Some((now, parsed.presentation_timestamp_ns));
+
         for event in reorder_window.push(parsed.clone(), pcm) {
             handle_receive_event(
                 event,
@@ -844,11 +855,11 @@ fn run_receive_loop(
                 };
                 let rate = interval_packets as f64 / elapsed.as_secs_f64();
                 let msg = if fec_recovered > 0 {
-                    format!("Receiving • {delivery_pct:.1}% delivered ({fec_recovered} recovered via FEC, {packets_lost} lost) • {rate:.0} pkts/s • {current_target_ms}ms buffer")
+                    format!("Receiving • {delivery_pct:.1}% delivered ({fec_recovered} recovered via FEC, {packets_lost} lost) • Jitter: {jitter_ms:.1}ms • {rate:.0} pkts/s • {current_target_ms}ms buffer")
                 } else if packets_lost == 0 {
-                    format!("Receiving • {delivery_pct:.1}% delivered (0 lost) • {rate:.0} pkts/s • {current_target_ms}ms buffer")
+                    format!("Receiving • {delivery_pct:.1}% delivered (0 lost) • Jitter: {jitter_ms:.1}ms • {rate:.0} pkts/s • {current_target_ms}ms buffer")
                 } else {
-                    format!("Receiving • {delivery_pct:.1}% delivered ({packets_lost} lost) • {rate:.0} pkts/s • {current_target_ms}ms buffer")
+                    format!("Receiving • {delivery_pct:.1}% delivered ({packets_lost} lost) • Jitter: {jitter_ms:.1}ms • {rate:.0} pkts/s • {current_target_ms}ms buffer")
                 };
                 if let Ok(mut guard) = status.lock() {
                     *guard = msg;
