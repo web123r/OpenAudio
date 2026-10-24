@@ -2,9 +2,10 @@ use crate::protocol::{
     sample_rate_to_code, AudioPayloadHeader, PacketHeader, SAMPLE_FORMAT_FLOAT32,
 };
 use network_core::discovery::{start_advertising_with_labels, SubscribeRequest};
+use network_core::protocol::SAMPLE_FORMAT_OPUS;
 use serde::Deserialize;
 use std::collections::HashSet;
-use std::net::{SocketAddr, TcpStream, UdpSocket};
+use std::net::{SocketAddr, UdpSocket};
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -19,12 +20,14 @@ struct PublishHandshake {
     channels: u8,
     #[serde(rename = "sampleRate")]
     sample_rate: u32,
+    #[serde(default)]
+    codec: Option<String>,
 }
 
 const MAX_FRAMES_PER_PACKET: usize = 58;
 
 pub fn handle_publish_ws(
-    mut ws: WebSocket<TcpStream>,
+    mut ws: WebSocket<crate::tls::MaybeTlsStream>,
     global_keep_running: Arc<AtomicBool>,
 ) -> Result<(), String> {
     // 1. Wait for handshake
@@ -49,6 +52,12 @@ pub fn handle_publish_ws(
             handshake.sample_rate
         ));
     }
+
+    let is_opus = handshake
+        .codec
+        .as_deref()
+        .unwrap_or("")
+        .eq_ignore_ascii_case("opus");
 
     let stream_id = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -110,9 +119,10 @@ pub fn handle_publish_ws(
         }
     });
 
+    let codec_display = if is_opus { "Opus" } else { "Float32 PCM" };
     println!(
-        "Web Publisher started: id={} port={}",
-        stream_id, control_port
+        "Web Publisher started: id={} port={} codec={}",
+        stream_id, control_port, codec_display
     );
 
     // Audio sending loop
@@ -126,22 +136,9 @@ pub fn handle_publish_ws(
 
         match ws.read() {
             Ok(Message::Binary(data)) => {
-                // `data` is a flat float32 array
-                let floats_count = data.len() / 4;
-                if floats_count == 0 {
+                if data.is_empty() {
                     continue;
                 }
-
-                // parse as f32
-                let mut samples = Vec::with_capacity(floats_count);
-                for i in 0..floats_count {
-                    let mut b = [0u8; 4];
-                    b.copy_from_slice(&data[i * 4..(i + 1) * 4]);
-                    samples.push(f32::from_le_bytes(b));
-                }
-
-                let frame_count = floats_count / channels as usize;
-                let mut frame_offset = 0;
 
                 let subs = {
                     let s = subscribers.lock().unwrap();
@@ -152,9 +149,8 @@ pub fn handle_publish_ws(
                     continue; // drop if no subs
                 }
 
-                while frame_offset < frame_count {
-                    let frames_this_packet =
-                        (frame_count - frame_offset).min(max_frames_per_packet);
+                if is_opus {
+                    // `data` is raw Opus packet from browser AudioEncoder (e.g. 40-120 bytes)
                     let sequence_number = sequence.fetch_add(1, Ordering::Relaxed);
                     let timestamp_ns = start_time.elapsed().as_nanos() as u64;
 
@@ -167,28 +163,78 @@ pub fn handle_publish_ws(
 
                     let payload_header = AudioPayloadHeader {
                         channel_count: channels,
-                        sample_format: SAMPLE_FORMAT_FLOAT32,
+                        sample_format: SAMPLE_FORMAT_OPUS,
                         sample_rate_code: rate_code,
-                        samples_per_channel: frames_this_packet as u16,
+                        samples_per_channel: 480, // 10ms frame @ 48kHz
                     };
 
-                    let mut packet =
-                        Vec::with_capacity(24 + 8 + frames_this_packet * channels as usize * 4);
+                    // OpenAudio Opus packet format: 2-byte big-endian length prefix followed by raw Opus bytes
+                    let mut packet = Vec::with_capacity(24 + 8 + 2 + data.len());
                     packet.extend_from_slice(&header.to_bytes());
                     packet.extend_from_slice(&payload_header.to_bytes());
-
-                    let sample_start = frame_offset * channels as usize;
-                    let sample_end = (frame_offset + frames_this_packet) * channels as usize;
-
-                    for &sample in &samples[sample_start..sample_end] {
-                        packet.extend_from_slice(&sample.to_le_bytes());
-                    }
+                    let len_u16 = data.len() as u16;
+                    packet.push((len_u16 >> 8) as u8);
+                    packet.push((len_u16 & 0xFF) as u8);
+                    packet.extend_from_slice(&data);
 
                     for dest in &subs {
                         let _ = audio_socket.send_to(&packet, dest);
                     }
+                } else {
+                    // `data` is a flat float32 array
+                    let floats_count = data.len() / 4;
+                    if floats_count == 0 {
+                        continue;
+                    }
 
-                    frame_offset += frames_this_packet;
+                    let mut samples = Vec::with_capacity(floats_count);
+                    for i in 0..floats_count {
+                        let mut b = [0u8; 4];
+                        b.copy_from_slice(&data[i * 4..(i + 1) * 4]);
+                        samples.push(f32::from_le_bytes(b));
+                    }
+
+                    let frame_count = floats_count / channels as usize;
+                    let mut frame_offset = 0;
+
+                    while frame_offset < frame_count {
+                        let frames_this_packet =
+                            (frame_count - frame_offset).min(max_frames_per_packet);
+                        let sequence_number = sequence.fetch_add(1, Ordering::Relaxed);
+                        let timestamp_ns = start_time.elapsed().as_nanos() as u64;
+
+                        let header = PacketHeader {
+                            sub_stream_index: 0,
+                            stream_id,
+                            sequence_number,
+                            presentation_timestamp_ns: timestamp_ns,
+                        };
+
+                        let payload_header = AudioPayloadHeader {
+                            channel_count: channels,
+                            sample_format: SAMPLE_FORMAT_FLOAT32,
+                            sample_rate_code: rate_code,
+                            samples_per_channel: frames_this_packet as u16,
+                        };
+
+                        let mut packet =
+                            Vec::with_capacity(24 + 8 + frames_this_packet * channels as usize * 4);
+                        packet.extend_from_slice(&header.to_bytes());
+                        packet.extend_from_slice(&payload_header.to_bytes());
+
+                        let sample_start = frame_offset * channels as usize;
+                        let sample_end = (frame_offset + frames_this_packet) * channels as usize;
+
+                        for &sample in &samples[sample_start..sample_end] {
+                            packet.extend_from_slice(&sample.to_le_bytes());
+                        }
+
+                        for dest in &subs {
+                            let _ = audio_socket.send_to(&packet, dest);
+                        }
+
+                        frame_offset += frames_this_packet;
+                    }
                 }
             }
             Ok(Message::Close(_)) => {

@@ -116,6 +116,7 @@ struct OpenAudioApp {
 
     // Browser gateway configuration.
     browser_access_mode: BrowserAccessMode,
+    browser_https_enabled: bool,
     browser_password: String,
     browser_password_confirmation: String,
     browser_show_password: bool,
@@ -289,6 +290,7 @@ impl Default for OpenAudioApp {
             signal_monitor: SignalMonitor::default(),
 
             browser_access_mode: BrowserAccessMode::PasswordProtected,
+            browser_https_enabled: true,
             browser_password: String::new(),
             browser_password_confirmation: String::new(),
             browser_show_password: false,
@@ -6205,25 +6207,49 @@ impl OpenAudioApp {
                     "Open LAN — no password",
                 );
 
+                ui.add_space(8.0);
+
+                ui.checkbox(
+                    &mut self.browser_https_enabled,
+                    "🔒 Enable Native HTTPS & WSS (Required for Mobile Mic)",
+                );
+                ui.label(
+                    egui::RichText::new(
+                        "Generates an automatic self-signed TLS certificate covering localhost and LAN IP. \
+                         Enables wireless microphone capture on iOS Safari and Android Chrome.",
+                    )
+                    .size(11.0)
+                    .color(Theme::TEXT_SECONDARY),
+                );
+
                 ui.add_space(10.0);
 
                 match self.browser_access_mode {
                     BrowserAccessMode::PasswordProtected => {
                         self.render_browser_password_fields(ui);
+                        let warning_text = if self.browser_https_enabled {
+                            "🔒 Browser traffic is encrypted with TLS (HTTPS/WSS). \
+                             Audio and password are encrypted in transit over your local network."
+                        } else {
+                            "⚠ Browser traffic is unencrypted HTTP/WebSocket. \
+                             A LAN observer may capture the password, session, \
+                             or audio. Use only on a trusted private network; \
+                             this password does not encrypt audio or native streams."
+                        };
+                        let warning_color = if self.browser_https_enabled {
+                            Theme::ACCENT_GREEN
+                        } else {
+                            egui::Color32::YELLOW
+                        };
                         egui::Frame::none()
                             .fill(Theme::BG_WARNING)
                             .rounding(8.0)
                             .inner_margin(12.0)
                             .show(ui, |ui| {
                                 ui.label(
-                                    egui::RichText::new(
-                                        "⚠ Browser traffic is unencrypted HTTP/WebSocket. \
-                                         A LAN observer may capture the password, session, \
-                                         or audio. Use only on a trusted private network; \
-                                         this password does not encrypt audio or native streams.",
-                                    )
-                                    .size(11.0)
-                                    .color(egui::Color32::YELLOW),
+                                    egui::RichText::new(warning_text)
+                                        .size(11.0)
+                                        .color(warning_color),
                                 );
                             });
                     }
@@ -6464,6 +6490,9 @@ impl OpenAudioApp {
     }
 
     fn render_active_gateway_details(&self, ui: &mut egui::Ui) {
+        let scheme = if self.browser_https_enabled { "https" } else { "http" };
+        let ws_scheme = if self.browser_https_enabled { "wss" } else { "ws" };
+
         card_frame().show(ui, |ui| {
             ui.label(
                 egui::RichText::new("Gateway Address")
@@ -6475,16 +6504,41 @@ impl OpenAudioApp {
             ui.add_space(5.0);
 
             ui.monospace(
-                egui::RichText::new("http://<this-machine-IP>:7100/").color(Theme::ACCENT_BLUE),
+                egui::RichText::new(format!("{scheme}://<this-machine-IP>:7100/"))
+                    .color(Theme::ACCENT_BLUE),
+            );
+
+            ui.add_space(3.0);
+
+            ui.monospace(
+                egui::RichText::new(format!("{scheme}://<this-machine-IP>:7100/publish (Mobile Mic)"))
+                    .color(Theme::ACCENT_GREEN),
             );
 
             ui.add_space(5.0);
 
             ui.label(
-                egui::RichText::new("HTTP player/API: 7100  •  WebSocket relay: 7101")
-                    .size(11.0)
-                    .color(Theme::TEXT_SECONDARY),
+                egui::RichText::new(format!(
+                    "{} player/API: 7100  •  {} relay: 7101",
+                    scheme.to_uppercase(),
+                    ws_scheme.to_uppercase()
+                ))
+                .size(11.0)
+                .color(Theme::TEXT_SECONDARY),
             );
+
+            if self.browser_https_enabled {
+                ui.add_space(2.0);
+                ui.label(
+                    egui::RichText::new(
+                        "🔒 Native TLS Active (Self-signed cert — tap Advanced > Proceed on phone)",
+                    )
+                    .size(10.5)
+                    .color(Theme::ACCENT_GREEN),
+                );
+            }
+
+            ui.add_space(5.0);
 
             let access_label = match self.browser_access_mode {
                 BrowserAccessMode::PasswordProtected => "Access: password protected",
@@ -6544,11 +6598,18 @@ impl OpenAudioApp {
             },
         };
 
+        let tls = if self.browser_https_enabled {
+            audio_core::TlsConfig::AutoSelfSigned
+        } else {
+            audio_core::TlsConfig::Disabled
+        };
+
         let config = audio_core::WebGatewayConfig {
             http_port: 7100,
             access,
             max_clients: 8,
             session_duration: Duration::from_secs(8 * 60 * 60),
+            tls,
         };
 
         let directory = self.discovery_directory.clone();

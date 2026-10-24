@@ -139,6 +139,9 @@ pub use sar_config::{
     remove_openaudio_endpoints, EndpointKind,
 };
 
+pub mod tls;
+pub use tls::TlsConfig;
+
 // ── Browser playback ────────────────────────────────────────────────────
 pub use web_gateway::{run_web_gateway, GatewayAccess, WebGatewayConfig};
 

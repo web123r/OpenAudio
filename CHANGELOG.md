@@ -6,6 +6,18 @@ All notable changes to the OpenAudio project will be documented in this file.
 
 ### 🚀 Highlights & New Features
 
+#### 🔒 **Native HTTPS / TLS Gateway & Mobile Microphone Access**
+* Integrated native TLS into `web_gateway.rs` via `rustls` and `rcgen`, supporting ephemeral self-signed certificates covering `localhost`, `127.0.0.1`, and local LAN IPv4 addresses.
+* Unlocks the mobile browser "Secure Context" requirement on iOS Safari and Android Chrome without requiring external reverse proxies or mkcert.
+* Added desktop UI HTTPS toggle that updates gateway addresses to `https://` and secure WebSocket relay to `wss://`.
+
+#### 📱 **Low-Bandwidth Mobile Mic Publishing & WebCodecs Opus Compression**
+* Modernized `web-publisher.html` with in-browser WebCodecs `AudioEncoder` streaming real-time RFC 6716 Opus audio chunks at 32 kbps, 64 kbps, or 128 kbps (reducing mobile upload bandwidth from 1.54 Mbps PCM down to 32–64 kbps, a ~25x to 48x reduction).
+* Added inline `AudioWorklet` for glitch-free, jitter-free microphone frame capture on dedicated browser audio threads.
+* Direct server-side packet forwarding (`web_publish.rs`): wraps browser Opus frames into OpenAudio `SAMPLE_FORMAT_OPUS` UDP packets with zero host re-encoding CPU overhead.
+* Added live responsive Canvas VU / peak level meter (-48 dB to 0 dB with peak hold and clip indicator), mic gain control (0 to +24 dB), instant mute toggle, and live upload bandwidth monitor.
+* Built-in fallback to Float32 PCM if accessed from older browsers without WebCodecs.
+
 #### 🎙️ **Pure-Rust Opus End-to-End Transport (70x Bandwidth Reduction)**
 * Fully wired RFC 6716 Opus encoder (`OpusChannelEncoder`) and decoder (`OpusChannelDecoder`) into `transmit.rs`, `bus.rs`, and receiver applications.
 * Enables high-channel-count multi-track live streaming (36, 48, 64 channels) at ~1.5 to 3 Mbps total bandwidth compared to ~220 Mbps uncompressed PCM.

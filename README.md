@@ -153,11 +153,12 @@ Browser playback accepts Float32 PCM and resamples to the browser's output
 sample rate. For multichannel streams it defaults to a selected stereo pair;
 the optional alternate L/R mode averages even and odd channels.
 
-Browser microphone capture requires a secure browser context. Most browsers
-allow microphone access on `localhost` or HTTPS, but not on an ordinary
-HTTP LAN address. The gateway currently serves HTTP, not HTTPS, so mobile
-publishing from another device may require a trusted HTTPS reverse proxy or a
-browser/device configuration that grants microphone access to the LAN origin.
+Browser microphone capture requires a secure browser context. With native
+HTTPS / TLS enabled, OpenAudio generates an automatic self-signed TLS certificate
+covering localhost and local LAN IPs, allowing iOS Safari and Android Chrome to
+access `https://<computer-ip>:7100/publish` as a wireless microphone without
+external reverse proxies. The mobile publisher features in-browser WebCodecs Opus
+compression (32–128 kbps), live animated VU meters, mic gain, and mute controls.
 
 ## Network and security
 
@@ -201,8 +202,9 @@ AAD (Additional Authenticated Data) to defend against packet-injection and heade
   count exceeds your output hardware, pass `--downmix stereo` or `--channels 0,1` in the CLI.
 - **Browser playback is silent or distorted:** Confirm the stream is Float32 PCM,
   select the intended stereo pair, and check browser audio output/permissions.
-- **Browser microphone permission is denied:** Use localhost or serve the
-  publishing page through a trusted HTTPS origin.
+- **Browser microphone permission is denied:** Enable HTTPS in Browser Sharing,
+  open `https://<ip>:7100/publish`, and accept the browser's self-signed certificate
+  prompt (tap Advanced > Proceed). Modern mobile browsers require HTTPS for microphone access.
 - **ASIO is unavailable:** Ensure compatible ASIO drivers are installed, build with
   `--features asio`, and verify no exclusive DAW session is locking the ASIO driver.
 

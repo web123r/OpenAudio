@@ -11,7 +11,7 @@ use rand::RngCore;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::io::{Read, Write};
-use std::net::{IpAddr, SocketAddr, TcpListener, TcpStream, UdpSocket};
+use std::net::{IpAddr, SocketAddr, TcpListener, UdpSocket};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -53,6 +53,7 @@ pub struct WebGatewayConfig {
     pub access: GatewayAccess,
     pub max_clients: usize,
     pub session_duration: Duration,
+    pub tls: crate::tls::TlsConfig,
 }
 
 impl Default for WebGatewayConfig {
@@ -62,6 +63,7 @@ impl Default for WebGatewayConfig {
             access: GatewayAccess::Open,
             max_clients: 8,
             session_duration: Duration::from_secs(8 * 60 * 60),
+            tls: crate::tls::TlsConfig::Disabled,
         }
     }
 }
@@ -314,6 +316,10 @@ pub fn run_web_gateway(
         )
     })?;
 
+    let tls_server_config = crate::tls::create_server_config(&config.tls)?;
+    let is_tls = tls_server_config.is_some();
+    let proto_desc = if is_tls { "HTTPS/WSS" } else { "HTTP/WS" };
+
     let mode = if state.is_protected() {
         "password protected"
     } else {
@@ -321,21 +327,36 @@ pub fn run_web_gateway(
     };
 
     println!(
-        "Web gateway ready ({mode}): HTTP on \
-         :{http_port}, WebSocket on :{ws_port}"
+        "Web gateway ready ({mode}, {proto_desc}): port \
+         {http_port}, WebSocket on {ws_port}"
     );
 
     let http_directory = directory.clone();
     let http_state = state.clone();
     let http_keep_running = keep_running.clone();
+    let http_tls = tls_server_config.clone();
 
     let http_thread = thread::spawn(move || {
-        run_http_server(http_listener, http_directory, http_state, http_keep_running);
+        run_http_server(http_listener, http_directory, http_state, http_keep_running, http_tls);
     });
 
     while keep_running.load(Ordering::Acquire) {
         match ws_listener.accept() {
-            Ok((stream, address)) => {
+            Ok((tcp_stream, address)) => {
+                let stream = match &tls_server_config {
+                    Some(cfg) => match crate::tls::accept_tls_stream(tcp_stream, cfg.clone()) {
+                        Ok(s) => s,
+                        Err(error) => {
+                            eprintln!(
+                                "audio-core: TLS handshake failed for WebSocket client \
+                                 {address}: {error}"
+                            );
+                            continue;
+                        }
+                    },
+                    None => crate::tls::MaybeTlsStream::Plain(tcp_stream),
+                };
+
                 if !reserve_client_slot(&state) {
                     reject_tcp_connection(stream);
                     continue;
@@ -445,10 +466,25 @@ fn run_http_server(
     directory: DiscoveryDirectory,
     state: Arc<GatewayState>,
     keep_running: Arc<AtomicBool>,
+    tls_config: Option<Arc<rustls::ServerConfig>>,
 ) {
     while keep_running.load(Ordering::Acquire) {
         match listener.accept() {
-            Ok((stream, address)) => {
+            Ok((tcp_stream, address)) => {
+                let stream = match &tls_config {
+                    Some(cfg) => match crate::tls::accept_tls_stream(tcp_stream, cfg.clone()) {
+                        Ok(s) => s,
+                        Err(error) => {
+                            eprintln!(
+                                "audio-core: TLS handshake failed for HTTP client \
+                                 {address}: {error}"
+                            );
+                            continue;
+                        }
+                    },
+                    None => crate::tls::MaybeTlsStream::Plain(tcp_stream),
+                };
+
                 let request_directory = directory.clone();
 
                 let request_state = state.clone();
@@ -490,7 +526,7 @@ fn reserve_client_slot(state: &Arc<GatewayState>) -> bool {
         .is_ok()
 }
 
-fn reject_tcp_connection(mut stream: TcpStream) {
+fn reject_tcp_connection(mut stream: crate::tls::MaybeTlsStream) {
     let body = br#"{"message":"Too many browser clients"}"#;
 
     let _ = write_http_response(
@@ -503,7 +539,7 @@ fn reject_tcp_connection(mut stream: TcpStream) {
 }
 
 fn handle_http_request(
-    mut stream: TcpStream,
+    mut stream: crate::tls::MaybeTlsStream,
     address: SocketAddr,
     directory: &DiscoveryDirectory,
     state: &Arc<GatewayState>,
@@ -600,7 +636,7 @@ fn handle_http_request(
 }
 
 fn handle_authentication_status(
-    stream: &mut TcpStream,
+    stream: &mut crate::tls::MaybeTlsStream,
     state: &GatewayState,
     token: Option<&str>,
 ) -> std::io::Result<()> {
@@ -621,7 +657,7 @@ fn handle_authentication_status(
 }
 
 fn handle_login(
-    stream: &mut TcpStream,
+    stream: &mut crate::tls::MaybeTlsStream,
     client_ip: IpAddr,
     state: &GatewayState,
     request_body: &[u8],
@@ -756,7 +792,7 @@ fn verify_password(access: &RuntimeAccess, password: &str) -> bool {
 }
 
 fn handle_logout(
-    stream: &mut TcpStream,
+    stream: &mut crate::tls::MaybeTlsStream,
     state: &GatewayState,
     token: Option<&str>,
 ) -> std::io::Result<()> {
@@ -782,7 +818,7 @@ fn handle_logout(
 }
 
 fn handle_stream_list(
-    stream: &mut TcpStream,
+    stream: &mut crate::tls::MaybeTlsStream,
     directory: &DiscoveryDirectory,
     state: &GatewayState,
     token: Option<&str>,
@@ -829,7 +865,7 @@ fn handle_stream_list(
     )
 }
 
-fn read_http_request(stream: &mut TcpStream) -> std::io::Result<HttpRequest> {
+fn read_http_request(stream: &mut crate::tls::MaybeTlsStream) -> std::io::Result<HttpRequest> {
     use std::io::{Error, ErrorKind};
 
     let mut bytes = Vec::with_capacity(4096);
@@ -988,7 +1024,7 @@ fn read_http_request(stream: &mut TcpStream) -> std::io::Result<HttpRequest> {
 }
 
 fn write_http_response(
-    stream: &mut TcpStream,
+    stream: &mut crate::tls::MaybeTlsStream,
     status: &str,
     content_type: &str,
     body: &[u8],
@@ -1050,8 +1086,10 @@ fn unauthorized_websocket_response() -> ErrorResponse {
         .unwrap_or_else(|_| ErrorResponse::new(Some("Authentication required".to_string())))
 }
 
+type WsStream = tungstenite::WebSocket<crate::tls::MaybeTlsStream>;
+
 fn handle_ws_client(
-    stream: TcpStream,
+    stream: crate::tls::MaybeTlsStream,
     directory: DiscoveryDirectory,
     state: Arc<GatewayState>,
     global_keep_running: Arc<AtomicBool>,
@@ -1123,7 +1161,7 @@ fn handle_ws_client(
 }
 
 fn wait_for_stream_selection(
-    ws: &mut tungstenite::WebSocket<TcpStream>,
+    ws: &mut WsStream,
     directory: &DiscoveryDirectory,
     global_keep_running: &AtomicBool,
 ) -> Result<DiscoveredNode, String> {
@@ -1212,7 +1250,7 @@ fn start_resubscribe_thread(
 }
 
 fn relay_audio_to_websocket(
-    ws: &mut tungstenite::WebSocket<TcpStream>,
+    ws: &mut WsStream,
     socket: &UdpSocket,
     node: &DiscoveredNode,
     global_keep_running: &AtomicBool,
@@ -1487,7 +1525,7 @@ fn relay_audio_to_websocket(
 }
 
 fn send_ws_metrics(
-    ws: &mut tungstenite::WebSocket<TcpStream>,
+    ws: &mut WsStream,
     delivery_pct: f64,
     received: u64,
     lost: u64,
@@ -1507,7 +1545,7 @@ fn send_ws_metrics(
 }
 
 fn flush_web_audio_batch(
-    ws: &mut tungstenite::WebSocket<TcpStream>,
+    ws: &mut WsStream,
     payload: &mut Vec<u8>,
 ) -> Result<(), tungstenite::Error> {
     if payload.is_empty() {
@@ -1519,7 +1557,7 @@ fn flush_web_audio_batch(
 }
 
 fn send_ws_format(
-    ws: &mut tungstenite::WebSocket<TcpStream>,
+    ws: &mut WsStream,
     format: (u16, u32),
     stream_name: &str,
     channel_labels: &[String],
@@ -1537,7 +1575,7 @@ fn send_ws_format(
 }
 
 fn send_ws_stream_status(
-    ws: &mut tungstenite::WebSocket<TcpStream>,
+    ws: &mut WsStream,
     status: &str,
 ) -> Result<(), tungstenite::Error> {
     let payload = serde_json::json!({
@@ -1548,7 +1586,7 @@ fn send_ws_stream_status(
     ws.send(Message::Text(payload.to_string().into()))
 }
 
-fn send_ws_error(ws: &mut tungstenite::WebSocket<TcpStream>, message: &str) {
+fn send_ws_error(ws: &mut WsStream, message: &str) {
     let payload = serde_json::json!({
         "type": "error",
         "message": message,
