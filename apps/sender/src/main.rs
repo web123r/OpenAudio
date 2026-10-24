@@ -6795,47 +6795,20 @@ impl Drop for OpenAudioApp {
 // ============================================================================
 
 fn load_icon() -> egui::IconData {
-    let size = 64u32;
-    let mut rgba = Vec::with_capacity((size * size * 4) as usize);
-
-    let center_x = size as f32 / 2.0;
-    let center_y = size as f32 / 2.0;
-
-    for y in 0..size {
-        for x in 0..size {
-            let dx = x as f32 - center_x;
-            let dy = y as f32 - center_y;
-            let distance = (dx * dx + dy * dy).sqrt();
-
-            let outer_radius = size as f32 / 2.0;
-            let inner_radius = outer_radius * 0.55;
-
-            if distance <= outer_radius && distance >= inner_radius {
-                let angle = dy.atan2(dx);
-
-                let wave = ((angle * 3.0).sin() * 0.5 + 0.5) * 0.4 + 0.6;
-
-                rgba.push((wave * 100.0) as u8);
-                rgba.push((wave * 180.0) as u8);
-                rgba.push(255);
-                rgba.push(255);
-            } else if distance < inner_radius {
-                let pulse = (distance / inner_radius * std::f32::consts::PI).sin().abs();
-
-                rgba.push((pulse * 80.0) as u8);
-                rgba.push((pulse * 140.0) as u8);
-                rgba.push((pulse * 220.0) as u8);
-                rgba.push(200);
-            } else {
-                rgba.extend_from_slice(&[0, 0, 0, 0]);
-            }
-        }
+    if let Ok(img) = image::load_from_memory(include_bytes!("../icon.ico")) {
+        let rgba = img.to_rgba8();
+        let (width, height) = rgba.dimensions();
+        return egui::IconData {
+            rgba: rgba.into_raw(),
+            width,
+            height,
+        };
     }
 
     egui::IconData {
-        rgba,
-        width: size,
-        height: size,
+        rgba: vec![0; 64 * 64 * 4],
+        width: 64,
+        height: 64,
     }
 }
 

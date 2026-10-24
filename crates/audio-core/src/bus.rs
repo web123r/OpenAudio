@@ -477,7 +477,8 @@ fn render_bus_output(
 
         for source_buffer in buffers_guard.values_mut() {
             for sample in input_frame.iter_mut() {
-                *sample = source_buffer.pop_front().unwrap_or(0.0);
+                // Smooth exponential decay if buffer momentarily runs dry, avoiding sharp Dirac step clicks
+                *sample = source_buffer.pop_front().unwrap_or_else(|| *sample * 0.85);
             }
 
             remap_frame_into(input_frame, remapped_frame);
