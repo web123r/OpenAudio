@@ -113,6 +113,7 @@ pub fn sample_rate_to_code(rate: u32) -> u16 {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ParsedPacket {
+    pub sub_stream_index: u16,
     pub stream_id: u32,
     pub sequence_number: u32,
     pub presentation_timestamp_ns: u64,
@@ -209,7 +210,7 @@ pub fn encode_opus_packet(
     samples_per_channel: u16,
     opus_payload: &[u8],
 ) -> Result<Vec<u8>, String> {
-    if channel_count != 1 && channel_count != 2 {
+    if !(1..=64).contains(&channel_count) {
         return Err(format!("unsupported opus channel count: {channel_count}"));
     }
 
@@ -246,6 +247,7 @@ pub fn parse_packet(buf: &[u8]) -> Option<ParsedPacket> {
         return None;
     }
 
+    let sub_stream_index = u16::from_be_bytes(buf[6..8].try_into().ok()?);
     let stream_id = u32::from_be_bytes(buf[8..12].try_into().ok()?);
     let sequence_number = u32::from_be_bytes(buf[12..16].try_into().ok()?);
     let presentation_timestamp_ns = u64::from_be_bytes(buf[16..24].try_into().ok()?);
@@ -264,6 +266,7 @@ pub fn parse_packet(buf: &[u8]) -> Option<ParsedPacket> {
     }
 
     Some(ParsedPacket {
+        sub_stream_index,
         stream_id,
         sequence_number,
         presentation_timestamp_ns,

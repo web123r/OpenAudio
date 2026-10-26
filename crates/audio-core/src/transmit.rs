@@ -764,7 +764,7 @@ fn spawn_capture_publisher_with_codec(
             network_core::fec::FecEncoder::new(network_core::fec::DEFAULT_FEC_GROUP_SIZE);
         let sample_rate = network_core::protocol::code_to_sample_rate(rate_code);
         let mut opus_encoder = match codec {
-            PayloadCodec::Opus { bitrate_kbps } if channels <= 2 => {
+            PayloadCodec::Opus { bitrate_kbps } => {
                 crate::opus::OpusChannelEncoder::new(sample_rate, channels as usize, bitrate_kbps).ok()
             }
             _ => None,

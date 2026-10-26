@@ -178,6 +178,7 @@ impl FecDecoder {
         self.recovered_count = self.recovered_count.saturating_add(1);
 
         let parsed = ParsedPacket {
+            sub_stream_index: 0,
             stream_id: fec.stream_id,
             sequence_number: missing_seq,
             presentation_timestamp_ns: fec.presentation_timestamp_ns,

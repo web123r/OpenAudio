@@ -53,6 +53,7 @@ pub struct DiagnosticPublishConfig {
     pub stream_id: u32,
     pub channel_count: usize,
     pub sample_rate: u32,
+    pub use_opus: bool,
 }
 
 impl DiagnosticPublishConfig {
@@ -69,10 +70,16 @@ impl DiagnosticPublishConfig {
             stream_id,
             channel_count,
             sample_rate,
+            use_opus: false,
         };
 
         config.validate()?;
         Ok(config)
+    }
+
+    pub fn with_opus(mut self, use_opus: bool) -> Self {
+        self.use_opus = use_opus;
+        self
     }
 
     pub fn validate(&self) -> Result<(), String> {
@@ -214,10 +221,27 @@ pub fn publish_diagnostic_stream_with_discovery(
 
     let sample_rate_code = sample_rate_to_code(config.sample_rate);
 
-    let maximum_frames_per_packet = calculate_max_frames_per_packet(config.channel_count)?;
+    let maximum_frames_per_packet = if config.use_opus {
+        crate::opus::OPUS_FRAME_SAMPLES
+    } else {
+        calculate_max_frames_per_packet(config.channel_count)?
+    };
 
-    let maximum_packet_bytes = OPENAUDIO_HEADER_BYTES
-        + maximum_frames_per_packet * config.channel_count * BYTES_PER_SAMPLE;
+    let maximum_packet_bytes = if config.use_opus {
+        SAFE_UDP_PAYLOAD_BYTES
+    } else {
+        OPENAUDIO_HEADER_BYTES + maximum_frames_per_packet * config.channel_count * BYTES_PER_SAMPLE
+    };
+
+    let mut opus_encoder = if config.use_opus {
+        Some(crate::opus::OpusChannelEncoder::new(
+            config.sample_rate,
+            config.channel_count,
+            128,
+        )?)
+    } else {
+        None
+    };
 
     let socket = UdpSocket::bind("0.0.0.0:0").map_err(|error| {
         format!(
@@ -403,16 +427,49 @@ pub fn publish_diagnostic_stream_with_discovery(
         let presentation_timestamp_ns =
             frames_to_nanoseconds(generated_timeline_frames, config.sample_rate);
 
-        build_audio_packet(
-            &mut packet,
-            config.stream_id,
-            sequence_number,
-            presentation_timestamp_ns,
-            config.channel_count,
-            sample_rate_code,
-            frames_to_generate,
-            &interleaved_samples,
-        )?;
+        let packet_ready = if let Some(ref mut enc) = opus_encoder {
+            match enc.push_samples(&interleaved_samples) {
+                Ok(Some(opus_payload)) => {
+                    let header = PacketHeader {
+                        sub_stream_index: 0,
+                        stream_id: config.stream_id,
+                        sequence_number,
+                        presentation_timestamp_ns,
+                    };
+                    packet = network_core::protocol::encode_opus_packet(
+                        &header,
+                        config.channel_count as u8,
+                        config.sample_rate,
+                        crate::opus::OPUS_FRAME_SAMPLES as u16,
+                        &opus_payload,
+                    )?;
+                    true
+                }
+                Ok(None) => false,
+                Err(e) => return Err(format!("diagnostic Opus encode error: {e}")),
+            }
+        } else {
+            build_audio_packet(
+                &mut packet,
+                config.stream_id,
+                sequence_number,
+                presentation_timestamp_ns,
+                config.channel_count,
+                sample_rate_code,
+                frames_to_generate,
+                &interleaved_samples,
+            )?;
+            true
+        };
+
+        if !packet_ready {
+            report.generated_frames = report
+                .generated_frames
+                .saturating_add(frames_to_generate as u64);
+            generated_timeline_frames =
+                generated_timeline_frames.saturating_add(frames_to_generate as u64);
+            continue;
+        }
 
         if packet.len() > SAFE_UDP_PAYLOAD_BYTES {
             return Err(format!(
@@ -884,6 +941,7 @@ mod tests {
             stream_id: 9_001,
             channel_count: 32,
             sample_rate: 123_456,
+            use_opus: false,
         };
 
         assert!(config.validate().is_err());
@@ -897,6 +955,7 @@ mod tests {
             stream_id: 9_001,
             channel_count: 0,
             sample_rate: 48_000,
+            use_opus: false,
         };
 
         assert!(config.validate().is_err());

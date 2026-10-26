@@ -546,7 +546,7 @@ fn run_publish(options: PublishOptions) -> Result<(), String> {
     };
 
     println!(
-        "OpenAudio Headless Publisher active:\n\
+        "OpenAudio by Ferronme Headless Publisher active:\n\
          • Node name:    {}\n\
          • Stream name:  {}\n\
          • Stream ID:    {}\n\
@@ -701,7 +701,7 @@ fn parse_args(mut raw_args: Vec<String>) -> Result<CliCommand, String> {
                 }
                 "--help" | "-h" => {
                     println!(
-                        "OpenAudio headless publisher\n\n\
+                        "OpenAudio by Ferronme headless publisher\n\n\
                          Usage:\n\
                            receiver publish [--device <NAME>] [--stream-name <NAME>] [--stream-id <ID>] [--codec <pcm|opus>] [--record <PATH>]\n\
                            receiver publish --list-devices\n\n\
@@ -787,7 +787,7 @@ fn parse_args(mut raw_args: Vec<String>) -> Result<CliCommand, String> {
             }
             "--help" | "-h" => {
                 println!(
-                    "OpenAudio receiver CLI\n\n\
+                    "OpenAudio by Ferronme receiver CLI\n\n\
                      Usage:\n\
                        receiver --list\n\
                        receiver --publisher <IP> --stream-id <ID> [--port <UDP>] [--seconds <N>] [--channels <CH1,CH2,...>] [--downmix] [--record <PATH>]\n\

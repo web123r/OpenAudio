@@ -1024,7 +1024,7 @@ impl OpenAudioApp {
         ui.horizontal(|ui| {
             ui.vertical(|ui| {
                 ui.label(
-                    egui::RichText::new("Ferronme's Open Audio")
+                    egui::RichText::new("OpenAudio by Ferronme")
                         .size(28.0)
                         .strong()
                         .color(Theme::TEXT_PRIMARY),
@@ -6972,7 +6972,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
 
     eframe::run_native(
-        "Ferronme's Open Audio",
+        "OpenAudio by Ferronme",
         options,
         Box::new(move |_creation_context| {
             let mut app = OpenAudioApp::default();

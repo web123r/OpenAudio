@@ -1,6 +1,6 @@
-# OpenAudio
+# OpenAudio by Ferronme
 
-OpenAudio is an open-source, cross-platform audio-over-IP project written in
+OpenAudio by Ferronme is an open-source, cross-platform audio-over-IP project written in
 Rust. It includes a desktop sender/router, a headless receiver and publisher CLI,
 and browser playback and publishing gateways. Supported audio wire formats include
 uncompressed Float32 PCM for bit-perfect low-latency studio networks, and RFC 6716

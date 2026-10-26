@@ -588,6 +588,7 @@ mod tests {
 
         let mut window = PacketReorderWindow::new(8);
         let dummy_pkt = |seq: u32| ParsedPacket {
+            sub_stream_index: 0,
             stream_id: 1,
             sequence_number: seq,
             presentation_timestamp_ns: 0,
@@ -624,6 +625,7 @@ mod tests {
 
         let mut window = PacketReorderWindow::new(8);
         let packet = |sequence_number| ParsedPacket {
+            sub_stream_index: 0,
             stream_id: 1,
             sequence_number,
             presentation_timestamp_ns: 0,

@@ -1,6 +1,6 @@
 use crate::discovery::{send_subscribe_request, DiscoveredNode};
 use crate::ensure_realtime_audio_thread;
-use crate::protocol::{float32_payload, parse_packet, SAMPLE_FORMAT_FLOAT32};
+use crate::protocol::{float32_payload, parse_packet, SAMPLE_FORMAT_FLOAT32, SAMPLE_FORMAT_OPUS};
 use network_core::fec::FecDecoder;
 use network_core::plc::PacketLossConcealer;
 use network_core::protocol::{parse_fec_packet, peek_packet_type, PACKET_TYPE_FEC};
@@ -1273,6 +1273,7 @@ fn relay_audio_to_websocket(
 
     let mut fec_decoder = FecDecoder::new(32);
     let mut plc: Option<PacketLossConcealer> = None;
+    let mut opus_decoder: Option<crate::opus::OpusChannelDecoder> = None;
 
     loop {
         if !global_keep_running.load(Ordering::Acquire) {
@@ -1308,11 +1309,6 @@ fn relay_audio_to_websocket(
                     continue;
                 };
 
-                if parsed.sample_format != SAMPLE_FORMAT_FLOAT32 {
-                    send_ws_error(ws, "Browser playback currently supports Float32 PCM only");
-                    return Ok(());
-                }
-
                 let channels = parsed.channel_count as usize;
 
                 if channels == 0 || channels > MAX_CHANNELS {
@@ -1323,11 +1319,33 @@ fn relay_audio_to_websocket(
                     continue;
                 }
 
-                let Some(payload) = float32_payload(packet, &parsed) else {
-                    continue;
+                let mut pcm: Vec<f32> = if parsed.sample_format == SAMPLE_FORMAT_FLOAT32 {
+                    let Some(payload) = float32_payload(packet, &parsed) else {
+                        continue;
+                    };
+                    fec_decoder.record_received(parsed.sequence_number, payload);
+                    payload
+                        .chunks_exact(4)
+                        .map(|bytes| f32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
+                        .collect()
+                } else if parsed.sample_format == SAMPLE_FORMAT_OPUS {
+                    let Some(opus_data) = network_core::protocol::opus_payload(packet, &parsed) else {
+                        continue;
+                    };
+                    if opus_decoder.is_none() {
+                        opus_decoder = crate::opus::OpusChannelDecoder::new(parsed.sample_rate, channels).ok();
+                    }
+                    let Some(ref mut dec) = opus_decoder else {
+                        continue;
+                    };
+                    match dec.decode_packet(opus_data) {
+                        Ok(samples) => samples,
+                        Err(_) => continue,
+                    }
+                } else {
+                    send_ws_error(ws, "Unsupported audio sample format");
+                    return Ok(());
                 };
-
-                fec_decoder.record_received(parsed.sequence_number, payload);
 
                 if plc.is_none() {
                     plc = Some(PacketLossConcealer::new(channels));
@@ -1413,11 +1431,6 @@ fn relay_audio_to_websocket(
                 if batched_payload.is_empty() {
                     batch_started = Instant::now();
                 }
-
-                let mut pcm: Vec<f32> = payload
-                    .chunks_exact(4)
-                    .map(|bytes| f32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
-                    .collect();
 
                 if let Some(plc_inst) = &mut plc {
                     plc_inst.process_incoming(&mut pcm);
