@@ -1,4 +1,4 @@
-?<#
+<#
 .SYNOPSIS
     Builds and packages the complete standalone OpenAudio release with built-in ASIO support.
 .DESCRIPTION
@@ -18,21 +18,21 @@ Write-Host "==========================================================" -Foregro
 $repoRoot = Resolve-Path (Join-Path $PSScriptRoot "..")
 Set-Location $repoRoot
 
-$version = "0.3.0"
+$version = "0.3.2"
 $distDir = Join-Path $repoRoot "dist"
 $packageDir = Join-Path $distDir "OpenAudio-v$version-windows-x64"
 $zipFile = Join-Path $distDir "OpenAudio-v$version-windows-x64.zip"
 
 Write-Host "[1/5] Building OpenAudio desktop app with ASIO enabled..." -ForegroundColor White
-$buildApp = Start-Process cargo -ArgumentList "build", "--release", "--features", "asio", "--bin", "OpenAudio" -NoNewWindow -PassThru -Wait
-if ($buildApp.ExitCode -ne 0) {
+& cargo build --release --features asio --bin OpenAudio
+if ($LASTEXITCODE -ne 0) {
     Write-Host "Failed to build OpenAudio.exe with ASIO support." -ForegroundColor Red
     exit 1
 }
 
 Write-Host "[2/5] Bundling OpenAudio.vst3 DAW plugin..." -ForegroundColor White
-$buildPlugin = Start-Process cargo -ArgumentList "run", "--release", "-p", "openaudio-plugin-xtask", "--", "bundle", "openaudio-plugin", "--release" -NoNewWindow -PassThru -Wait
-if ($buildPlugin.ExitCode -ne 0) {
+& cargo run --release -p openaudio-plugin-xtask -- bundle openaudio-plugin --release
+if ($LASTEXITCODE -ne 0) {
     Write-Host "Failed to bundle OpenAudio.vst3 plugin." -ForegroundColor Red
     exit 1
 }

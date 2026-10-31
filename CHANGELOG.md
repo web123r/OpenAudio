@@ -2,7 +2,7 @@
 
 All notable changes to the OpenAudio project will be documented in this file.
 
-## [Unreleased]
+## [0.3.2] - 2026-10-31
 
 ### 🎛️ **VST3 Plugin Opus Support**
 * The plugin now decodes Opus: its receiver declares PCM and Opus and decodes through the shared `AudioPacketDecoder`, so it receives multichannel Opus streams that previously reached it as nothing.
