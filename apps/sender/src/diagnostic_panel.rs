@@ -5,7 +5,7 @@
 
 use audio_core::{
     publish_diagnostic_stream_with_discovery, DiagnosticPublishConfig, DiagnosticPublishReport,
-    SubscriberRegistry,
+    DiagnosticTransportFormat, SubscriberRegistry,
 };
 use eframe::egui;
 
@@ -20,7 +20,7 @@ const SAFE_UDP_PAYLOAD_BYTES: usize = 1_200;
 const OPENAUDIO_HEADER_BYTES: usize = 32;
 const BYTES_PER_SAMPLE: usize = std::mem::size_of::<f32>();
 
-const CHANNEL_OPTIONS: [usize; 7] = [2, 8, 16, 24, 32, 48, 64];
+const CHANNEL_OPTIONS: [usize; 6] = [2, 8, 16, 24, 32, 64];
 const SAMPLE_RATE_OPTIONS: [u32; 2] = [44_100, 48_000];
 
 /// Owns all synthetic diagnostic publisher sessions.
@@ -36,7 +36,7 @@ struct DiagnosticSession {
     stream_id: u32,
     channel_count: usize,
     sample_rate: u32,
-    use_opus: bool,
+    transport_format: DiagnosticTransportFormat,
 
     running: Arc<AtomicBool>,
     status: Arc<Mutex<String>>,
@@ -83,10 +83,6 @@ impl DiagnosticPanel {
 
                     if ui.button("Add 32-channel test").clicked() {
                         self.add_session_with_channels(32);
-                    }
-
-                    if ui.button("Add 48-channel test").clicked() {
-                        self.add_session_with_channels(48);
                     }
                 });
 
@@ -181,76 +177,53 @@ impl DiagnosticPanel {
                                         );
                                         ui.end_row();
 
+                                        ui.label("Transport format");
+                                        ui.horizontal(|ui| {
+                                            ui.radio_value(
+                                                &mut session.transport_format,
+                                                DiagnosticTransportFormat::Float32,
+                                                "Float32",
+                                            );
+                                            if ui
+                                                .radio_value(
+                                                    &mut session.transport_format,
+                                                    DiagnosticTransportFormat::Opus,
+                                                    "Opus",
+                                                )
+                                                .clicked()
+                                            {
+                                                session.sample_rate = 48_000;
+                                            }
+                                        });
+                                        ui.end_row();
+
                                         ui.label("Sample rate");
-                                        egui::ComboBox::from_id_source(format!(
-                                            "diagnostic_rate_{}",
-                                            session.id
-                                        ))
-                                        .selected_text(format!("{} Hz", session.sample_rate))
-                                        .show_ui(
-                                            ui,
+                                        ui.add_enabled_ui(
+                                            session.transport_format
+                                                == DiagnosticTransportFormat::Float32,
                                             |ui| {
-                                                for sample_rate in SAMPLE_RATE_OPTIONS {
-                                                    ui.selectable_value(
-                                                        &mut session.sample_rate,
-                                                        sample_rate,
-                                                        format!("{sample_rate} Hz"),
-                                                    );
-                                                }
+                                                egui::ComboBox::from_id_source(format!(
+                                                    "diagnostic_rate_{}",
+                                                    session.id
+                                                ))
+                                                .selected_text(format!(
+                                                    "{} Hz",
+                                                    session.sample_rate
+                                                ))
+                                                .show_ui(ui, |ui| {
+                                                    for sample_rate in SAMPLE_RATE_OPTIONS {
+                                                        ui.selectable_value(
+                                                            &mut session.sample_rate,
+                                                            sample_rate,
+                                                            format!("{sample_rate} Hz"),
+                                                        );
+                                                    }
+                                                });
                                             },
                                         );
                                         ui.end_row();
-
-                                        ui.label("Transport / Codec");
-                                        ui.horizontal(|ui| {
-                                            ui.selectable_value(
-                                                &mut session.use_opus,
-                                                false,
-                                                "Float32 PCM (Uncompressed)",
-                                            );
-                                            ui.selectable_value(
-                                                &mut session.use_opus,
-                                                true,
-                                                "Opus (Compressed — Low Bandwidth)",
-                                            );
-                                        });
-                                        ui.end_row();
                                     });
                             });
-
-                            if session.use_opus {
-                                ui.add_space(6.0);
-                                egui::Frame::none()
-                                    .fill(egui::Color32::from_rgb(18, 32, 48))
-                                    .rounding(6.0)
-                                    .inner_margin(8.0)
-                                    .show(ui, |ui| {
-                                        ui.horizontal(|ui| {
-                                            ui.label(
-                                                egui::RichText::new("⏱")
-                                                    .size(16.0)
-                                                    .color(egui::Color32::from_rgb(0, 210, 255)),
-                                            );
-                                            ui.vertical(|ui| {
-                                                ui.label(
-                                                    egui::RichText::new(
-                                                        "Latency Note: Opus adds ~10–20 ms algorithmic buffering & encoding delay.",
-                                                    )
-                                                    .size(11.5)
-                                                    .strong()
-                                                    .color(egui::Color32::from_rgb(140, 215, 255)),
-                                                );
-                                                ui.label(
-                                                    egui::RichText::new(
-                                                        "Slashes 48-channel bandwidth from ~73.7 Mbps down to ~0.77 Mbps so all channels stream smoothly without packet loss even over weak or congested Wi-Fi.",
-                                                    )
-                                                    .size(11.0)
-                                                    .color(egui::Color32::from_rgb(190, 210, 230)),
-                                                );
-                                            });
-                                        });
-                                    });
-                            }
 
                             ui.add_space(8.0);
 
@@ -334,7 +307,7 @@ impl DiagnosticPanel {
             stream_id,
             channel_count,
             sample_rate: DEFAULT_SAMPLE_RATE,
-            use_opus: channel_count >= 32, // Default to Opus for high channel counts to prevent Wi-Fi saturation
+            transport_format: DiagnosticTransportFormat::Float32,
             running: Arc::new(AtomicBool::new(false)),
             status: Arc::new(Mutex::new(
                 "Ready. Start the test, then subscribe normally.".to_string(),
@@ -359,7 +332,7 @@ fn start_session(session: &mut DiagnosticSession, subscribers_by_stream: Subscri
         return;
     }
 
-    let mut config = match DiagnosticPublishConfig::new(
+    let config = match DiagnosticPublishConfig::new(
         session.node_name.trim(),
         session.stream_name.trim(),
         session.stream_id,
@@ -372,7 +345,18 @@ fn start_session(session: &mut DiagnosticSession, subscribers_by_stream: Subscri
             return;
         }
     };
-    config.use_opus = session.use_opus;
+
+    let config = match session.transport_format {
+        DiagnosticTransportFormat::Float32 => Ok(config),
+        DiagnosticTransportFormat::Opus => config.with_opus(128_000),
+    };
+    let config = match config {
+        Ok(config) => config,
+        Err(error) => {
+            write_status(&session.status, format!("Failed: {error}"));
+            return;
+        }
+    };
 
     session.running.store(true, Ordering::Release);
     session.started_at = Some(Instant::now());
@@ -458,24 +442,15 @@ fn stop_session(session: &mut DiagnosticSession) {
 }
 
 fn show_load_estimate(ui: &mut egui::Ui, session: &DiagnosticSession) {
-    let (frames_per_packet, packet_bytes, packets_per_second, bandwidth_mbps) = if session.use_opus {
-        let frames = 480; // 10 ms @ 48 kHz
-        let num_substreams = (session.channel_count + 1) / 2;
-        let pps = session.sample_rate as f64 / frames as f64;
-        let bytes = OPENAUDIO_HEADER_BYTES + num_substreams * 42;
-        let mbps = (bytes as f64 * 8.0 * pps) / 1_000_000.0;
-        (frames, bytes, pps, mbps)
+    let frames_per_packet = calculate_frames_per_packet(session.channel_count);
+
+    let packet_bytes =
+        OPENAUDIO_HEADER_BYTES + frames_per_packet * session.channel_count * BYTES_PER_SAMPLE;
+
+    let packets_per_second = if frames_per_packet == 0 {
+        0.0
     } else {
-        let frames = calculate_frames_per_packet(session.channel_count);
-        let bytes = OPENAUDIO_HEADER_BYTES + frames * session.channel_count * BYTES_PER_SAMPLE;
-        let pps = if frames == 0 {
-            0.0
-        } else {
-            session.sample_rate as f64 / frames as f64
-        };
-        let mbps = session.channel_count as f64 * session.sample_rate as f64 * BYTES_PER_SAMPLE as f64 * 8.0
-            / 1_000_000.0;
-        (frames, bytes, pps, mbps)
+        session.sample_rate as f64 / frames_per_packet as f64
     };
 
     let raw_pcm_mbps =
@@ -487,7 +462,7 @@ fn show_load_estimate(ui: &mut egui::Ui, session: &DiagnosticSession) {
         .striped(true)
         .show(ui, |ui| {
             ui.weak("Frames per packet");
-            ui.label(format!("{frames_per_packet} (10 ms frame)"));
+            ui.label(frames_per_packet.to_string());
             ui.end_row();
 
             ui.weak("UDP payload");
@@ -498,26 +473,15 @@ fn show_load_estimate(ui: &mut egui::Ui, session: &DiagnosticSession) {
             ui.label(format!("{packets_per_second:.0} packets/s"));
             ui.end_row();
 
-            if session.use_opus {
-                ui.weak("Compressed stream");
-                ui.label(format!("{bandwidth_mbps:.2} Mbps (vs {raw_pcm_mbps:.1} Mbps raw Float32)"));
-                ui.end_row();
-
-                ui.weak("Bandwidth savings");
-                let savings = (1.0 - (bandwidth_mbps / raw_pcm_mbps.max(0.01))) * 100.0;
-                ui.colored_label(egui::Color32::LIGHT_GREEN, format!("{savings:.1}% bandwidth saved"));
-                ui.end_row();
-            } else {
-                ui.weak("Raw Float32 audio");
-                ui.label(format!("{bandwidth_mbps:.2} Mbps"));
-                ui.end_row();
-            }
+            ui.weak("Raw Float32 audio");
+            ui.label(format!("{raw_pcm_mbps:.2} Mbps"));
+            ui.end_row();
         });
 
     if packet_bytes <= SAFE_UDP_PAYLOAD_BYTES {
         ui.colored_label(
             egui::Color32::LIGHT_GREEN,
-            "✓ Packet size is below the 1200-byte safety limit (No Wi-Fi fragmentation).",
+            "✓ Packet size is below the 1200-byte safety limit.",
         );
     } else {
         ui.colored_label(

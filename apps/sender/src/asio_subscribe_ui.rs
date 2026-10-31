@@ -677,9 +677,13 @@ fn start_session(
         return;
     }
 
-    if let Err(error) =
-        audio_core::send_subscribe_request(&stream.ip, stream.control_port, stream.stream_id, port)
-    {
+    if let Err(error) = audio_core::send_subscribe_request_with_formats(
+        &stream.ip,
+        stream.control_port,
+        stream.stream_id,
+        port,
+        audio_core::PCM_AND_OPUS_WIRE_FORMATS,
+    ) {
         crate::release_asio_device(&driver_name);
         set_error(
             error_banner,
@@ -716,11 +720,12 @@ fn start_session(
     let reconnect_stream_id = stream.stream_id;
     thread::spawn(move || {
         while reconnect_running.load(Ordering::Acquire) {
-            if let Err(error) = audio_core::send_subscribe_request(
+            if let Err(error) = audio_core::send_subscribe_request_with_formats(
                 &reconnect_ip,
                 reconnect_control_port,
                 reconnect_stream_id,
                 port,
+                audio_core::PCM_AND_OPUS_WIRE_FORMATS,
             ) {
                 eprintln!("audio-core: ASIO subscription renewal failed: {error}");
             }

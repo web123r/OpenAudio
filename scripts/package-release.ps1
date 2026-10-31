@@ -18,28 +18,21 @@ Write-Host "==========================================================" -Foregro
 $repoRoot = Resolve-Path (Join-Path $PSScriptRoot "..")
 Set-Location $repoRoot
 
-$version = "0.3.1"
+$version = "0.3.2"
 $distDir = Join-Path $repoRoot "dist"
 $packageDir = Join-Path $distDir "OpenAudio-v$version-windows-x64"
 $zipFile = Join-Path $distDir "OpenAudio-v$version-windows-x64.zip"
 
 Write-Host "[1/5] Building OpenAudio desktop app with ASIO enabled..." -ForegroundColor White
-$buildApp = Start-Process cargo -ArgumentList "build", "--release", "--features", "asio", "--bin", "OpenAudio" -NoNewWindow -PassThru -Wait
-if ($buildApp.ExitCode -ne 0) {
+& cargo build --release --features asio --bin OpenAudio
+if ($LASTEXITCODE -ne 0) {
     Write-Host "Failed to build OpenAudio.exe with ASIO support." -ForegroundColor Red
     exit 1
 }
 
-Write-Host "Building OpenAudio headless CLI (receiver & publisher)..." -ForegroundColor White
-$buildReceiver = Start-Process cargo -ArgumentList "build", "--release", "--bin", "receiver" -NoNewWindow -PassThru -Wait
-if ($buildReceiver.ExitCode -ne 0) {
-    Write-Host "Failed to build receiver.exe." -ForegroundColor Red
-    exit 1
-}
-
 Write-Host "[2/5] Bundling OpenAudio.vst3 DAW plugin..." -ForegroundColor White
-$buildPlugin = Start-Process cargo -ArgumentList "run", "--release", "-p", "openaudio-plugin-xtask", "--", "bundle", "openaudio-plugin", "--release" -NoNewWindow -PassThru -Wait
-if ($buildPlugin.ExitCode -ne 0) {
+& cargo run --release -p openaudio-plugin-xtask -- bundle openaudio-plugin --release
+if ($LASTEXITCODE -ne 0) {
     Write-Host "Failed to bundle OpenAudio.vst3 plugin." -ForegroundColor Red
     exit 1
 }
@@ -53,10 +46,6 @@ New-Item -ItemType Directory -Path $packageDir -Force | Out-Null
 # Copy main binary
 Copy-Item (Join-Path $repoRoot "target\release\OpenAudio.exe") $packageDir -Force
 Write-Host " - Copied OpenAudio.exe (ASIO enabled)" -ForegroundColor Gray
-
-# Copy headless CLI
-Copy-Item (Join-Path $repoRoot "target\release\receiver.exe") $packageDir -Force
-Write-Host " - Copied receiver.exe (Headless CLI Publisher & Receiver)" -ForegroundColor Gray
 
 # Copy VST3 bundle
 Copy-Item (Join-Path $repoRoot "target\bundled\OpenAudio.vst3") (Join-Path $packageDir "OpenAudio.vst3") -Recurse -Force
@@ -76,13 +65,8 @@ Self-hosted, ultra-low latency Audio-over-IP for studios, DAWs, and live sound.
 
 ## Features Included in This Build
 - **Native ASIO & WASAPI Engines:** Direct hardware input/output and loopback.
-- **Pure-Rust Opus Compression:** 70x bandwidth reduction for multi-track streams (36–64 channels).
-- **Lossless FLAC & WAV Archival Recording:** Direct per-stream recording on both publishers and subscribers.
 - **Visual Audio Patchbay Matrix:** Real-time 2D crossbar routing between network streams and output hardware.
-- **Live Latency & Network Quality Indicators:** Real-time RTT, 1-way network delay, jitter (RFC 3550), packet loss %, and buffer depth.
-- **Autonomous Stream Reconnection:** Automatic discovery-based reconnect when publishers restart.
-- **Headless CLI Tools (`receiver.exe`):** Headless publish and subscribe modes for audio servers and nodes.
-- **RFC 5109 FEC & Packet Loss Concealment (PLC):** Bit-exact recovery and waveform smoothing over Wi-Fi/LAN.
+- **RFC 5109 FEC & Packet Loss Concealment (PLC):** Bit-exact recovery and waveform smoothing to eliminate audio dropouts and skips over Wi-Fi/LAN.
 - **Dynamic Jitter Buffer Controls:** Instant toggles for LAN (5ms), Wi-Fi (20ms), and Safe (50ms).
 - **DAW VST3 Sender Plugin:** Low-latency track publishing straight from REAPER, Ableton, Cubase, etc.
 - **Web Browser Gateway:** Live stream listening on phones, tablets, and remote PCs without installing software.

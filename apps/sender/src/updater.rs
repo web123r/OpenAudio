@@ -109,12 +109,16 @@ impl UpdateChecker {
                         let new_status = match res {
                             Ok(release) => {
                                 let tag = release.tag_name.trim_start_matches('v').trim();
-                                if !release.draft.unwrap_or(false) && is_newer_version(tag, current_ver) {
+                                if !release.draft.unwrap_or(false)
+                                    && is_newer_version(tag, current_ver)
+                                {
                                     let download_url = release
                                         .assets
                                         .as_ref()
                                         .and_then(|assets| {
-                                            assets.iter().find(|a| a.name.ends_with(".zip") || a.name.ends_with(".exe"))
+                                            assets.iter().find(|a| {
+                                                a.name.ends_with(".zip") || a.name.ends_with(".exe")
+                                            })
                                         })
                                         .map(|a| a.browser_download_url.clone())
                                         .or_else(|| Some(release.html_url.clone()));
@@ -122,7 +126,9 @@ impl UpdateChecker {
                                     UpdateStatus::UpdateAvailable {
                                         current_version: current_ver.to_string(),
                                         latest_version: tag.to_string(),
-                                        release_name: release.name.unwrap_or_else(|| format!("v{tag}")),
+                                        release_name: release
+                                            .name
+                                            .unwrap_or_else(|| format!("v{tag}")),
                                         release_url: release.html_url,
                                         download_url,
                                         release_notes: release.body.unwrap_or_default(),

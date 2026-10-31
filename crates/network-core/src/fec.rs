@@ -1,6 +1,6 @@
-use crate::protocol::{
-    encode_fec_packet, ParsedFecPacket, ParsedPacket, SAMPLE_FORMAT_FLOAT32,
-};
+#![allow(clippy::too_many_arguments)]
+
+use crate::protocol::{encode_fec_packet, ParsedFecPacket, ParsedPacket, SAMPLE_FORMAT_FLOAT32};
 use std::collections::BTreeMap;
 
 pub const DEFAULT_FEC_GROUP_SIZE: usize = 5;
@@ -56,8 +56,13 @@ impl FecEncoder {
             self.parity_buffer.extend_from_slice(raw_float32_payload);
         } else {
             let len = self.parity_buffer.len().min(raw_float32_payload.len());
-            for i in 0..len {
-                self.parity_buffer[i] ^= raw_float32_payload[i];
+            for (parity, incoming) in self
+                .parity_buffer
+                .iter_mut()
+                .zip(raw_float32_payload.iter())
+                .take(len)
+            {
+                *parity ^= *incoming;
             }
             if raw_float32_payload.len() > self.parity_buffer.len() {
                 self.parity_buffer
@@ -160,8 +165,8 @@ impl FecDecoder {
         }
 
         // Reconstruct float32 samples from byte payload
-        let expected_samples = (fec.channel_count as usize)
-            .checked_mul(fec.samples_per_channel as usize)?;
+        let expected_samples =
+            (fec.channel_count as usize).checked_mul(fec.samples_per_channel as usize)?;
         let expected_bytes = expected_samples.checked_mul(std::mem::size_of::<f32>())?;
 
         if reconstructed.len() < expected_bytes {
@@ -220,16 +225,48 @@ mod tests {
         let p3_bytes: Vec<u8> = p3.iter().flat_map(|f| f.to_le_bytes()).collect();
 
         assert!(encoder
-            .push_audio_packet(stream_id, 10, 0, channel_count, sample_rate, samples_per_channel, &p0_bytes)
+            .push_audio_packet(
+                stream_id,
+                10,
+                0,
+                channel_count,
+                sample_rate,
+                samples_per_channel,
+                &p0_bytes
+            )
             .is_none());
         assert!(encoder
-            .push_audio_packet(stream_id, 11, 0, channel_count, sample_rate, samples_per_channel, &p1_bytes)
+            .push_audio_packet(
+                stream_id,
+                11,
+                0,
+                channel_count,
+                sample_rate,
+                samples_per_channel,
+                &p1_bytes
+            )
             .is_none());
         assert!(encoder
-            .push_audio_packet(stream_id, 12, 0, channel_count, sample_rate, samples_per_channel, &p2_bytes)
+            .push_audio_packet(
+                stream_id,
+                12,
+                0,
+                channel_count,
+                sample_rate,
+                samples_per_channel,
+                &p2_bytes
+            )
             .is_none());
         let fec_packet = encoder
-            .push_audio_packet(stream_id, 13, 0, channel_count, sample_rate, samples_per_channel, &p3_bytes)
+            .push_audio_packet(
+                stream_id,
+                13,
+                0,
+                channel_count,
+                sample_rate,
+                samples_per_channel,
+                &p3_bytes,
+            )
             .expect("emits FEC packet on 4th packet");
 
         // Simulate receiver getting p0, p1, and p3 (p2 sequence 12 is lost!)
@@ -239,7 +276,8 @@ mod tests {
 
         // Parse FEC packet
         let parsed_fec = parse_fec_packet(&fec_packet).expect("valid fec");
-        let fec_payload = &fec_packet[parsed_fec.payload_offset..parsed_fec.payload_offset + parsed_fec.payload_len];
+        let fec_payload = &fec_packet
+            [parsed_fec.payload_offset..parsed_fec.payload_offset + parsed_fec.payload_len];
 
         // Attempt recovery
         let (recovered_pkt, recovered_pcm) = decoder

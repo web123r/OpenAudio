@@ -1,6 +1,8 @@
 use crate::backend::get_backend;
 use crate::devices::is_skip;
-use crate::discovery::{start_advertising, SubscriberRegistry};
+use crate::discovery::{
+    active_subscribers_accept_opus, start_advertising, DestinationSet, SubscriberRegistry,
+};
 use crate::ensure_realtime_audio_thread;
 use crate::protocol::{
     sample_rate_to_code, AudioPayloadHeader, PacketHeader, SAMPLE_FORMAT_FLOAT32,
@@ -9,7 +11,9 @@ use crate::recording::{
     create_wav_writer, finalize as finalize_recording, write_samples, SharedWavWriter,
 };
 use crate::util::BoundedAudioQueue;
-use crate::{register_scoped_signal_meter, SignalDirection};
+use crate::{register_scoped_signal_meter, SignalDirection, StreamingLinearResampler};
+use serde::{Deserialize, Serialize};
+use socket2::SockRef;
 use std::net::{SocketAddr, ToSocketAddrs, UdpSocket};
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::Arc;
@@ -17,6 +21,7 @@ use std::time::{Duration, Instant};
 
 const MAX_FRAMES_PER_PACKET: usize = 58;
 const MAX_CAPTURE_QUEUE_MILLISECONDS: usize = 100;
+const UDP_SEND_BUFFER_BYTES: usize = 4 * 1024 * 1024;
 
 /// Fixed format used when a source is set to "None" and there is no
 /// physical device from which to determine channel count or sample rate.
@@ -28,6 +33,110 @@ enum PublisherDestinations {
     Fixed(Vec<SocketAddr>),
 }
 
+fn configure_audio_send_socket(socket: &UdpSocket) {
+    if let Err(error) = SockRef::from(socket).set_send_buffer_size(UDP_SEND_BUFFER_BYTES) {
+        eprintln!("audio-core: could not increase UDP send buffer: {error}");
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PublishFormat {
+    #[default]
+    Float32,
+    Opus,
+    Auto,
+}
+
+impl PublishFormat {
+    /// Resolve the opt-in automatic policy once the source channel count is known.
+    /// Multichannel streams (8+ channels) use Opus; smaller streams retain PCM.
+    pub fn resolve_for_channels(self, channels: usize) -> Self {
+        self.resolve(channels, None)
+    }
+
+    /// Resolve `Auto` using the channel count together with what the subscribers
+    /// already waiting on this stream declared they can decode.
+    ///
+    /// Multichannel streams prefer Opus, but if every subscriber that is already
+    /// waiting declared PCM only, Opus would deliver audio to nobody, so the
+    /// publisher stays on PCM instead. `None` means nobody has subscribed yet and
+    /// the channel-count policy alone decides; subscribers that arrive later with
+    /// a narrower format are reported by [`report_incompatible_subscribers`].
+    pub fn resolve(self, channels: usize, subscribers_accept_opus: Option<bool>) -> Self {
+        match self {
+            Self::Auto if channels >= 8 => match subscribers_accept_opus {
+                Some(false) => Self::Float32,
+                Some(true) | None => Self::Opus,
+            },
+            Self::Auto => Self::Float32,
+            explicit => explicit,
+        }
+    }
+
+    /// Wire format identifier advertised to subscribers for this policy.
+    /// Callers must resolve `Auto` first.
+    pub fn wire_sample_format(self) -> u8 {
+        match self {
+            Self::Opus => network_core::protocol::SAMPLE_FORMAT_OPUS,
+            Self::Float32 | Self::Auto => network_core::protocol::SAMPLE_FORMAT_FLOAT32,
+        }
+    }
+}
+
+#[cfg(test)]
+mod publish_format_tests {
+    use super::PublishFormat;
+
+    #[test]
+    fn automatic_format_uses_opus_for_eight_or_more_channels() {
+        assert_eq!(
+            PublishFormat::Auto.resolve_for_channels(7),
+            PublishFormat::Float32
+        );
+        assert_eq!(
+            PublishFormat::Auto.resolve_for_channels(8),
+            PublishFormat::Opus
+        );
+        assert_eq!(
+            PublishFormat::Auto.resolve_for_channels(64),
+            PublishFormat::Opus
+        );
+    }
+
+    #[test]
+    fn automatic_format_respects_what_waiting_subscribers_can_decode() {
+        // Multichannel with nobody subscribed yet keeps the channel-count policy.
+        assert_eq!(PublishFormat::Auto.resolve(16, None), PublishFormat::Opus);
+        assert_eq!(
+            PublishFormat::Auto.resolve(16, Some(true)),
+            PublishFormat::Opus
+        );
+        // Every waiting subscriber is PCM-only, so Opus would reach nobody.
+        assert_eq!(
+            PublishFormat::Auto.resolve(16, Some(false)),
+            PublishFormat::Float32
+        );
+        // Small streams stay PCM regardless of capability.
+        assert_eq!(
+            PublishFormat::Auto.resolve(2, Some(true)),
+            PublishFormat::Float32
+        );
+    }
+
+    #[test]
+    fn explicit_format_is_never_overridden_by_auto_policy() {
+        assert_eq!(
+            PublishFormat::Float32.resolve_for_channels(64),
+            PublishFormat::Float32
+        );
+        assert_eq!(
+            PublishFormat::Opus.resolve_for_channels(2),
+            PublishFormat::Opus
+        );
+    }
+}
+
 fn capture_queue_capacity_frames(sample_rate: u32, minimum_frames: usize) -> Result<usize, String> {
     let queued_frames = (sample_rate as usize)
         .checked_mul(MAX_CAPTURE_QUEUE_MILLISECONDS)
@@ -37,74 +146,37 @@ fn capture_queue_capacity_frames(sample_rate: u32, minimum_frames: usize) -> Res
 }
 
 impl PublisherDestinations {
-    fn snapshot(&self, stream_id: u32) -> Option<Vec<SocketAddr>> {
+    fn snapshot(&self, stream_id: u32, sample_format: u8) -> DestinationSet {
         match self {
-            Self::Discovery(registry) => crate::discovery::active_subscribers(registry, stream_id)
-                .filter(|addresses| !addresses.is_empty()),
-            Self::Fixed(addresses) if !addresses.is_empty() => Some(addresses.clone()),
-            Self::Fixed(_) => None,
+            Self::Discovery(registry) => {
+                crate::discovery::active_subscribers_for_format(registry, stream_id, sample_format)
+            }
+            Self::Fixed(addresses) => DestinationSet {
+                addresses: addresses.clone(),
+                skipped_incompatible: 0,
+            },
         }
     }
 }
 
-/// Supported network payload codecs.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum PayloadCodec {
-    Float32,
-    Opus { bitrate_kbps: i32 },
-}
-
-/// Represents a grouped subset of audio channels bundled into a single network stream.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ChannelGroup {
-    pub stream_id: u32,
-    pub stream_name: String,
-    pub channel_indices: Vec<usize>,
-    pub channel_labels: Vec<String>,
-}
-
-/// Helper that partitions a total channel count into groups of at most `max_channels_per_group` (default 8).
-pub fn create_channel_groups(
-    base_stream_id: u32,
-    base_stream_name: &str,
-    channel_count: usize,
-    channel_labels: &[String],
-    max_channels_per_group: usize,
-) -> Vec<ChannelGroup> {
-    let group_size = max_channels_per_group.clamp(1, 8);
-    let mut groups = Vec::new();
-    let num_groups = (channel_count + group_size - 1) / group_size;
-
-    for g in 0..num_groups {
-        let start = g * group_size;
-        let end = (start + group_size).min(channel_count);
-        let indices: Vec<usize> = (start..end).collect();
-        let labels: Vec<String> = indices
-            .iter()
-            .map(|&idx| {
-                channel_labels
-                    .get(idx)
-                    .cloned()
-                    .unwrap_or_else(|| format!("Ch {}", idx + 1))
-            })
-            .collect();
-
-        let stream_id = base_stream_id.wrapping_add(g as u32);
-        let stream_name = if num_groups == 1 {
-            base_stream_name.to_string()
-        } else {
-            format!("{base_stream_name} (Ch {}-{})", start + 1, end)
-        };
-
-        groups.push(ChannelGroup {
-            stream_id,
-            stream_name,
-            channel_indices: indices,
-            channel_labels: labels,
-        });
+pub(crate) fn report_incompatible_subscribers(
+    stream_id: u32,
+    format: PublishFormat,
+    skipped: usize,
+    last_reported: &mut usize,
+) {
+    if skipped == *last_reported {
+        return;
     }
 
-    groups
+    if skipped > 0 {
+        eprintln!(
+            "audio-core: {skipped} subscriber(s) of stream {stream_id} did not declare \
+             support for {format:?}; they will not receive audio"
+        );
+    }
+
+    *last_reported = skipped;
 }
 
 pub fn transmit(duration_secs: u64, dest_addr: &str, stream_id: u32) -> Result<(), String> {
@@ -145,6 +217,7 @@ pub fn transmit_multi(
 
     let socket =
         UdpSocket::bind("0.0.0.0:0").map_err(|error| format!("failed to bind socket: {error}"))?;
+    configure_audio_send_socket(&socket);
 
     let (signal_meter, _signal_meter_guard) = register_scoped_signal_meter(
         format!("direct-publish:{stream_id}"),
@@ -184,6 +257,8 @@ pub fn transmit_multi(
         channels,
         rate_code,
         max_frames_per_packet,
+        sample_rate,
+        PublishFormat::Float32,
         None,
         packets_sent.clone(),
         None,
@@ -239,6 +314,7 @@ pub fn transmit_with_control(
 
     let socket =
         UdpSocket::bind("0.0.0.0:0").map_err(|error| format!("failed to bind socket: {error}"))?;
+    configure_audio_send_socket(&socket);
 
     let (signal_meter, _signal_meter_guard) = register_scoped_signal_meter(
         format!("controlled-publish:{stream_id}"),
@@ -278,6 +354,8 @@ pub fn transmit_with_control(
         channels,
         rate_code,
         max_frames_per_packet,
+        sample_rate,
+        PublishFormat::Float32,
         None,
         packets_sent,
         None,
@@ -350,7 +428,7 @@ pub fn transmit_with_discovery_labeled_encrypted(
     keep_running: Arc<AtomicBool>,
     cipher: Option<Arc<crate::crypto::StreamCipher>>,
 ) -> Result<(), String> {
-    transmit_with_discovery_labeled_encrypted_codec(
+    transmit_with_discovery_labeled_encrypted_format(
         node_name,
         stream_name,
         stream_id,
@@ -360,11 +438,11 @@ pub fn transmit_with_discovery_labeled_encrypted(
         channel_labels,
         keep_running,
         cipher,
-        PayloadCodec::Float32,
+        PublishFormat::Float32,
     )
 }
 
-pub fn transmit_with_discovery_labeled_encrypted_codec(
+pub fn transmit_with_discovery_labeled_encrypted_format(
     node_name: String,
     stream_name: String,
     stream_id: u32,
@@ -374,9 +452,13 @@ pub fn transmit_with_discovery_labeled_encrypted_codec(
     channel_labels: Option<Vec<String>>,
     keep_running: Arc<AtomicBool>,
     cipher: Option<Arc<crate::crypto::StreamCipher>>,
-    codec: PayloadCodec,
+    format: PublishFormat,
 ) -> Result<(), String> {
     ensure_realtime_audio_thread();
+
+    if format == PublishFormat::Opus && is_skip(&device_name) {
+        return Err("Opus publishing requires a selected input device; silent-source publishing remains Float32".to_string());
+    }
 
     if is_skip(&device_name) {
         println!(
@@ -398,18 +480,43 @@ pub fn transmit_with_discovery_labeled_encrypted_codec(
     let (device_label, config) = backend.get_input_config(device_name.as_deref())?;
 
     let channels = config.channels;
-    let max_frames_per_packet =
-        network_core::protocol::max_float32_frames_per_packet(channels as usize)?
-            .min(MAX_FRAMES_PER_PACKET);
+    let format = format.resolve(
+        channels as usize,
+        active_subscribers_accept_opus(&subscribers_by_stream, stream_id),
+    );
     let sample_rate = config.sample_rate;
-    let rate_code = sample_rate_to_code(sample_rate);
+    let max_frames_per_packet = if format == PublishFormat::Opus {
+        network_core::opus::OPUS_FRAME_SAMPLES
+    } else {
+        network_core::protocol::max_float32_frames_per_packet(channels as usize)?
+            .min(MAX_FRAMES_PER_PACKET)
+    };
+    if format == PublishFormat::Opus && !(1..=64).contains(&channels) {
+        return Err(format!("Opus supports 1 to 64 channels, got {channels}"));
+    }
+    let wire_sample_rate = if format == PublishFormat::Opus {
+        48_000
+    } else {
+        sample_rate
+    };
+    let rate_code = sample_rate_to_code(wire_sample_rate);
 
+    if format == PublishFormat::Opus && rate_code == 0 {
+        return Err(format!(
+            "unsupported Opus wire sample rate: {wire_sample_rate}"
+        ));
+    }
     if rate_code == 0 {
-        return Err(format!("unsupported sample rate: {sample_rate}"));
+        return Err(format!("unsupported sample rate: {wire_sample_rate}"));
     }
 
     let meter_label = format!("{node_name} — {stream_name} — {device_label}");
 
+    if format == PublishFormat::Opus {
+        println!(
+            "Publish: Opus selected; capture audio is resampled to 48 kHz in the publisher worker."
+        );
+    }
     let (signal_meter, _signal_meter_guard) = register_scoped_signal_meter(
         format!("wasapi-publish:{stream_id}"),
         meter_label,
@@ -437,24 +544,29 @@ pub fn transmit_with_discovery_labeled_encrypted_codec(
     });
 
     let is_encrypted = cipher.is_some();
+    let advertised_format = format.wire_sample_format();
     std::thread::spawn(move || {
-        if let Err(error) = crate::discovery::start_advertising_with_labels_and_active_encrypted(
-            node_name,
-            stream_id,
-            stream_name,
-            channels_u8,
-            labels,
-            crate::discovery::CONTROL_PORT,
-            is_encrypted,
-            advertise_keep_running.clone(),
-            advertise_keep_running,
-        ) {
+        if let Err(error) =
+            crate::discovery::start_advertising_with_labels_and_active_encrypted_format(
+                node_name,
+                stream_id,
+                stream_name,
+                channels_u8,
+                labels,
+                crate::discovery::CONTROL_PORT,
+                is_encrypted,
+                advertised_format,
+                advertise_keep_running.clone(),
+                advertise_keep_running,
+            )
+        {
             eprintln!("audio-core: advertising stopped: {error}");
         }
     });
 
     let socket =
         UdpSocket::bind("0.0.0.0:0").map_err(|error| format!("failed to bind socket: {error}"))?;
+    configure_audio_send_socket(&socket);
 
     let start = Instant::now();
     let queue_for_callback = audio_queue.clone();
@@ -483,7 +595,7 @@ pub fn transmit_with_discovery_labeled_encrypted_codec(
         .play()
         .map_err(|error| format!("failed to start stream: {error}"))?;
 
-    let publisher_worker = spawn_capture_publisher_with_codec(
+    let publisher_worker = spawn_capture_publisher(
         audio_queue.clone(),
         PublisherDestinations::Discovery(subscribers_by_stream),
         stream_id,
@@ -491,10 +603,11 @@ pub fn transmit_with_discovery_labeled_encrypted_codec(
         channels,
         rate_code,
         max_frames_per_packet,
+        sample_rate,
+        format,
         writer.clone(),
         Arc::new(AtomicU32::new(0)),
         cipher,
-        codec,
     );
 
     while keep_running.load(Ordering::Relaxed) {
@@ -569,7 +682,37 @@ pub fn transmit_loopback_with_discovery_labeled_encrypted(
     keep_running: Arc<AtomicBool>,
     cipher: Option<Arc<crate::crypto::StreamCipher>>,
 ) -> Result<(), String> {
+    transmit_loopback_with_discovery_labeled_encrypted_format(
+        node_name,
+        stream_name,
+        stream_id,
+        device_name,
+        subscribers_by_stream,
+        record_path,
+        channel_labels,
+        keep_running,
+        cipher,
+        PublishFormat::Float32,
+    )
+}
+
+pub fn transmit_loopback_with_discovery_labeled_encrypted_format(
+    node_name: String,
+    stream_name: String,
+    stream_id: u32,
+    device_name: Option<String>,
+    subscribers_by_stream: SubscriberRegistry,
+    record_path: Option<String>,
+    channel_labels: Option<Vec<String>>,
+    keep_running: Arc<AtomicBool>,
+    cipher: Option<Arc<crate::crypto::StreamCipher>>,
+    format: PublishFormat,
+) -> Result<(), String> {
     ensure_realtime_audio_thread();
+
+    if format == PublishFormat::Opus && is_skip(&device_name) {
+        return Err("Opus publishing requires a selected output device; silent-source publishing remains Float32".to_string());
+    }
 
     if is_skip(&device_name) {
         println!(
@@ -591,14 +734,34 @@ pub fn transmit_loopback_with_discovery_labeled_encrypted(
     let (device_label, config) = backend.get_loopback_config(device_name.as_deref())?;
 
     let channels = config.channels;
-    let max_frames_per_packet =
-        network_core::protocol::max_float32_frames_per_packet(channels as usize)?
-            .min(MAX_FRAMES_PER_PACKET);
+    let format = format.resolve(
+        channels as usize,
+        active_subscribers_accept_opus(&subscribers_by_stream, stream_id),
+    );
     let sample_rate = config.sample_rate;
-    let rate_code = sample_rate_to_code(sample_rate);
+    let max_frames_per_packet = if format == PublishFormat::Opus {
+        network_core::opus::OPUS_FRAME_SAMPLES
+    } else {
+        network_core::protocol::max_float32_frames_per_packet(channels as usize)?
+            .min(MAX_FRAMES_PER_PACKET)
+    };
+    if format == PublishFormat::Opus && !(1..=64).contains(&channels) {
+        return Err(format!("Opus supports 1 to 64 channels, got {channels}"));
+    }
+    let wire_sample_rate = if format == PublishFormat::Opus {
+        48_000
+    } else {
+        sample_rate
+    };
+    let rate_code = sample_rate_to_code(wire_sample_rate);
 
+    if format == PublishFormat::Opus && rate_code == 0 {
+        return Err(format!(
+            "unsupported Opus wire sample rate: {wire_sample_rate}"
+        ));
+    }
     if rate_code == 0 {
-        return Err(format!("unsupported sample rate: {sample_rate}"));
+        return Err(format!("unsupported sample rate: {wire_sample_rate}"));
     }
 
     let meter_label = format!(
@@ -606,6 +769,9 @@ pub fn transmit_loopback_with_discovery_labeled_encrypted(
          {device_label} (loopback)"
     );
 
+    if format == PublishFormat::Opus {
+        println!("Publish (loopback): Opus selected; capture audio is resampled to 48 kHz in the publisher worker.");
+    }
     let (signal_meter, _signal_meter_guard) = register_scoped_signal_meter(
         format!("wasapi-loopback-publish:{stream_id}"),
         meter_label,
@@ -632,24 +798,29 @@ pub fn transmit_loopback_with_discovery_labeled_encrypted(
     });
 
     let is_encrypted = cipher.is_some();
+    let advertised_format = format.wire_sample_format();
     std::thread::spawn(move || {
-        if let Err(error) = crate::discovery::start_advertising_with_labels_and_active_encrypted(
-            node_name,
-            stream_id,
-            stream_name,
-            channels_u8,
-            labels,
-            crate::discovery::CONTROL_PORT,
-            is_encrypted,
-            advertise_keep_running.clone(),
-            advertise_keep_running,
-        ) {
+        if let Err(error) =
+            crate::discovery::start_advertising_with_labels_and_active_encrypted_format(
+                node_name,
+                stream_id,
+                stream_name,
+                channels_u8,
+                labels,
+                crate::discovery::CONTROL_PORT,
+                is_encrypted,
+                advertised_format,
+                advertise_keep_running.clone(),
+                advertise_keep_running,
+            )
+        {
             eprintln!("audio-core: advertising stopped: {error}");
         }
     });
 
     let socket =
         UdpSocket::bind("0.0.0.0:0").map_err(|error| format!("failed to bind socket: {error}"))?;
+    configure_audio_send_socket(&socket);
 
     let start = Instant::now();
     let queue_for_callback = audio_queue.clone();
@@ -687,7 +858,7 @@ pub fn transmit_loopback_with_discovery_labeled_encrypted(
         .play()
         .map_err(|error| format!("failed to start loopback stream: {error}"))?;
 
-    let publisher_worker = spawn_capture_publisher_with_codec(
+    let publisher_worker = spawn_capture_publisher(
         audio_queue.clone(),
         PublisherDestinations::Discovery(subscribers_by_stream),
         stream_id,
@@ -695,10 +866,11 @@ pub fn transmit_loopback_with_discovery_labeled_encrypted(
         channels,
         rate_code,
         max_frames_per_packet,
+        sample_rate,
+        format,
         writer.clone(),
         Arc::new(AtomicU32::new(0)),
         cipher,
-        PayloadCodec::Float32,
     );
 
     while keep_running.load(Ordering::Relaxed) {
@@ -726,49 +898,43 @@ fn spawn_capture_publisher(
     channels: u16,
     rate_code: u16,
     max_frames_per_packet: usize,
+    source_sample_rate: u32,
+    format: PublishFormat,
     writer: Option<SharedWavWriter>,
     packets_sent: Arc<AtomicU32>,
     cipher: Option<Arc<crate::crypto::StreamCipher>>,
-) -> std::thread::JoinHandle<()> {
-    spawn_capture_publisher_with_codec(
-        audio_queue,
-        destinations_source,
-        stream_id,
-        socket,
-        channels,
-        rate_code,
-        max_frames_per_packet,
-        writer,
-        packets_sent,
-        cipher,
-        PayloadCodec::Float32,
-    )
-}
-
-fn spawn_capture_publisher_with_codec(
-    audio_queue: Arc<BoundedAudioQueue>,
-    destinations_source: PublisherDestinations,
-    stream_id: u32,
-    socket: UdpSocket,
-    channels: u16,
-    rate_code: u16,
-    max_frames_per_packet: usize,
-    writer: Option<SharedWavWriter>,
-    packets_sent: Arc<AtomicU32>,
-    cipher: Option<Arc<crate::crypto::StreamCipher>>,
-    codec: PayloadCodec,
 ) -> std::thread::JoinHandle<()> {
     std::thread::spawn(move || {
         let mut last_drop_report = Instant::now();
         let mut fec_encoder =
             network_core::fec::FecEncoder::new(network_core::fec::DEFAULT_FEC_GROUP_SIZE);
-        let sample_rate = network_core::protocol::code_to_sample_rate(rate_code);
-        let mut opus_encoder = match codec {
-            PayloadCodec::Opus { bitrate_kbps } => {
-                crate::opus::OpusChannelEncoder::new(sample_rate, channels as usize, bitrate_kbps).ok()
+        let mut opus_encoder = if format == PublishFormat::Opus {
+            match network_core::opus::MultichannelOpusEncoder::new(channels as usize, 64_000) {
+                Ok(encoder) => Some(encoder),
+                Err(error) => {
+                    eprintln!("audio-core: failed to initialize Opus publisher: {error}");
+                    return;
+                }
             }
-            _ => None,
+        } else {
+            None
         };
+        let mut opus_resampler = if format == PublishFormat::Opus && source_sample_rate != 48_000 {
+            match StreamingLinearResampler::new(channels as usize, source_sample_rate, 48_000) {
+                Ok(resampler) => Some(resampler),
+                Err(error) => {
+                    eprintln!("audio-core: failed to initialize Opus resampler: {error}");
+                    return;
+                }
+            }
+        } else {
+            None
+        };
+        let mut opus_pending = Vec::<f32>::new();
+        let mut opus_pending_timestamp_ns = None;
+        let mut opus_next_timestamp_ns = None;
+        let mut opus_sequence = 0u32;
+        let mut last_incompatible_report = 0usize;
 
         loop {
             if last_drop_report.elapsed() >= Duration::from_secs(1) {
@@ -779,74 +945,123 @@ fn spawn_capture_publisher_with_codec(
                 last_drop_report = Instant::now();
             }
 
-            // --- Stage 1: Demand-based gating ---
-            // Snapshot subscribers BEFORE dequeuing audio.  If nobody is
-            // listening we still drain the queue (to prevent backlog growth)
-            // but skip every allocation, encoding, FEC, and UDP send.
-            let destinations = destinations_source.snapshot(stream_id);
-
             if let Some(block) = audio_queue.try_pop() {
                 let data = block.samples;
                 if let Some(writer) = &writer {
                     write_samples(writer, &data);
                 }
 
-                // No subscribers → discard this block; zero network cost.
-                let Some(destinations) = destinations else {
-                    continue;
-                };
+                let destinations =
+                    destinations_source.snapshot(stream_id, format.wire_sample_format());
+                report_incompatible_subscribers(
+                    stream_id,
+                    format,
+                    destinations.skipped_incompatible,
+                    &mut last_incompatible_report,
+                );
 
-                // Opus compression path
-                if let Some(ref mut encoder) = opus_encoder {
-                    let mut offset = 0;
-                    let chunk_size = crate::opus::OPUS_FRAME_SAMPLES * channels as usize;
-                    while offset < data.len() {
-                        let end = (offset + chunk_size).min(data.len());
-                        let chunk = &data[offset..end];
-                        offset = end;
+                if format == PublishFormat::Opus {
+                    let converted = match opus_resampler.as_mut() {
+                        Some(resampler) => match resampler.process(&data) {
+                            Ok(converted) => converted,
+                            Err(error) => {
+                                eprintln!("audio-core: Opus resampling failed: {error}");
+                                continue;
+                            }
+                        },
+                        None => data.clone(),
+                    };
+                    if opus_pending.is_empty() {
+                        opus_pending_timestamp_ns =
+                            Some(opus_next_timestamp_ns.unwrap_or(block.presentation_timestamp_ns));
+                    }
+                    opus_pending.extend(converted);
 
-                        if let Ok(Some(opus_pkt)) = encoder.push_samples(chunk) {
-                            let sequence_number = packets_sent.fetch_add(1, Ordering::Relaxed);
-                            let header = PacketHeader {
-                                sub_stream_index: 0,
-                                stream_id,
-                                sequence_number,
-                                presentation_timestamp_ns: block.presentation_timestamp_ns,
-                            };
-                            let packet = match network_core::protocol::encode_opus_packet(
-                                &header,
-                                channels as u8,
-                                sample_rate,
-                                crate::opus::OPUS_FRAME_SAMPLES as u16,
-                                &opus_pkt,
-                            ) {
-                                Ok(p) => p,
-                                Err(e) => {
-                                    eprintln!("audio-core: failed to encode opus packet: {e}");
-                                    continue;
-                                }
-                            };
-                            let packet_to_send = if let Some(ref cipher) = cipher {
-                                match crate::crypto::encrypt_audio_packet(cipher, &packet) {
-                                    Ok(enc) => enc,
-                                    Err(e) => {
-                                        eprintln!("audio-core: encryption error: {e}");
+                    let frame_samples = network_core::opus::OPUS_FRAME_SAMPLES * channels as usize;
+                    while opus_pending.len() >= frame_samples {
+                        let frame: Vec<f32> = opus_pending.drain(..frame_samples).collect();
+                        let timestamp_ns =
+                            opus_pending_timestamp_ns.unwrap_or(block.presentation_timestamp_ns);
+                        let Some(encoder) = opus_encoder.as_mut() else {
+                            eprintln!("audio-core: Opus encoder became unavailable");
+                            break;
+                        };
+                        let substream_count = channels.div_ceil(2) as u32;
+                        let sequence_start = opus_sequence;
+                        opus_sequence = opus_sequence.wrapping_add(substream_count);
+                        let encoded = match encoder.encode(&frame, sequence_start) {
+                            Ok(encoded) => encoded,
+                            Err(error) => {
+                                eprintln!("audio-core: Opus encoding failed: {error}");
+                                opus_pending_timestamp_ns = Some(
+                                    timestamp_ns
+                                        .saturating_add(network_core::opus::OPUS_FRAME_DURATION_NS),
+                                );
+                                continue;
+                            }
+                        };
+
+                        if !destinations.addresses.is_empty() {
+                            for (substream_index, sequence_number, payload) in encoded {
+                                let header = PacketHeader {
+                                    sub_stream_index: substream_index,
+                                    stream_id,
+                                    sequence_number,
+                                    presentation_timestamp_ns: timestamp_ns,
+                                };
+                                let packet = match network_core::protocol::encode_opus_packet(
+                                    &header,
+                                    channels as u8,
+                                    48_000,
+                                    network_core::opus::OPUS_FRAME_SAMPLES as u16,
+                                    &payload,
+                                ) {
+                                    Ok(packet) => packet,
+                                    Err(error) => {
+                                        eprintln!(
+                                            "audio-core: failed to frame Opus packet: {error}"
+                                        );
                                         continue;
                                     }
-                                }
-                            } else {
-                                packet
-                            };
-                            for address in &destinations {
-                                if let Err(e) = socket.send_to(&packet_to_send, address) {
-                                    eprintln!("audio-core: send to {address} failed: {e}");
+                                };
+                                let packet_to_send = if let Some(ref cipher) = cipher {
+                                    match crate::crypto::encrypt_audio_packet(cipher, &packet) {
+                                        Ok(encrypted) => encrypted,
+                                        Err(error) => {
+                                            eprintln!("audio-core: failed to encrypt Opus packet: {error}");
+                                            continue;
+                                        }
+                                    }
+                                } else {
+                                    packet
+                                };
+                                for address in &destinations.addresses {
+                                    if let Err(error) = socket.send_to(&packet_to_send, address) {
+                                        eprintln!(
+                                            "audio-core: Opus send to {address} failed: {error}"
+                                        );
+                                    }
                                 }
                             }
                         }
+
+                        let next_timestamp =
+                            timestamp_ns.saturating_add(network_core::opus::OPUS_FRAME_DURATION_NS);
+                        opus_pending_timestamp_ns = if opus_pending.len() >= frame_samples {
+                            Some(next_timestamp)
+                        } else {
+                            None
+                        };
+                        opus_next_timestamp_ns = Some(next_timestamp);
+                        packets_sent.fetch_add(substream_count, Ordering::Relaxed);
                     }
                     continue;
                 }
 
+                if destinations.addresses.is_empty() {
+                    continue;
+                }
+                let destinations = destinations.addresses;
                 let frame_count = data.len() / channels as usize;
                 let mut frame_offset = 0usize;
 
@@ -916,6 +1131,7 @@ fn spawn_capture_publisher_with_codec(
 
                     frame_offset += frames_this_packet;
                 }
+                continue;
             }
 
             if audio_queue.is_closed_and_empty() {
@@ -986,6 +1202,7 @@ fn transmit_silence(
 
     let socket =
         UdpSocket::bind("0.0.0.0:0").map_err(|error| format!("failed to bind socket: {error}"))?;
+    configure_audio_send_socket(&socket);
 
     let sequence = AtomicU32::new(0);
     let start = Instant::now();
@@ -1011,10 +1228,13 @@ fn transmit_silence(
             write_samples(writer, &silent_samples);
         }
 
-        let destinations = crate::discovery::active_subscribers(&subscribers_by_stream, stream_id)
-            .filter(|addresses| !addresses.is_empty());
+        let destinations = crate::discovery::active_subscribers_for_format(
+            &subscribers_by_stream,
+            stream_id,
+            network_core::protocol::SAMPLE_FORMAT_FLOAT32,
+        );
 
-        if let Some(destinations) = destinations {
+        if !destinations.addresses.is_empty() {
             let sequence_number = sequence.fetch_add(1, Ordering::Relaxed);
 
             let timestamp_ns = start.elapsed().as_nanos() as u64;
@@ -1042,7 +1262,7 @@ fn transmit_silence(
                 packet.extend_from_slice(&sample.to_le_bytes());
             }
 
-            for address in &destinations {
+            for address in &destinations.addresses {
                 if let Err(error) = socket.send_to(&packet, address) {
                     eprintln!(
                         "audio-core: send to {address} failed: \
@@ -1061,43 +1281,4 @@ fn transmit_silence(
 
     println!("Publish: silent stream stopped.");
     Ok(())
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn create_channel_groups_splits_48_channels() {
-        let labels: Vec<String> = (1..=48).map(|i| format!("Mic {i}")).collect();
-        let groups = create_channel_groups(100, "Studio Live", 48, &labels, 8);
-
-        // 48 channels / 8 per group = 6 groups
-        assert_eq!(groups.len(), 6);
-
-        // Check group 0
-        assert_eq!(groups[0].stream_id, 100);
-        assert_eq!(groups[0].stream_name, "Studio Live (Ch 1-8)");
-        assert_eq!(groups[0].channel_indices, vec![0, 1, 2, 3, 4, 5, 6, 7]);
-        assert_eq!(groups[0].channel_labels[0], "Mic 1");
-        assert_eq!(groups[0].channel_labels[7], "Mic 8");
-
-        // Check group 5 (final group, channels 41-48)
-        assert_eq!(groups[5].stream_id, 105);
-        assert_eq!(groups[5].stream_name, "Studio Live (Ch 41-48)");
-        assert_eq!(groups[5].channel_indices, (40..48).collect::<Vec<_>>());
-        assert_eq!(groups[5].channel_labels[7], "Mic 48");
-    }
-
-    #[test]
-    fn create_channel_groups_preserves_single_group_under_limit() {
-        let labels: Vec<String> = vec!["Left".to_string(), "Right".to_string()];
-        let groups = create_channel_groups(50, "Stereo Out", 2, &labels, 8);
-
-        assert_eq!(groups.len(), 1);
-        assert_eq!(groups[0].stream_id, 50);
-        assert_eq!(groups[0].stream_name, "Stereo Out");
-        assert_eq!(groups[0].channel_indices, vec![0, 1]);
-        assert_eq!(groups[0].channel_labels, labels);
-    }
 }

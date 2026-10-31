@@ -1,6 +1,7 @@
 use crate::ensure_realtime_audio_thread;
 
-use crate::protocol::{float32_payload, parse_packet};
+use crate::opus_receive::AudioPacketDecoder;
+use crate::protocol::parse_packet;
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream, UdpSocket};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -20,7 +21,8 @@ const WEB_AUDIO_BATCH_MS: u32 = 20;
 /// - WebSocket on `http_port + 1`: streams raw interleaved Float32
 ///   PCM binary frames, preceded by a one-time JSON "format" message
 ///   (channel count, sample rate, and the stream's display name) so
-///   the browser knows how to play it and what to show.
+///   the browser knows how to play it and what to show. Incoming Opus
+///   streams are decoded to PCM before being relayed.
 pub fn receive_and_serve_web(
     bind_addr: &str,
     http_port: u16,
@@ -45,6 +47,7 @@ pub fn receive_and_serve_web(
     // buffer caused WSAEMSGSIZE the moment a packet carried more
     // than ~9 channels in one datagram (e.g. 32ch ASIO input).
     let mut buf = [0u8; 65536];
+    let mut decoder = AudioPacketDecoder::new();
     let (channel_count, sample_rate) = loop {
         if !keep_running.load(Ordering::Relaxed) {
             return Ok(());
@@ -52,7 +55,11 @@ pub fn receive_and_serve_web(
         match socket.recv_from(&mut buf) {
             Ok((len, _src)) => {
                 if let Some(parsed) = parse_packet(&buf[..len]) {
-                    if float32_payload(&buf[..len], &parsed).is_some() {
+                    if decoder
+                        .decode(&buf[..len], &parsed)
+                        .map(|frames| !frames.is_empty())
+                        .unwrap_or(false)
+                    {
                         break (parsed.channel_count as u16, parsed.sample_rate);
                     }
                 }
@@ -158,16 +165,23 @@ pub fn receive_and_serve_web(
     while keep_running.load(Ordering::Relaxed) {
         let (len, _src) = match socket.recv_from(&mut buf) {
             Ok(r) => r,
-            Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                flush_web_audio_batch(
-                    &clients,
-                    &mut batched_payload,
-                    &mut batched_frames,
-                    &mut batch_started,
-                );
-                continue;
-            }
-            Err(ref e) if e.kind() == std::io::ErrorKind::TimedOut => {
+            Err(ref e)
+                if e.kind() == std::io::ErrorKind::WouldBlock
+                    || e.kind() == std::io::ErrorKind::TimedOut =>
+            {
+                // The socket went quiet: emit any Opus frame that has been
+                // waiting for substreams, concealed, instead of stranding it.
+                for frame in decoder.flush_expired()? {
+                    if batched_payload.is_empty() {
+                        batch_started = Instant::now();
+                    }
+
+                    for sample in &frame.pcm {
+                        batched_payload.extend_from_slice(&sample.to_le_bytes());
+                    }
+                    batched_frames += frame.pcm.len() / channel_count.max(1) as usize;
+                }
+
                 flush_web_audio_batch(
                     &clients,
                     &mut batched_payload,
@@ -186,20 +200,27 @@ pub fn receive_and_serve_web(
         if parsed.channel_count as u16 != channel_count || parsed.sample_rate != sample_rate {
             continue;
         }
-        let Some(payload) = float32_payload(&buf[..len], &parsed) else {
+        let Ok(frames) = decoder.decode(&buf[..len], &parsed) else {
             continue;
         };
+        if frames.is_empty() {
+            continue;
+        }
         packets_received += 1;
 
-        if batched_payload.is_empty() {
-            batch_started = Instant::now();
+        for frame in frames {
+            if batched_payload.is_empty() {
+                batch_started = Instant::now();
+            }
+
+            for sample in &frame.pcm {
+                batched_payload.extend_from_slice(&sample.to_le_bytes());
+            }
+            batched_frames += frame.pcm.len() / channel_count.max(1) as usize;
         }
 
-        batched_payload.extend_from_slice(payload);
-        batched_frames += parsed.samples_per_channel as usize;
-
-        let target_batch_frames = (sample_rate as usize * WEB_AUDIO_BATCH_MS as usize / 1_000)
-            .max(parsed.samples_per_channel as usize);
+        let target_batch_frames =
+            (sample_rate as usize * WEB_AUDIO_BATCH_MS as usize / 1_000).max(1);
 
         if batched_frames >= target_batch_frames {
             flush_web_audio_batch(

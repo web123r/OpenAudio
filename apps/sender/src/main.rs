@@ -3,7 +3,6 @@ mod diagnostic_panel;
 mod file_dialog;
 mod patchbay;
 mod preset;
-mod session_models;
 mod signal_monitor;
 mod ui_shell;
 mod updater;
@@ -13,10 +12,6 @@ use diagnostic_panel::DiagnosticPanel;
 use preset::{
     AsioPublishPreset, BrowserPreset, CombinePublishPreset, PresetFile, PublishPreset,
     SplitSubscribePreset, SubscribePreset,
-};
-use session_models::{
-    AsioPublishSession, BrowserAccessMode, CombinePublishSession, NodePing, PublishSession,
-    SplitSubscribeSession, SubscribeSession,
 };
 use signal_monitor::SignalMonitor;
 use ui_shell::{AppPage, UiSummary};
@@ -92,7 +87,108 @@ mod tests {
     }
 }
 
-// Session data models and network state are defined in `session_models.rs`.
+#[derive(Debug, Clone, Copy)]
+pub struct NodePing {
+    pub rtt_ms: f32,
+    pub last_seen: Instant,
+}
+
+// ============================================================================
+// PUBLISH SESSION TYPES
+// ============================================================================
+
+struct PublishSession {
+    id: u64,
+    node_name: String,
+    stream_name: String,
+    stream_id: u32,
+    selected_input: Option<String>,
+    is_loopback: bool,
+    format: audio_core::PublishFormat,
+    record: bool,
+    channel_labels: Vec<String>,
+    encrypted: bool,
+    passphrase: String,
+    running: Arc<AtomicBool>,
+    status: Arc<Mutex<String>>,
+    last_toggle: Instant,
+}
+
+struct CombinePublishSession {
+    id: u64,
+    session_tag: String,
+    node_name: String,
+    stream_name: String,
+    stream_id: u32,
+    channel_count: usize,
+    channel_sources: Vec<(Option<String>, bool)>,
+    channel_labels: Vec<String>,
+    format: audio_core::PublishFormat,
+    record: bool,
+    encrypted: bool,
+    passphrase: String,
+    running: Arc<AtomicBool>,
+    status: Arc<Mutex<String>>,
+    last_toggle: Instant,
+}
+
+struct AsioPublishSession {
+    id: u64,
+    node_name: String,
+    stream_name: String,
+    stream_id: u32,
+    selected_driver: Option<String>,
+    driver_channel_count: usize,
+    channel_indices: Vec<usize>,
+    channel_labels: Vec<String>,
+    format: audio_core::PublishFormat,
+    running: Arc<AtomicBool>,
+    status: Arc<Mutex<String>>,
+    last_toggle: Instant,
+}
+
+// ============================================================================
+// SUBSCRIBE SESSION TYPES
+// ============================================================================
+
+struct SubscribeSession {
+    id: u64,
+    selected_discovered_node_id: Option<String>,
+    bind_port: String,
+    selected_output: Option<String>,
+    volume: audio_core::VolumeControl,
+    record: bool,
+    encrypted: bool,
+    passphrase: String,
+    running: Arc<AtomicBool>,
+    status: Arc<Mutex<String>>,
+    last_toggle: Instant,
+    jitter_target_ms: Arc<AtomicU32>,
+}
+
+struct SplitSubscribeSession {
+    id: u64,
+    session_tag: String,
+    selected_discovered_node_id: Option<String>,
+    bind_port: String,
+    channel_devices: Vec<Option<String>>,
+    running: Arc<AtomicBool>,
+    status: Arc<Mutex<String>>,
+    last_toggle: Instant,
+    record: bool,
+    encrypted: bool,
+    passphrase: String,
+}
+
+// Browser playback uses one application-level gateway rather than one
+// gateway per stream. It is disabled by default and explicitly started
+// or stopped from the Browser Sharing page.
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum BrowserAccessMode {
+    PasswordProtected,
+    OpenLan,
+}
 
 // ============================================================================
 // APPLICATION STATE
@@ -116,7 +212,6 @@ struct OpenAudioApp {
 
     // Browser gateway configuration.
     browser_access_mode: BrowserAccessMode,
-    browser_https_enabled: bool,
     browser_password: String,
     browser_password_confirmation: String,
     browser_show_password: bool,
@@ -169,8 +264,7 @@ impl Default for OpenAudioApp {
         let subscribers_by_stream: audio_core::SubscriberRegistry =
             Arc::new(Mutex::new(HashMap::new()));
 
-        let interface_selector: Arc<Mutex<Option<std::net::Ipv4Addr>>> =
-            Arc::new(Mutex::new(None));
+        let interface_selector: Arc<Mutex<Option<std::net::Ipv4Addr>>> = Arc::new(Mutex::new(None));
 
         // Discovery and publisher-control listeners live for the lifetime
         // of the desktop application.
@@ -188,13 +282,11 @@ impl Default for OpenAudioApp {
             .spawn(move || {
                 audio_core::ensure_realtime_audio_thread();
 
-                if let Err(error) =
-                    audio_core::start_discovery_listener_on_interface_selector(
-                        directory_for_discovery,
-                        discovery_running,
-                        iface_selector_for_discovery,
-                    )
-                {
+                if let Err(error) = audio_core::start_discovery_listener_on_interface_selector(
+                    directory_for_discovery,
+                    discovery_running,
+                    iface_selector_for_discovery,
+                ) {
                     eprintln!("Discovery listener error: {error}");
                 }
             })
@@ -290,7 +382,6 @@ impl Default for OpenAudioApp {
             signal_monitor: SignalMonitor::default(),
 
             browser_access_mode: BrowserAccessMode::PasswordProtected,
-            browser_https_enabled: true,
             browser_password: String::new(),
             browser_password_confirmation: String::new(),
             browser_show_password: false,
@@ -528,6 +619,7 @@ impl OpenAudioApp {
                     stream_id: session.stream_id,
                     selected_input: session.selected_input.clone(),
                     is_loopback: session.is_loopback,
+                    format: session.format,
                     record: session.record,
                     channel_labels: session.channel_labels.clone(),
                     encrypted: session.encrypted,
@@ -548,6 +640,7 @@ impl OpenAudioApp {
                     channel_labels: session.channel_labels.clone(),
                     encrypted: session.encrypted,
                     passphrase: session.passphrase.clone(),
+                    format: session.format,
                 })
                 .collect(),
             asio_publish_sessions: self
@@ -560,6 +653,7 @@ impl OpenAudioApp {
                     selected_driver: session.selected_driver.clone(),
                     channel_indices: session.channel_indices.clone(),
                     channel_labels: session.channel_labels.clone(),
+                    format: session.format,
                 })
                 .collect(),
             subscribe_sessions: self
@@ -647,8 +741,8 @@ impl OpenAudioApp {
                 stream_id: item.stream_id,
                 selected_input: item.selected_input,
                 is_loopback: item.is_loopback,
+                format: item.format,
                 record: item.record,
-                record_flac: false,
                 channel_labels: item.channel_labels,
                 encrypted: item.encrypted,
                 passphrase: item.passphrase,
@@ -669,8 +763,8 @@ impl OpenAudioApp {
                 channel_count: item.channel_count,
                 channel_sources: item.channel_sources,
                 channel_labels: item.channel_labels,
+                format: item.format,
                 record: item.record,
-                record_flac: false,
                 encrypted: item.encrypted,
                 passphrase: item.passphrase,
                 running: Arc::new(AtomicBool::new(false)),
@@ -696,6 +790,7 @@ impl OpenAudioApp {
                 driver_channel_count,
                 channel_indices: item.channel_indices,
                 channel_labels: item.channel_labels,
+                format: item.format,
                 running: Arc::new(AtomicBool::new(false)),
                 status: Arc::new(Mutex::new("Not started.".to_string())),
                 last_toggle: Instant::now() - Duration::from_secs(1),
@@ -711,7 +806,6 @@ impl OpenAudioApp {
                 selected_output: item.selected_output,
                 volume: audio_core::new_volume_control(item.volume.clamp(0.0, 2.0)),
                 record: item.record,
-                record_flac: false,
                 encrypted: item.encrypted,
                 passphrase: item.passphrase,
                 running: Arc::new(AtomicBool::new(false)),
@@ -730,7 +824,6 @@ impl OpenAudioApp {
                 bind_port: item.bind_port,
                 channel_devices: item.channel_devices,
                 record: item.record,
-                record_flac: false,
                 encrypted: item.encrypted,
                 passphrase: item.passphrase,
                 running: Arc::new(AtomicBool::new(false)),
@@ -813,7 +906,6 @@ fn render_rtt_badge(ui: &mut egui::Ui, ping: &NodePing) {
 // ============================================================================
 // SHARED UI HELPERS
 // ============================================================================
-
 
 fn configure_style(ctx: &egui::Context) {
     let mut style = (*ctx.style()).clone();
@@ -1024,7 +1116,7 @@ impl OpenAudioApp {
         ui.horizontal(|ui| {
             ui.vertical(|ui| {
                 ui.label(
-                    egui::RichText::new("OpenAudio by Ferronme")
+                    egui::RichText::new("Ferronme's Open Audio")
                         .size(28.0)
                         .strong()
                         .color(Theme::TEXT_PRIMARY),
@@ -1098,16 +1190,15 @@ impl OpenAudioApp {
                     "↻ Updates"
                 };
 
-                let update_btn = ui
-                    .add_enabled(
-                        !is_checking_update,
-                        egui::Button::new(
-                            egui::RichText::new(update_btn_text).color(Theme::TEXT_PRIMARY),
-                        )
-                        .fill(Theme::BG_CARD)
-                        .rounding(8.0)
-                        .min_size(egui::vec2(95.0, 34.0)),
-                    );
+                let update_btn = ui.add_enabled(
+                    !is_checking_update,
+                    egui::Button::new(
+                        egui::RichText::new(update_btn_text).color(Theme::TEXT_PRIMARY),
+                    )
+                    .fill(Theme::BG_CARD)
+                    .rounding(8.0)
+                    .min_size(egui::vec2(95.0, 34.0)),
+                );
 
                 if update_btn.clicked() {
                     self.updater.check_now();
@@ -1119,7 +1210,8 @@ impl OpenAudioApp {
                             update_btn.on_hover_text(format!("OpenAudio v{version} is up to date"));
                         }
                         updater::UpdateStatus::UpdateAvailable { latest_version, .. } => {
-                            update_btn.on_hover_text(format!("Update available: v{latest_version}"));
+                            update_btn
+                                .on_hover_text(format!("Update available: v{latest_version}"));
                         }
                         updater::UpdateStatus::Error { message, .. } => {
                             update_btn.on_hover_text(format!("Update check: {message}"));
@@ -1893,6 +1985,32 @@ impl OpenAudioApp {
 
                         if session.driver_channel_count > 0 {
                             ui.add_space(10.0);
+                            egui::ComboBox::from_id_source(format!(
+                                "asio_publish_format_{}",
+                                session.id
+                            ))
+                            .selected_text(match session.format {
+                                audio_core::PublishFormat::Float32 => "Float32 PCM",
+                                audio_core::PublishFormat::Opus => "Opus (10 ms)",
+                                audio_core::PublishFormat::Auto => "Auto (Opus at 8+ ch)",
+                            })
+                            .show_ui(ui, |ui| {
+                                ui.selectable_value(
+                                    &mut session.format,
+                                    audio_core::PublishFormat::Float32,
+                                    "Float32 PCM",
+                                );
+                                ui.selectable_value(
+                                    &mut session.format,
+                                    audio_core::PublishFormat::Opus,
+                                    "Opus (10 ms)",
+                                );
+                                ui.selectable_value(
+                                    &mut session.format,
+                                    audio_core::PublishFormat::Auto,
+                                    "Auto (Opus at 8+ ch)",
+                                );
+                            });
 
                             ui.horizontal_wrapped(|ui| {
                                 ui.label(
@@ -2179,7 +2297,6 @@ impl OpenAudioApp {
                                             subscribers,
                                             worker_running.clone(),
                                         );
-
                                         match result {
                                             Ok(()) => {
                                                 set_shared_status(&worker_status, "Stopped.");
@@ -2325,6 +2442,7 @@ impl OpenAudioApp {
                 driver_channel_count: 0,
                 channel_indices: Vec::new(),
                 channel_labels: Vec::new(),
+                format: audio_core::PublishFormat::Float32,
                 running: Arc::new(AtomicBool::new(false)),
                 status: Arc::new(Mutex::new("Not started.".to_string())),
                 last_toggle: Instant::now() - Duration::from_secs(1),
@@ -2340,21 +2458,13 @@ fn render_asio_bandwidth_estimate(ui: &mut egui::Ui, selected_channels: usize) {
     let (color, message) = if selected_channels == 0 {
         (Theme::ACCENT_RED, "No channels selected".to_string())
     } else if selected_channels <= 2 {
-        (
-            Theme::ACCENT_GREEN,
-            "Low channel load • Demand-gated (0 Mbps when idle)".to_string(),
-        )
+        (Theme::ACCENT_GREEN, "Low channel load".to_string())
     } else if selected_channels <= 16 {
-        (
-            Theme::ACCENT_ORANGE,
-            "Moderate channel load • Demand-gated (0 Mbps when idle)".to_string(),
-        )
+        (Theme::ACCENT_ORANGE, "Moderate channel load".to_string())
     } else {
         (
             egui::Color32::YELLOW,
-            format!(
-                "Multichannel load ({selected_channels} ch) • Demand-gating active: 0 Mbps when idle, only active subscribers consume bandwidth"
-            ),
+            "High-bandwidth multichannel stream".to_string(),
         )
     };
 
@@ -2666,17 +2776,33 @@ impl OpenAudioApp {
 
                             ui.checkbox(
                                 &mut session.record,
-                                egui::RichText::new("Record stream to file")
+                                egui::RichText::new("Record stream to WAV")
                                     .color(Theme::TEXT_PRIMARY),
                             );
 
-                            if session.record {
-                                ui.checkbox(
-                                    &mut session.record_flac,
-                                    egui::RichText::new("Lossless FLAC (.flac)")
-                                        .color(egui::Color32::from_rgb(100, 210, 255)),
-                                );
-                            }
+                            egui::ComboBox::from_id_source(format!("publish_format_{}", session.id))
+                                .selected_text(match session.format {
+                                    audio_core::PublishFormat::Float32 => "Float32 PCM",
+                                    audio_core::PublishFormat::Opus => "Opus (10 ms)",
+                                    audio_core::PublishFormat::Auto => "Auto (Opus at 8+ ch)",
+                                })
+                                .show_ui(ui, |ui| {
+                                    ui.selectable_value(
+                                        &mut session.format,
+                                        audio_core::PublishFormat::Float32,
+                                        "Float32 PCM",
+                                    );
+                                    ui.selectable_value(
+                                        &mut session.format,
+                                        audio_core::PublishFormat::Opus,
+                                        "Opus (10 ms)",
+                                    );
+                                    ui.selectable_value(
+                                        &mut session.format,
+                                        audio_core::PublishFormat::Auto,
+                                        "Auto (Opus at 8+ ch)",
+                                    );
+                                });
 
                             let is_enc = session.encrypted;
                             ui.checkbox(
@@ -2899,6 +3025,8 @@ impl OpenAudioApp {
 
                                 let is_loopback = session.is_loopback;
 
+                                let format = session.format;
+
                                 let channel_labels = session.channel_labels.clone();
 
                                 let cipher = if session.encrypted && !session.passphrase.is_empty() {
@@ -2908,15 +3036,9 @@ impl OpenAudioApp {
                                 };
 
                                 let record_path = if session.record {
-                                    if session.record_flac {
-                                        Some(audio_core::generate_flac_record_path(&format!(
-                                            "publish_{stream_id}"
-                                        )))
-                                    } else {
-                                        Some(audio_core::generate_record_path(&format!(
-                                            "publish_{stream_id}"
-                                        )))
-                                    }
+                                    Some(audio_core::generate_record_path(&format!(
+                                        "publish_{stream_id}"
+                                    )))
                                 } else {
                                     None
                                 };
@@ -2949,7 +3071,7 @@ impl OpenAudioApp {
                                     .name(format!("wasapi-publish-{stream_id}"))
                                     .spawn(move || {
                                         let result = if is_loopback {
-                                            audio_core::transmit_loopback_with_discovery_labeled_encrypted(
+                                            audio_core::transmit_loopback_with_discovery_labeled_encrypted_format(
                                                 node_name,
                                                 stream_name,
                                                 stream_id,
@@ -2959,9 +3081,10 @@ impl OpenAudioApp {
                                                 Some(channel_labels),
                                                 worker_running.clone(),
                                                 cipher,
+                                                format,
                                             )
                                         } else {
-                                            audio_core::transmit_with_discovery_labeled_encrypted(
+                                            audio_core::transmit_with_discovery_labeled_encrypted_format(
                                                 node_name,
                                                 stream_name,
                                                 stream_id,
@@ -2971,6 +3094,7 @@ impl OpenAudioApp {
                                                 Some(channel_labels),
                                                 worker_running.clone(),
                                                 cipher,
+                                                format,
                                             )
                                         };
 
@@ -3111,8 +3235,9 @@ impl OpenAudioApp {
                 stream_id: 3000u32.saturating_add(id.min(u32::MAX as u64) as u32),
                 selected_input: None,
                 is_loopback: false,
+                format: audio_core::PublishFormat::Float32,
                 record: false,
-                record_flac: false,
+
                 channel_labels: vec!["Channel 1".to_string(), "Channel 2".to_string()],
                 encrypted: false,
                 passphrase: String::new(),
@@ -3353,32 +3478,56 @@ impl OpenAudioApp {
                                 }
                             }
 
+                            egui::ComboBox::from_id_source(format!("combine_format_{}", session.id))
+                                .selected_text(match session.format {
+                                    audio_core::PublishFormat::Float32 => "Float32 PCM",
+                                    audio_core::PublishFormat::Opus => "Opus (10 ms)",
+                                    audio_core::PublishFormat::Auto => "Auto (Opus at 8+ ch)",
+                                })
+                                .show_ui(ui, |ui| {
+                                    ui.selectable_value(
+                                        &mut session.format,
+                                        audio_core::PublishFormat::Float32,
+                                        "Float32 PCM",
+                                    );
+                                    ui.selectable_value(
+                                        &mut session.format,
+                                        audio_core::PublishFormat::Opus,
+                                        "Opus (10 ms)",
+                                    );
+                                    ui.selectable_value(
+                                        &mut session.format,
+                                        audio_core::PublishFormat::Auto,
+                                        "Auto (Opus at 8+ ch)",
+                                    );
+                                });
+
                             ui.checkbox(
                                 &mut session.record,
-                                egui::RichText::new("Record each channel to file")
+                                egui::RichText::new("Record each channel to WAV")
                                     .color(Theme::TEXT_PRIMARY),
                             );
-
-                            if session.record {
-                                ui.checkbox(
-                                    &mut session.record_flac,
-                                    egui::RichText::new("Lossless FLAC (.flac)")
-                                        .color(egui::Color32::from_rgb(100, 210, 255)),
-                                );
-                            }
 
                             let is_enc = session.encrypted;
                             ui.checkbox(
                                 &mut session.encrypted,
-                                egui::RichText::new("🔒 Encrypt Stream (AES-256-GCM)")
-                                    .color(if is_enc { egui::Color32::from_rgb(52, 199, 89) } else { Theme::TEXT_PRIMARY }),
+                                egui::RichText::new("🔒 Encrypt Stream (AES-256-GCM)").color(
+                                    if is_enc {
+                                        egui::Color32::from_rgb(52, 199, 89)
+                                    } else {
+                                        Theme::TEXT_PRIMARY
+                                    },
+                                ),
                             );
                         });
 
                         if session.encrypted {
                             ui.add_space(4.0);
                             ui.horizontal(|ui| {
-                                ui.label(egui::RichText::new("🔑 Passphrase:").color(Theme::TEXT_SECONDARY));
+                                ui.label(
+                                    egui::RichText::new("🔑 Passphrase:")
+                                        .color(Theme::TEXT_SECONDARY),
+                                );
                                 ui.add(
                                     egui::TextEdit::singleline(&mut session.passphrase)
                                         .password(true)
@@ -3530,6 +3679,8 @@ impl OpenAudioApp {
 
                                 let record_each = session.record;
 
+                                let format = session.format;
+
                                 let channel_labels = session.channel_labels.clone();
 
                                 let subscribers = subscriber_registry.clone();
@@ -3554,8 +3705,11 @@ impl OpenAudioApp {
                                     ),
                                 );
 
-                                let cipher = if session.encrypted && !session.passphrase.is_empty() {
-                                    Some(Arc::new(audio_core::StreamCipher::from_passphrase(&session.passphrase)))
+                                let cipher = if session.encrypted && !session.passphrase.is_empty()
+                                {
+                                    Some(Arc::new(audio_core::StreamCipher::from_passphrase(
+                                        &session.passphrase,
+                                    )))
                                 } else {
                                     None
                                 };
@@ -3563,17 +3717,19 @@ impl OpenAudioApp {
                                 let spawn_result = thread::Builder::new()
                                     .name(format!("combined-publish-{stream_id}"))
                                     .spawn(move || {
-                                        let result = audio_core::capture_and_combine_with_labels_encrypted(
-                                            node_name,
-                                            stream_name,
-                                            stream_id,
-                                            sources,
-                                            subscribers,
-                                            record_each,
-                                            Some(channel_labels),
-                                            cipher,
-                                            worker_running.clone(),
-                                        );
+                                        let result =
+                                            audio_core::capture_and_combine_with_labels_encrypted_format(
+                                                node_name,
+                                                stream_name,
+                                                stream_id,
+                                                sources,
+                                                subscribers,
+                                                record_each,
+                                                Some(channel_labels),
+                                                cipher,
+                                                worker_running.clone(),
+                                                format,
+                                            );
 
                                         match result {
                                             Ok(()) => {
@@ -3728,8 +3884,8 @@ impl OpenAudioApp {
                 channel_count: 2,
                 channel_sources: vec![(None, false), (None, false)],
                 channel_labels: vec!["Channel 1".to_string(), "Channel 2".to_string()],
+                format: audio_core::PublishFormat::Float32,
                 record: false,
-                record_flac: false,
                 encrypted: false,
                 passphrase: String::new(),
                 running: Arc::new(AtomicBool::new(false)),
@@ -3952,17 +4108,9 @@ impl OpenAudioApp {
 
                             ui.checkbox(
                                 &mut session.record,
-                                egui::RichText::new("Record output to file")
+                                egui::RichText::new("Record mixed output to WAV")
                                     .color(Theme::TEXT_PRIMARY),
                             );
-
-                            if session.record {
-                                ui.checkbox(
-                                    &mut session.record_flac,
-                                    egui::RichText::new("Lossless FLAC (.flac)")
-                                        .color(egui::Color32::from_rgb(100, 210, 255)),
-                                );
-                            }
 
                             let is_enc = session.encrypted;
                             ui.checkbox(
@@ -4177,11 +4325,12 @@ impl OpenAudioApp {
 
                                 match (node, port) {
                                     (Some(node), Ok(port)) if port != 0 => {
-                                        let subscribe_result = audio_core::send_subscribe_request(
+                                        let subscribe_result = audio_core::send_subscribe_request_with_formats(
                                             &node.ip,
                                             node.control_port,
                                             node.stream_id,
                                             port,
+                                            audio_core::PCM_AND_OPUS_WIRE_FORMATS,
                                         );
 
                                         match subscribe_result {
@@ -4193,15 +4342,9 @@ impl OpenAudioApp {
                                                 let volume = session.volume.clone();
 
                                                 let record_path = if session.record {
-                                                    if session.record_flac {
-                                                        Some(audio_core::generate_flac_record_path(
-                                                            &format!("subscribe_{port}"),
-                                                        ))
-                                                    } else {
-                                                        Some(audio_core::generate_record_path(
-                                                            &format!("subscribe_{port}"),
-                                                        ))
-                                                    }
+                                                    Some(audio_core::generate_record_path(
+                                                        &format!("subscribe_{port}"),
+                                                    ))
                                                 } else {
                                                     None
                                                 };
@@ -4223,28 +4366,18 @@ impl OpenAudioApp {
                                                 running.store(true, Ordering::Release);
 
                                                 let reconnect_running = running.clone();
-                                                let reconnect_directory = self.discovery_directory.clone();
-                                                let reconnect_node_id = selected_id.clone();
-                                                let mut reconnect_ip = node.ip.clone();
-                                                let mut reconnect_control_port = node.control_port;
-                                                let mut reconnect_stream_id = node.stream_id;
+                                                let reconnect_ip = node.ip.clone();
+                                                let reconnect_control_port = node.control_port;
+                                                let reconnect_stream_id = node.stream_id;
                                                 thread::spawn(move || {
                                                     while reconnect_running.load(Ordering::Acquire)
                                                     {
-                                                        if let Some(ref nid) = reconnect_node_id {
-                                                            if let Ok(dir) = reconnect_directory.lock() {
-                                                                if let Some(live_node) = dir.get(nid) {
-                                                                    reconnect_ip = live_node.ip.clone();
-                                                                    reconnect_control_port = live_node.control_port;
-                                                                    reconnect_stream_id = live_node.stream_id;
-                                                                }
-                                                            }
-                                                        }
-                                                        let _ = audio_core::send_subscribe_request(
+                                                        let _ = audio_core::send_subscribe_request_with_formats(
                                                             &reconnect_ip,
                                                             reconnect_control_port,
                                                             reconnect_stream_id,
                                                             port,
+                                                            audio_core::PCM_AND_OPUS_WIRE_FORMATS,
                                                         );
                                                         for _ in 0..10 {
                                                             if !reconnect_running
@@ -4393,31 +4526,6 @@ impl OpenAudioApp {
                                 .size(11.0)
                                 .color(Theme::TEXT_SECONDARY),
                             );
-
-                            if running {
-                                if let Some(ref node_id) = session.selected_discovered_node_id {
-                                    if let Some(ping) = pings.get(node_id) {
-                                        let rtt = ping.rtt_ms;
-                                        let one_way = rtt / 2.0;
-                                        let buf_ms = session.jitter_target_ms.load(Ordering::Relaxed) as f32;
-                                        let est_total = one_way + buf_ms;
-                                        ui.label(
-                                            egui::RichText::new(format!(
-                                                "⏱ RTT: {:.1}ms | 1-Way: {:.1}ms | Buffer: {:.0}ms | Total: ~{:.1}ms",
-                                                rtt, one_way, buf_ms, est_total
-                                            ))
-                                            .size(11.0)
-                                            .color(if est_total < 25.0 {
-                                                Theme::ACCENT_GREEN
-                                            } else if est_total < 50.0 {
-                                                Theme::ACCENT_BLUE
-                                            } else {
-                                                Theme::ACCENT_ORANGE
-                                            }),
-                                        );
-                                    }
-                                }
-                            }
                         });
                     });
                 });
@@ -4484,7 +4592,6 @@ impl OpenAudioApp {
                 selected_output: None,
                 volume: audio_core::new_volume_control(1.0),
                 record: false,
-                record_flac: false,
                 encrypted: false,
                 passphrase: String::new(),
                 running: Arc::new(AtomicBool::new(false)),
@@ -4530,11 +4637,12 @@ impl OpenAudioApp {
 
             match (node, port) {
                 (Some(node), Ok(port)) if port != 0 => {
-                    let subscribe_result = audio_core::send_subscribe_request(
+                    let subscribe_result = audio_core::send_subscribe_request_with_formats(
                         &node.ip,
                         node.control_port,
                         node.stream_id,
                         port,
+                        audio_core::PCM_AND_OPUS_WIRE_FORMATS,
                     );
 
                     match subscribe_result {
@@ -4543,11 +4651,9 @@ impl OpenAudioApp {
                             let device_name = session.selected_output.clone();
                             let volume = session.volume.clone();
                             let record_path = if session.record {
-                                if session.record_flac {
-                                    Some(audio_core::generate_flac_record_path(&format!("subscribe_{port}")))
-                                } else {
-                                    Some(audio_core::generate_record_path(&format!("subscribe_{port}")))
-                                }
+                                Some(audio_core::generate_record_path(&format!(
+                                    "subscribe_{port}"
+                                )))
                             } else {
                                 None
                             };
@@ -4562,27 +4668,17 @@ impl OpenAudioApp {
                             running.store(true, Ordering::Release);
 
                             let reconnect_running = running.clone();
-                            let reconnect_directory = self.discovery_directory.clone();
-                            let reconnect_node_id = selected_id.clone();
-                            let mut reconnect_ip = node.ip.clone();
-                            let mut reconnect_control_port = node.control_port;
-                            let mut reconnect_stream_id = node.stream_id;
+                            let reconnect_ip = node.ip.clone();
+                            let reconnect_control_port = node.control_port;
+                            let reconnect_stream_id = node.stream_id;
                             thread::spawn(move || {
                                 while reconnect_running.load(Ordering::Acquire) {
-                                    if let Some(ref nid) = reconnect_node_id {
-                                        if let Ok(dir) = reconnect_directory.lock() {
-                                            if let Some(live_node) = dir.get(nid) {
-                                                reconnect_ip = live_node.ip.clone();
-                                                reconnect_control_port = live_node.control_port;
-                                                reconnect_stream_id = live_node.stream_id;
-                                            }
-                                        }
-                                    }
-                                    let _ = audio_core::send_subscribe_request(
+                                    let _ = audio_core::send_subscribe_request_with_formats(
                                         &reconnect_ip,
                                         reconnect_control_port,
                                         reconnect_stream_id,
                                         port,
+                                        audio_core::PCM_AND_OPUS_WIRE_FORMATS,
                                     );
                                     for _ in 0..10 {
                                         if !reconnect_running.load(Ordering::Acquire) {
@@ -4598,11 +4694,14 @@ impl OpenAudioApp {
                                 format!("Receiving '{stream_name}' from '{node_name}'..."),
                             );
 
-                            let cipher = if session.encrypted && !session.passphrase.trim().is_empty() {
-                                Some(Arc::new(audio_core::StreamCipher::from_passphrase(&session.passphrase)))
-                            } else {
-                                None
-                            };
+                            let cipher =
+                                if session.encrypted && !session.passphrase.trim().is_empty() {
+                                    Some(Arc::new(audio_core::StreamCipher::from_passphrase(
+                                        &session.passphrase,
+                                    )))
+                                } else {
+                                    None
+                                };
 
                             let jitter_target = session.jitter_target_ms.clone();
 
@@ -4641,7 +4740,10 @@ impl OpenAudioApp {
                             }
                         }
                         Err(error) => {
-                            set_shared_optional_message(&error_banner, Some(friendly_error(&error)));
+                            set_shared_optional_message(
+                                &error_banner,
+                                Some(friendly_error(&error)),
+                            );
                         }
                     }
                 }
@@ -4667,14 +4769,19 @@ impl OpenAudioApp {
             let stream_id = session.stream_id;
             let device_name = session.selected_input.clone();
             let is_loopback = session.is_loopback;
+            let format = session.format;
             let channel_labels = session.channel_labels.clone();
             let cipher = if session.encrypted && !session.passphrase.is_empty() {
-                Some(Arc::new(audio_core::StreamCipher::from_passphrase(&session.passphrase)))
+                Some(Arc::new(audio_core::StreamCipher::from_passphrase(
+                    &session.passphrase,
+                )))
             } else {
                 None
             };
             let record_path = if session.record {
-                Some(audio_core::generate_record_path(&format!("publish_{stream_id}")))
+                Some(audio_core::generate_record_path(&format!(
+                    "publish_{stream_id}"
+                )))
             } else {
                 None
             };
@@ -4687,14 +4794,18 @@ impl OpenAudioApp {
             running.store(true, Ordering::Release);
             set_shared_status(
                 &status,
-                if is_loopback { "Starting loopback capture..." } else { "Starting input capture..." },
+                if is_loopback {
+                    "Starting loopback capture..."
+                } else {
+                    "Starting input capture..."
+                },
             );
 
             let spawn_result = thread::Builder::new()
                 .name(format!("wasapi-publish-{stream_id}"))
                 .spawn(move || {
                     let result = if is_loopback {
-                        audio_core::transmit_loopback_with_discovery_labeled_encrypted(
+                        audio_core::transmit_loopback_with_discovery_labeled_encrypted_format(
                             node_name,
                             stream_name,
                             stream_id,
@@ -4704,9 +4815,10 @@ impl OpenAudioApp {
                             Some(channel_labels),
                             worker_running.clone(),
                             cipher,
+                            format,
                         )
                     } else {
-                        audio_core::transmit_with_discovery_labeled_encrypted(
+                        audio_core::transmit_with_discovery_labeled_encrypted_format(
                             node_name,
                             stream_name,
                             stream_id,
@@ -4716,6 +4828,7 @@ impl OpenAudioApp {
                             Some(channel_labels),
                             worker_running.clone(),
                             cipher,
+                            format,
                         )
                     };
                     match result {
@@ -4757,9 +4870,11 @@ impl OpenAudioApp {
                 })
                 .collect::<Vec<_>>();
             let record_each = session.record;
+            let format = session.format;
             let channel_labels = session.channel_labels.clone();
             let running = session.running.clone();
             let worker_running = running.clone();
+
             let status = session.status.clone();
             let worker_status = status.clone();
             let worker_error_banner = error_banner.clone();
@@ -4768,7 +4883,9 @@ impl OpenAudioApp {
             set_shared_status(&status, "Starting combined capture...");
 
             let cipher = if session.encrypted && !session.passphrase.is_empty() {
-                Some(Arc::new(audio_core::StreamCipher::from_passphrase(&session.passphrase)))
+                Some(Arc::new(audio_core::StreamCipher::from_passphrase(
+                    &session.passphrase,
+                )))
             } else {
                 None
             };
@@ -4776,7 +4893,7 @@ impl OpenAudioApp {
             let spawn_result = thread::Builder::new()
                 .name(format!("combined-publish-{stream_id}"))
                 .spawn(move || {
-                    let result = audio_core::capture_and_combine_with_labels_encrypted(
+                    let result = audio_core::capture_and_combine_with_labels_encrypted_format(
                         node_name,
                         stream_name,
                         stream_id,
@@ -4786,6 +4903,7 @@ impl OpenAudioApp {
                         Some(channel_labels),
                         cipher,
                         worker_running.clone(),
+                        format,
                     );
                     match result {
                         Ok(()) => set_shared_status(&worker_status, "Stopped."),
@@ -4823,6 +4941,7 @@ impl OpenAudioApp {
             };
             let channel_indices = session.channel_indices.clone();
             let channel_labels = session.channel_labels.clone();
+            let format = session.format;
             let running = session.running.clone();
             let worker_running = running.clone();
             let status = session.status.clone();
@@ -4842,7 +4961,7 @@ impl OpenAudioApp {
             let spawn_result = thread::Builder::new()
                 .name(format!("asio-publish-{stream_id}"))
                 .spawn(move || {
-                    let result = audio_core::capture_asio_with_channel_labels(
+                    let result = audio_core::capture_asio_with_channel_labels_format(
                         node_name,
                         stream_name,
                         stream_id,
@@ -4851,6 +4970,7 @@ impl OpenAudioApp {
                         channel_labels,
                         subscribers,
                         worker_running.clone(),
+                        format,
                     );
                     match result {
                         Ok(()) => set_shared_status(&worker_status, "Stopped."),
@@ -4895,11 +5015,12 @@ impl OpenAudioApp {
 
             match (node, port) {
                 (Some(node), Ok(port)) if port != 0 => {
-                    let _ = audio_core::send_subscribe_request(
+                    let _ = audio_core::send_subscribe_request_with_formats(
                         &node.ip,
                         node.control_port,
                         node.stream_id,
                         port,
+                        audio_core::PCM_AND_OPUS_WIRE_FORMATS,
                     );
                     let bind_addr = format!("0.0.0.0:{port}");
                     let device_targets = session.channel_devices.clone();
@@ -4919,11 +5040,12 @@ impl OpenAudioApp {
                     let reconnect_stream_id = node.stream_id;
                     thread::spawn(move || {
                         while reconnect_running.load(Ordering::Acquire) {
-                            let _ = audio_core::send_subscribe_request(
+                            let _ = audio_core::send_subscribe_request_with_formats(
                                 &reconnect_ip,
                                 reconnect_control_port,
                                 reconnect_stream_id,
                                 port,
+                                audio_core::PCM_AND_OPUS_WIRE_FORMATS,
                             );
                             for _ in 0..10 {
                                 if !reconnect_running.load(Ordering::Acquire) {
@@ -4943,7 +5065,9 @@ impl OpenAudioApp {
                     );
 
                     let cipher = if session.encrypted && !session.passphrase.trim().is_empty() {
-                        Some(Arc::new(audio_core::StreamCipher::from_passphrase(&session.passphrase)))
+                        Some(Arc::new(audio_core::StreamCipher::from_passphrase(
+                            &session.passphrase,
+                        )))
                     } else {
                         None
                     };
@@ -4975,7 +5099,8 @@ impl OpenAudioApp {
 
                     if let Err(error) = spawn_result {
                         running.store(false, Ordering::Release);
-                        let message = format!("Could not start the split subscription thread: {error}");
+                        let message =
+                            format!("Could not start the split subscription thread: {error}");
                         set_shared_status(&session.status, &message);
                         set_shared_optional_message(&error_banner, Some(message));
                     }
@@ -4992,12 +5117,18 @@ impl OpenAudioApp {
             }
         }
         for idx in 0..self.combine_publish_sessions.len() {
-            if !self.combine_publish_sessions[idx].running.load(Ordering::Acquire) {
+            if !self.combine_publish_sessions[idx]
+                .running
+                .load(Ordering::Acquire)
+            {
                 self.start_combine_publish_session(idx);
             }
         }
         for idx in 0..self.asio_publish_sessions.len() {
-            if !self.asio_publish_sessions[idx].running.load(Ordering::Acquire) {
+            if !self.asio_publish_sessions[idx]
+                .running
+                .load(Ordering::Acquire)
+            {
                 self.start_asio_publish_session(idx);
             }
         }
@@ -5007,7 +5138,10 @@ impl OpenAudioApp {
             }
         }
         for idx in 0..self.split_subscribe_sessions.len() {
-            if !self.split_subscribe_sessions[idx].running.load(Ordering::Acquire) {
+            if !self.split_subscribe_sessions[idx]
+                .running
+                .load(Ordering::Acquire)
+            {
                 self.start_split_subscribe_session(idx);
             }
         }
@@ -5094,7 +5228,8 @@ impl OpenAudioApp {
 
         self.patchbay_matrix.receivers.clear();
         for dest in &destinations {
-            self.patchbay_matrix.add_receiver(&dest.id, &dest.label, 2, "local");
+            self.patchbay_matrix
+                .add_receiver(&dest.id, &dest.label, 2, "local");
         }
 
         self.patchbay_matrix.clear_patches();
@@ -5364,7 +5499,8 @@ impl OpenAudioApp {
             if let Some((first_pub_id, _)) = discovered_entries.first() {
                 // Find or create session for (first_pub_id, None)
                 let existing_idx = self.subscribe_sessions.iter().position(|s| {
-                    s.selected_discovered_node_id.as_deref() == Some(first_pub_id.as_str()) && s.selected_output.is_none()
+                    s.selected_discovered_node_id.as_deref() == Some(first_pub_id.as_str())
+                        && s.selected_output.is_none()
                 });
 
                 if let Some(idx) = existing_idx {
@@ -5374,7 +5510,10 @@ impl OpenAudioApp {
                 } else {
                     let id = self.take_next_id();
                     let port = 6980u64.saturating_add(id).min(u16::MAX as u64);
-                    let is_enc = discovered_nodes.get(first_pub_id).map(|n| n.encrypted).unwrap_or(false);
+                    let is_enc = discovered_nodes
+                        .get(first_pub_id)
+                        .map(|n| n.encrypted)
+                        .unwrap_or(false);
                     self.subscribe_sessions.push(SubscribeSession {
                         id,
                         selected_discovered_node_id: Some(first_pub_id.clone()),
@@ -5382,7 +5521,6 @@ impl OpenAudioApp {
                         selected_output: None,
                         volume: audio_core::new_volume_control(1.0),
                         record: false,
-                        record_flac: false,
                         encrypted: is_enc,
                         passphrase: String::new(),
                         running: Arc::new(AtomicBool::new(false)),
@@ -5394,25 +5532,32 @@ impl OpenAudioApp {
                     self.start_subscribe_session(new_idx);
                 }
             }
-        } else if let Some((target_pub_id, target_dest_id, target_device_opt)) = toggle_patch_action {
+        } else if let Some((target_pub_id, target_dest_id, target_device_opt)) = toggle_patch_action
+        {
             // Find existing session
             let existing_idx = self.subscribe_sessions.iter().position(|s| {
-                s.selected_discovered_node_id.as_deref() == Some(target_pub_id.as_str()) && s.selected_output == target_device_opt
+                s.selected_discovered_node_id.as_deref() == Some(target_pub_id.as_str())
+                    && s.selected_output == target_device_opt
             });
 
             if let Some(idx) = existing_idx {
                 let is_running = self.subscribe_sessions[idx].running.load(Ordering::Acquire);
                 if is_running {
                     self.stop_subscribe_session(idx);
-                    self.patchbay_matrix.set_patched(&target_pub_id, &target_dest_id, false);
+                    self.patchbay_matrix
+                        .set_patched(&target_pub_id, &target_dest_id, false);
                 } else {
                     self.start_subscribe_session(idx);
-                    self.patchbay_matrix.set_patched(&target_pub_id, &target_dest_id, true);
+                    self.patchbay_matrix
+                        .set_patched(&target_pub_id, &target_dest_id, true);
                 }
             } else {
                 let id = self.take_next_id();
                 let port = 6980u64.saturating_add(id).min(u16::MAX as u64);
-                let is_enc = discovered_nodes.get(&target_pub_id).map(|n| n.encrypted).unwrap_or(false);
+                let is_enc = discovered_nodes
+                    .get(&target_pub_id)
+                    .map(|n| n.encrypted)
+                    .unwrap_or(false);
                 self.subscribe_sessions.push(SubscribeSession {
                     id,
                     selected_discovered_node_id: Some(target_pub_id.clone()),
@@ -5420,7 +5565,6 @@ impl OpenAudioApp {
                     selected_output: target_device_opt,
                     volume: audio_core::new_volume_control(1.0),
                     record: false,
-                    record_flac: false,
                     encrypted: is_enc,
                     passphrase: String::new(),
                     running: Arc::new(AtomicBool::new(false)),
@@ -5430,7 +5574,8 @@ impl OpenAudioApp {
                 });
                 let new_idx = self.subscribe_sessions.len() - 1;
                 self.start_subscribe_session(new_idx);
-                self.patchbay_matrix.set_patched(&target_pub_id, &target_dest_id, true);
+                self.patchbay_matrix
+                    .set_patched(&target_pub_id, &target_dest_id, true);
             }
         }
     }
@@ -5555,17 +5700,9 @@ impl OpenAudioApp {
 
                             ui.checkbox(
                                 &mut session.record,
-                                egui::RichText::new("Record each channel to file")
+                                egui::RichText::new("Record each channel to WAV")
                                     .color(Theme::TEXT_PRIMARY),
                             );
-
-                            if session.record {
-                                ui.checkbox(
-                                    &mut session.record_flac,
-                                    egui::RichText::new("Lossless FLAC (.flac)")
-                                        .color(egui::Color32::from_rgb(100, 210, 255)),
-                                );
-                            }
 
                             ui.checkbox(
                                 &mut session.encrypted,
@@ -5842,11 +5979,12 @@ impl OpenAudioApp {
 
                                 match (node, port) {
                                     (Some(node), Ok(port)) if port != 0 => {
-                                        match audio_core::send_subscribe_request(
+                                        match audio_core::send_subscribe_request_with_formats(
                                             &node.ip,
                                             node.control_port,
                                             node.stream_id,
                                             port,
+                                            audio_core::PCM_AND_OPUS_WIRE_FORMATS,
                                         ) {
                                             Ok(()) => {
                                                 let bind_addr = format!("0.0.0.0:{port}");
@@ -5877,11 +6015,12 @@ impl OpenAudioApp {
                                                 thread::spawn(move || {
                                                     while reconnect_running.load(Ordering::Acquire)
                                                     {
-                                                        let _ = audio_core::send_subscribe_request(
+                                                        let _ = audio_core::send_subscribe_request_with_formats(
                                                             &reconnect_ip,
                                                             reconnect_control_port,
                                                             reconnect_stream_id,
                                                             port,
+                                                            audio_core::PCM_AND_OPUS_WIRE_FORMATS,
                                                         );
                                                         for _ in 0..10 {
                                                             if !reconnect_running
@@ -5915,16 +6054,13 @@ impl OpenAudioApp {
                                                 let spawn_result = thread::Builder::new()
                                                     .name(format!("split-subscribe-{port}"))
                                                     .spawn(move || {
-                                                        let result =
-                                                                audio_core::
-                                                                receive_and_split_to_devices_with_cipher(
-                                                                    &bind_addr,
-                                                                    device_targets,
-                                                                    record_each,
-                                                                    cipher,
-                                                                    worker_running
-                                                                        .clone(),
-                                                                );
+                                                        let result = audio_core::receive_and_split_to_devices_with_cipher(
+                                                            &bind_addr,
+                                                            device_targets,
+                                                            record_each,
+                                                            cipher,
+                                                            worker_running.clone(),
+                                                        );
 
                                                         match result {
                                                             Ok(()) => {
@@ -6112,7 +6248,6 @@ impl OpenAudioApp {
                 bind_port: port.to_string(),
                 channel_devices: Vec::new(),
                 record: false,
-                record_flac: false,
                 encrypted: false,
                 passphrase: String::new(),
                 running: Arc::new(AtomicBool::new(false)),
@@ -6207,49 +6342,25 @@ impl OpenAudioApp {
                     "Open LAN — no password",
                 );
 
-                ui.add_space(8.0);
-
-                ui.checkbox(
-                    &mut self.browser_https_enabled,
-                    "🔒 Enable Native HTTPS & WSS (Required for Mobile Mic)",
-                );
-                ui.label(
-                    egui::RichText::new(
-                        "Generates an automatic self-signed TLS certificate covering localhost and LAN IP. \
-                         Enables wireless microphone capture on iOS Safari and Android Chrome.",
-                    )
-                    .size(11.0)
-                    .color(Theme::TEXT_SECONDARY),
-                );
-
                 ui.add_space(10.0);
 
                 match self.browser_access_mode {
                     BrowserAccessMode::PasswordProtected => {
                         self.render_browser_password_fields(ui);
-                        let warning_text = if self.browser_https_enabled {
-                            "🔒 Browser traffic is encrypted with TLS (HTTPS/WSS). \
-                             Audio and password are encrypted in transit over your local network."
-                        } else {
-                            "⚠ Browser traffic is unencrypted HTTP/WebSocket. \
-                             A LAN observer may capture the password, session, \
-                             or audio. Use only on a trusted private network; \
-                             this password does not encrypt audio or native streams."
-                        };
-                        let warning_color = if self.browser_https_enabled {
-                            Theme::ACCENT_GREEN
-                        } else {
-                            egui::Color32::YELLOW
-                        };
                         egui::Frame::none()
                             .fill(Theme::BG_WARNING)
                             .rounding(8.0)
                             .inner_margin(12.0)
                             .show(ui, |ui| {
                                 ui.label(
-                                    egui::RichText::new(warning_text)
-                                        .size(11.0)
-                                        .color(warning_color),
+                                    egui::RichText::new(
+                                        "⚠ Browser traffic is unencrypted HTTP/WebSocket. \
+                                         A LAN observer may capture the password, session, \
+                                         or audio. Use only on a trusted private network; \
+                                         this password does not encrypt audio or native streams.",
+                                    )
+                                    .size(11.0)
+                                    .color(egui::Color32::YELLOW),
                                 );
                             });
                     }
@@ -6490,9 +6601,6 @@ impl OpenAudioApp {
     }
 
     fn render_active_gateway_details(&self, ui: &mut egui::Ui) {
-        let scheme = if self.browser_https_enabled { "https" } else { "http" };
-        let ws_scheme = if self.browser_https_enabled { "wss" } else { "ws" };
-
         card_frame().show(ui, |ui| {
             ui.label(
                 egui::RichText::new("Gateway Address")
@@ -6504,41 +6612,16 @@ impl OpenAudioApp {
             ui.add_space(5.0);
 
             ui.monospace(
-                egui::RichText::new(format!("{scheme}://<this-machine-IP>:7100/"))
-                    .color(Theme::ACCENT_BLUE),
-            );
-
-            ui.add_space(3.0);
-
-            ui.monospace(
-                egui::RichText::new(format!("{scheme}://<this-machine-IP>:7100/publish (Mobile Mic)"))
-                    .color(Theme::ACCENT_GREEN),
+                egui::RichText::new("http://<this-machine-IP>:7100/").color(Theme::ACCENT_BLUE),
             );
 
             ui.add_space(5.0);
 
             ui.label(
-                egui::RichText::new(format!(
-                    "{} player/API: 7100  •  {} relay: 7101",
-                    scheme.to_uppercase(),
-                    ws_scheme.to_uppercase()
-                ))
-                .size(11.0)
-                .color(Theme::TEXT_SECONDARY),
+                egui::RichText::new("HTTP player/API: 7100  •  WebSocket relay: 7101")
+                    .size(11.0)
+                    .color(Theme::TEXT_SECONDARY),
             );
-
-            if self.browser_https_enabled {
-                ui.add_space(2.0);
-                ui.label(
-                    egui::RichText::new(
-                        "🔒 Native TLS Active (Self-signed cert — tap Advanced > Proceed on phone)",
-                    )
-                    .size(10.5)
-                    .color(Theme::ACCENT_GREEN),
-                );
-            }
-
-            ui.add_space(5.0);
 
             let access_label = match self.browser_access_mode {
                 BrowserAccessMode::PasswordProtected => "Access: password protected",
@@ -6598,18 +6681,11 @@ impl OpenAudioApp {
             },
         };
 
-        let tls = if self.browser_https_enabled {
-            audio_core::TlsConfig::AutoSelfSigned
-        } else {
-            audio_core::TlsConfig::Disabled
-        };
-
         let config = audio_core::WebGatewayConfig {
             http_port: 7100,
             access,
             max_clients: 8,
             session_duration: Duration::from_secs(8 * 60 * 60),
-            tls,
         };
 
         let directory = self.discovery_directory.clone();
@@ -6795,20 +6871,47 @@ impl Drop for OpenAudioApp {
 // ============================================================================
 
 fn load_icon() -> egui::IconData {
-    if let Ok(img) = image::load_from_memory(include_bytes!("../icon.ico")) {
-        let rgba = img.to_rgba8();
-        let (width, height) = rgba.dimensions();
-        return egui::IconData {
-            rgba: rgba.into_raw(),
-            width,
-            height,
-        };
+    let size = 64u32;
+    let mut rgba = Vec::with_capacity((size * size * 4) as usize);
+
+    let center_x = size as f32 / 2.0;
+    let center_y = size as f32 / 2.0;
+
+    for y in 0..size {
+        for x in 0..size {
+            let dx = x as f32 - center_x;
+            let dy = y as f32 - center_y;
+            let distance = (dx * dx + dy * dy).sqrt();
+
+            let outer_radius = size as f32 / 2.0;
+            let inner_radius = outer_radius * 0.55;
+
+            if distance <= outer_radius && distance >= inner_radius {
+                let angle = dy.atan2(dx);
+
+                let wave = ((angle * 3.0).sin() * 0.5 + 0.5) * 0.4 + 0.6;
+
+                rgba.push((wave * 100.0) as u8);
+                rgba.push((wave * 180.0) as u8);
+                rgba.push(255);
+                rgba.push(255);
+            } else if distance < inner_radius {
+                let pulse = (distance / inner_radius * std::f32::consts::PI).sin().abs();
+
+                rgba.push((pulse * 80.0) as u8);
+                rgba.push((pulse * 140.0) as u8);
+                rgba.push((pulse * 220.0) as u8);
+                rgba.push(200);
+            } else {
+                rgba.extend_from_slice(&[0, 0, 0, 0]);
+            }
+        }
     }
 
     egui::IconData {
-        rgba: vec![0; 64 * 64 * 4],
-        width: 64,
-        height: 64,
+        rgba,
+        width: size,
+        height: size,
     }
 }
 
@@ -6907,11 +7010,31 @@ fn run_headless(
 
         if last_report.elapsed() >= Duration::from_secs(10) {
             last_report = Instant::now();
-            let pub_active = app.publish_sessions.iter().filter(|s| s.running.load(Ordering::Relaxed)).count();
-            let comb_active = app.combine_publish_sessions.iter().filter(|s| s.running.load(Ordering::Relaxed)).count();
-            let asio_active = app.asio_publish_sessions.iter().filter(|s| s.running.load(Ordering::Relaxed)).count();
-            let sub_active = app.subscribe_sessions.iter().filter(|s| s.running.load(Ordering::Relaxed)).count();
-            let split_active = app.split_subscribe_sessions.iter().filter(|s| s.running.load(Ordering::Relaxed)).count();
+            let pub_active = app
+                .publish_sessions
+                .iter()
+                .filter(|s| s.running.load(Ordering::Relaxed))
+                .count();
+            let comb_active = app
+                .combine_publish_sessions
+                .iter()
+                .filter(|s| s.running.load(Ordering::Relaxed))
+                .count();
+            let asio_active = app
+                .asio_publish_sessions
+                .iter()
+                .filter(|s| s.running.load(Ordering::Relaxed))
+                .count();
+            let sub_active = app
+                .subscribe_sessions
+                .iter()
+                .filter(|s| s.running.load(Ordering::Relaxed))
+                .count();
+            let split_active = app
+                .split_subscribe_sessions
+                .iter()
+                .filter(|s| s.running.load(Ordering::Relaxed))
+                .count();
 
             println!(
                 "[STATUS] Active Sessions: {} publish, {} combined, {} ASIO, {} subscribe, {} split",
@@ -6972,7 +7095,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
 
     eframe::run_native(
-        "OpenAudio by Ferronme",
+        "Ferronme's Open Audio",
         options,
         Box::new(move |_creation_context| {
             let mut app = OpenAudioApp::default();

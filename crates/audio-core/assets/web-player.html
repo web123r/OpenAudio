@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>OpenAudio by Ferronme Web Player</title>
+<title>Ferronme's OpenAudio Web Player</title>
 <style>
   * { box-sizing: border-box; margin: 0; padding: 0; }
 
@@ -489,7 +489,7 @@
 <div class="card">
   <h1>
     <span id="liveDot" class="dot"></span>
-    OpenAudio by Ferronme
+    OpenAudio Web Player
   </h1>
 
   <div class="subtitle">Live streams on your network</div>
@@ -847,6 +847,14 @@
         parts.push(`Delivery: ${pct}% (${lost} lost, ${rec} recovered via FEC)`);
       } else {
         parts.push(`Delivery: ${pct}% (${lost} lost)`);
+      }
+      const dup = Number(latestMetrics.duplicateSubstreams || 0);
+      const bad = Number(latestMetrics.malformedPackets || 0);
+      const concealed = Number(latestMetrics.concealedSubstreams || 0);
+      if (dup + bad + concealed > 0) {
+        parts.push(
+          `Opus drops: ${dup} duplicate, ${bad} malformed, ${concealed} concealed`
+        );
       }
       parts.push(`${rate} pkts/s`);
     }

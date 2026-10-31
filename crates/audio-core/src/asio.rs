@@ -15,13 +15,18 @@ pub mod inner {
     use std::sync::{Arc, Mutex, TryLockError};
     use std::time::{Duration, Instant};
 
-    use crate::discovery::{start_advertising_with_labels, SubscriberRegistry};
+    use crate::discovery::{
+        active_subscribers_accept_opus, start_advertising_with_format, SubscriberRegistry,
+    };
     use crate::ensure_realtime_audio_thread;
     use crate::protocol::{
         sample_rate_to_code, AudioPayloadHeader, PacketHeader, SAMPLE_FORMAT_FLOAT32,
     };
     use crate::util::safe_lock;
-    use crate::{register_scoped_signal_meter, SignalDirection, SignalMeter};
+    use crate::{
+        register_scoped_signal_meter, PublishFormat, SignalDirection, SignalMeter,
+        StreamingLinearResampler,
+    };
 
     /// Conservative payload limit that avoids IP fragmentation on most
     /// Ethernet, Wi-Fi, VPN, and tunneled network paths.
@@ -186,7 +191,7 @@ pub mod inner {
             .map(|index| format!("Channel {}", index + 1))
             .collect();
 
-        capture_asio_with_channel_labels(
+        capture_asio_with_channel_labels_format(
             node_name,
             stream_name,
             stream_id,
@@ -195,6 +200,7 @@ pub mod inner {
             channel_labels,
             subscribers_by_stream,
             keep_running,
+            PublishFormat::Float32,
         )
     }
 
@@ -207,6 +213,30 @@ pub mod inner {
         channel_labels: Vec<String>,
         subscribers_by_stream: SubscriberRegistry,
         keep_running: Arc<AtomicBool>,
+    ) -> Result<(), String> {
+        capture_asio_with_channel_labels_format(
+            node_name,
+            stream_name,
+            stream_id,
+            driver_name,
+            channel_indices,
+            channel_labels,
+            subscribers_by_stream,
+            keep_running,
+            PublishFormat::Float32,
+        )
+    }
+
+    pub fn capture_asio_with_channel_labels_format(
+        node_name: String,
+        stream_name: String,
+        stream_id: u32,
+        driver_name: String,
+        channel_indices: Vec<usize>,
+        channel_labels: Vec<String>,
+        subscribers_by_stream: SubscriberRegistry,
+        keep_running: Arc<AtomicBool>,
+        format: PublishFormat,
     ) -> Result<(), String> {
         init_com_for_asio();
         ensure_realtime_audio_thread();
@@ -228,7 +258,22 @@ pub mod inner {
 
         validate_driver_channels(&driver_name, total_driver_channels, &channel_indices)?;
 
-        let sample_rate_code = sample_rate_to_code(sample_rate);
+        let selected_channel_count = channel_indices.len();
+        let format = format.resolve(
+            selected_channel_count,
+            active_subscribers_accept_opus(&subscribers_by_stream, stream_id),
+        );
+        if format == PublishFormat::Opus && !(1..=64).contains(&selected_channel_count) {
+            return Err(format!(
+                "Opus supports 1 to 64 channels, got {selected_channel_count}"
+            ));
+        }
+        let wire_sample_rate = if format == PublishFormat::Opus {
+            48_000
+        } else {
+            sample_rate
+        };
+        let sample_rate_code = sample_rate_to_code(wire_sample_rate);
 
         if sample_rate_code == 0 {
             return Err(format!(
@@ -238,8 +283,6 @@ pub mod inner {
                  48000 Hz in its control panel."
             ));
         }
-
-        let selected_channel_count = channel_indices.len();
 
         let meter_label = format!(
             "{node_name} — {stream_name} — ASIO \
@@ -253,7 +296,11 @@ pub mod inner {
             selected_channel_count,
         );
 
-        let max_frames_per_packet = calculate_max_frames_per_packet(selected_channel_count)?;
+        let max_frames_per_packet = if format == PublishFormat::Opus {
+            network_core::opus::OPUS_FRAME_SAMPLES
+        } else {
+            calculate_max_frames_per_packet(selected_channel_count)?
+        };
 
         let maximum_packet_bytes = OPENAUDIO_HEADER_BYTES
             + max_frames_per_packet * selected_channel_count * BYTES_PER_SAMPLE;
@@ -299,14 +346,16 @@ pub mod inner {
         let advertising_stream_name = stream_name;
         let advertised_channels = selected_channel_count as u8;
 
+        let advertised_format = format.wire_sample_format();
         std::thread::spawn(move || {
-            if let Err(error) = start_advertising_with_labels(
+            if let Err(error) = start_advertising_with_format(
                 advertising_node_name,
                 stream_id,
                 advertising_stream_name,
                 advertised_channels,
                 channel_labels,
                 crate::discovery::CONTROL_PORT,
+                advertised_format,
                 advertising_flag,
             ) {
                 eprintln!(
@@ -361,6 +410,8 @@ pub mod inner {
             keep_running,
             metrics.clone(),
             signal_meter,
+            format,
+            sample_rate,
         );
 
         drop(stream);
@@ -730,6 +781,8 @@ pub mod inner {
         keep_running: Arc<AtomicBool>,
         metrics: Arc<CaptureMetrics>,
         signal_meter: Arc<SignalMeter>,
+        format: PublishFormat,
+        capture_sample_rate: u32,
     ) -> Result<(), String> {
         let maximum_packet_size =
             OPENAUDIO_HEADER_BYTES + max_frames_per_packet * channel_count * BYTES_PER_SAMPLE;
@@ -739,6 +792,26 @@ pub mod inner {
         let mut samples = Vec::with_capacity(max_frames_per_packet * channel_count);
 
         let mut last_metrics_report = Instant::now();
+        let mut opus_encoder = if format == PublishFormat::Opus {
+            Some(network_core::opus::MultichannelOpusEncoder::new(
+                channel_count,
+                64_000,
+            )?)
+        } else {
+            None
+        };
+        let mut opus_resampler = if format == PublishFormat::Opus && capture_sample_rate != 48_000 {
+            Some(StreamingLinearResampler::new(
+                channel_count,
+                capture_sample_rate,
+                48_000,
+            )?)
+        } else {
+            None
+        };
+        let mut opus_pending = Vec::<f32>::new();
+        let mut opus_timestamp_ns = None;
+        let mut last_incompatible_report = 0usize;
 
         while keep_running.load(Ordering::Relaxed) {
             let available_frames = {
@@ -780,15 +853,79 @@ pub mod inner {
             // useful while the publisher is waiting for a receiver.
             signal_meter.observe_interleaved(&samples, channel_count);
 
-            let destinations =
-                crate::discovery::active_subscribers(subscribers_by_stream, stream_id)
-                    .filter(|addresses| !addresses.is_empty());
+            let destinations = crate::discovery::active_subscribers_for_format(
+                subscribers_by_stream,
+                stream_id,
+                format.wire_sample_format(),
+            );
+            crate::transmit::report_incompatible_subscribers(
+                stream_id,
+                format,
+                destinations.skipped_incompatible,
+                &mut last_incompatible_report,
+            );
 
             // Captured data is always drained to prevent unlimited
             // latency, even when no subscriber is connected.
-            let Some(destinations) = destinations else {
+            if destinations.addresses.is_empty() {
                 continue;
-            };
+            }
+            let destinations = destinations.addresses;
+
+            if format == PublishFormat::Opus {
+                let resampled = match opus_resampler.as_mut() {
+                    Some(resampler) => resampler.process(&samples)?,
+                    None => samples.clone(),
+                };
+                if opus_pending.is_empty() {
+                    opus_timestamp_ns = Some(clock_start.elapsed().as_nanos() as u64);
+                }
+                opus_pending.extend(resampled);
+                let frame_samples = network_core::opus::OPUS_FRAME_SAMPLES * channel_count;
+                while opus_pending.len() >= frame_samples {
+                    let frame = opus_pending.drain(..frame_samples).collect::<Vec<_>>();
+                    let timestamp_ns = opus_timestamp_ns.unwrap_or_default();
+                    let substream_count = (channel_count as u32).div_ceil(2);
+                    let sequence_start = sequence.fetch_add(substream_count, Ordering::Relaxed);
+                    let encoded = opus_encoder
+                        .as_mut()
+                        .ok_or_else(|| "ASIO Opus encoder was not initialized".to_string())?
+                        .encode(&frame, sequence_start)?;
+                    for (sub_stream_index, sequence_number, payload) in encoded {
+                        let packet = network_core::protocol::encode_opus_packet(
+                            &PacketHeader {
+                                sub_stream_index,
+                                stream_id,
+                                sequence_number,
+                                presentation_timestamp_ns: timestamp_ns,
+                            },
+                            channel_count as u8,
+                            48_000,
+                            network_core::opus::OPUS_FRAME_SAMPLES as u16,
+                            &payload,
+                        )?;
+                        metrics.packets_sent.fetch_add(1, Ordering::Relaxed);
+                        for destination in &destinations {
+                            match socket.send_to(&packet, destination) {
+                                Ok(bytes) if bytes == packet.len() => {
+                                    metrics.datagrams_sent.fetch_add(1, Ordering::Relaxed);
+                                }
+                                Ok(_) | Err(_) => {
+                                    metrics.packet_send_errors.fetch_add(1, Ordering::Relaxed);
+                                }
+                            }
+                        }
+                    }
+                    opus_timestamp_ns = if opus_pending.len() >= frame_samples {
+                        Some(
+                            timestamp_ns.saturating_add(network_core::opus::OPUS_FRAME_DURATION_NS),
+                        )
+                    } else {
+                        None
+                    };
+                }
+                continue;
+            }
 
             let sequence_number = sequence.fetch_add(1, Ordering::Relaxed);
 
@@ -825,7 +962,7 @@ pub mod inner {
 
             metrics.packets_sent.fetch_add(1, Ordering::Relaxed);
 
-            for destination in destinations {
+            for destination in &destinations {
                 match socket.send_to(&packet, destination) {
                     Ok(bytes_sent) if bytes_sent == packet.len() => {
                         metrics.datagrams_sent.fetch_add(1, Ordering::Relaxed);
@@ -968,8 +1105,8 @@ pub mod inner {
 
 #[cfg(feature = "asio")]
 pub use inner::{
-    capture_asio_with_channel_labels, capture_asio_with_discovery, get_asio_device,
-    list_asio_drivers, AsioDriverInfo,
+    capture_asio_with_channel_labels, capture_asio_with_channel_labels_format,
+    capture_asio_with_discovery, get_asio_device, list_asio_drivers, AsioDriverInfo,
 };
 
 // Non-ASIO build stubs.
@@ -1020,6 +1157,23 @@ pub fn capture_asio_with_channel_labels(
     _channel_labels: Vec<String>,
     _subscribers_by_stream: crate::discovery::SubscriberRegistry,
     _keep_running: std::sync::Arc<std::sync::atomic::AtomicBool>,
+) -> Result<(), String> {
+    Err("ASIO support is not compiled in. Build with \
+         --features asio and set CPAL_ASIO_DIR."
+        .to_string())
+}
+
+#[cfg(not(feature = "asio"))]
+pub fn capture_asio_with_channel_labels_format(
+    _node_name: String,
+    _stream_name: String,
+    _stream_id: u32,
+    _driver_name: String,
+    _channel_indices: Vec<usize>,
+    _channel_labels: Vec<String>,
+    _subscribers_by_stream: crate::discovery::SubscriberRegistry,
+    _keep_running: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    _format: crate::PublishFormat,
 ) -> Result<(), String> {
     Err("ASIO support is not compiled in. Build with \
          --features asio and set CPAL_ASIO_DIR."

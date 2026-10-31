@@ -1,6 +1,11 @@
 use crossbeam::queue::ArrayQueue;
-use network_core::discovery::{active_subscribers, SubscriberRegistry};
-use network_core::protocol::{encode_float32_packet, max_float32_frames_per_packet, PacketHeader};
+use network_core::discovery::{
+    active_subscribers_for_format, SubscriberRegistry, PCM_AND_OPUS_WIRE_FORMATS,
+};
+use network_core::protocol::{
+    encode_float32_packet, max_float32_frames_per_packet, PacketHeader, SAMPLE_FORMAT_FLOAT32,
+    SAMPLE_FORMAT_OPUS,
+};
 use nice_plug::prelude::*;
 use std::collections::HashMap;
 use std::net::UdpSocket;
@@ -12,6 +17,8 @@ use std::time::{Duration, Instant};
 
 const AUDIO_BLOCK_COUNT: usize = 4;
 const MAX_HOST_BLOCK_FRAMES: usize = 8_192;
+/// Opus publish timestamps advance by one low-latency frame.
+const FRAME_DURATION_NS: u64 = network_core::opus::OPUS_FRAME_DURATION_NS;
 
 static STREAM_ID_COUNTER: AtomicU32 = AtomicU32::new(1);
 static CONTROL_SERVICE: OnceLock<Mutex<Weak<ControlService>>> = OnceLock::new();
@@ -147,6 +154,7 @@ impl PublisherRuntime {
         slot: u32,
         encrypt_enabled: Arc<AtomicBool>,
         active_pin: Arc<AtomicU32>,
+        publish_opus: Arc<AtomicBool>,
     ) -> Result<Self, String> {
         if channels == 0 || channels > 64 {
             return Err(format!(
@@ -217,6 +225,7 @@ impl PublisherRuntime {
 
         let publisher_encrypt_enabled = encrypt_enabled.clone();
         let publisher_active_pin = active_pin.clone();
+        let publisher_opus_enabled = publish_opus.clone();
 
         eprintln!(
             "OpenAudio VST3 [stream {stream_id}]: activated — \
@@ -229,10 +238,45 @@ impl PublisherRuntime {
             .spawn(move || {
                 let mut sequence_number = 0u32;
                 let mut last_stats_report = Instant::now();
-                let mut fec_encoder = network_core::fec::FecEncoder::new(
-                    network_core::fec::DEFAULT_FEC_GROUP_SIZE,
-                );
+                let mut fec_encoder =
+                    network_core::fec::FecEncoder::new(network_core::fec::DEFAULT_FEC_GROUP_SIZE);
                 let mut current_cipher: Option<(u32, audio_core::crypto::StreamCipher)> = None;
+                let opus_enabled = publisher_opus_enabled.load(Ordering::Relaxed);
+                let wire_format = if opus_enabled {
+                    SAMPLE_FORMAT_OPUS
+                } else {
+                    SAMPLE_FORMAT_FLOAT32
+                };
+                let mut opus_encoder = if opus_enabled {
+                    match network_core::opus::MultichannelOpusEncoder::new(channels, 64_000) {
+                        Ok(encoder) => Some(encoder),
+                        Err(error) => {
+                            eprintln!(
+                                "OpenAudio VST3 [stream {stream_id}]: \
+                                 Opus encoder unavailable: {error}"
+                            );
+                            None
+                        }
+                    }
+                } else {
+                    None
+                };
+                let mut opus_resampler = if opus_enabled && sample_rate != 48_000 {
+                    match audio_core::StreamingLinearResampler::new(channels, sample_rate, 48_000) {
+                        Ok(resampler) => Some(resampler),
+                        Err(error) => {
+                            eprintln!(
+                                "OpenAudio VST3 [stream {stream_id}]: \
+                                 Opus resampler unavailable: {error}"
+                            );
+                            None
+                        }
+                    }
+                } else {
+                    None
+                };
+                let mut opus_pending: Vec<f32> = Vec::new();
+                let mut opus_frame_index: u64 = 0;
 
                 while publisher_running.load(Ordering::Acquire)
                     || !publisher_ready_blocks.is_empty()
@@ -252,24 +296,105 @@ impl PublisherRuntime {
                     if publisher_encrypt_enabled.load(Ordering::Relaxed) {
                         let pin = publisher_active_pin.load(Ordering::Relaxed);
                         if current_cipher.as_ref().map(|(p, _)| *p) != Some(pin) {
-                            current_cipher = Some((pin, audio_core::crypto::StreamCipher::from_passphrase(&pin.to_string())));
+                            current_cipher = Some((
+                                pin,
+                                audio_core::crypto::StreamCipher::from_passphrase(&pin.to_string()),
+                            ));
                         }
                     } else {
                         current_cipher = None;
                     }
 
                     if let Some(block) = publisher_ready_blocks.pop() {
-                        let maybe_destinations = active_subscribers(
+                        let destinations = active_subscribers_for_format(
                             &publisher_subscribers,
                             stream_id,
-                        )
-                        .filter(|destinations| !destinations.is_empty());
+                            wire_format,
+                        );
 
-                        if let Some(destinations) = maybe_destinations {
-                            for samples in block
-                                .samples
-                                .chunks(maximum_packet_frames * channels)
-                            {
+                        if opus_enabled {
+                            if let Some(encoder) = opus_encoder.as_mut() {
+                                let converted = match opus_resampler.as_mut() {
+                                    Some(resampler) => match resampler.process(&block.samples) {
+                                        Ok(converted) => converted,
+                                        Err(error) => {
+                                            eprintln!(
+                                                "OpenAudio VST3 [stream {stream_id}]: \
+                                                 Opus resampling failed: {error}"
+                                            );
+                                            Vec::new()
+                                        }
+                                    },
+                                    None => block.samples.clone(),
+                                };
+                                opus_pending.extend(converted);
+
+                                let frame_samples =
+                                    network_core::opus::OPUS_FRAME_SAMPLES * channels;
+                                let substream_count = channels.div_ceil(2) as u32;
+
+                                while opus_pending.len() >= frame_samples {
+                                    let frame: Vec<f32> =
+                                        opus_pending.drain(..frame_samples).collect();
+                                    let timestamp_ns =
+                                        opus_frame_index.saturating_mul(FRAME_DURATION_NS);
+                                    opus_frame_index = opus_frame_index.wrapping_add(1);
+
+                                    let sequence_start = sequence_number;
+                                    sequence_number = sequence_number.wrapping_add(substream_count);
+
+                                    let Ok(encoded) = encoder.encode(&frame, sequence_start) else {
+                                        continue;
+                                    };
+
+                                    for (substream_index, packet_sequence, payload) in encoded {
+                                        let header = PacketHeader {
+                                            sub_stream_index: substream_index,
+                                            stream_id,
+                                            sequence_number: packet_sequence,
+                                            presentation_timestamp_ns: timestamp_ns,
+                                        };
+                                        let Ok(mut packet) =
+                                            network_core::protocol::encode_opus_packet(
+                                                &header,
+                                                channels as u8,
+                                                48_000,
+                                                network_core::opus::OPUS_FRAME_SAMPLES as u16,
+                                                &payload,
+                                            )
+                                        else {
+                                            continue;
+                                        };
+
+                                        if let Some((_, ref cipher)) = current_cipher {
+                                            if let Ok(enc) =
+                                                audio_core::crypto::encrypt_audio_packet(
+                                                    cipher, &packet,
+                                                )
+                                            {
+                                                packet = enc;
+                                            }
+                                        }
+
+                                        for destination in &destinations.addresses {
+                                            if let Err(error) = socket.send_to(&packet, destination)
+                                            {
+                                                publisher_send_errors
+                                                    .fetch_add(1, Ordering::Relaxed);
+                                                eprintln!(
+                                                    "OpenAudio VST3 [stream {stream_id}]: \
+                                                     send to {destination} failed: {error}"
+                                                );
+                                            } else {
+                                                publisher_packets_sent
+                                                    .fetch_add(1, Ordering::Relaxed);
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        } else if !destinations.addresses.is_empty() {
+                            for samples in block.samples.chunks(maximum_packet_frames * channels) {
                                 let header = PacketHeader {
                                     sub_stream_index: 0,
                                     stream_id,
@@ -286,14 +411,17 @@ impl PublisherRuntime {
                                 ) {
                                     Ok(mut packet) => {
                                         if let Some((_, ref cipher)) = current_cipher {
-                                            if let Ok(enc) = audio_core::crypto::encrypt_audio_packet(cipher, &packet) {
+                                            if let Ok(enc) =
+                                                audio_core::crypto::encrypt_audio_packet(
+                                                    cipher, &packet,
+                                                )
+                                            {
                                                 packet = enc;
                                             }
                                         }
 
-                                        for destination in &destinations {
-                                            if let Err(error) =
-                                                socket.send_to(&packet, destination)
+                                        for destination in &destinations.addresses {
+                                            if let Err(error) = socket.send_to(&packet, destination)
                                             {
                                                 publisher_send_errors
                                                     .fetch_add(1, Ordering::Relaxed);
@@ -319,8 +447,9 @@ impl PublisherRuntime {
                                                 &packet[32..],
                                             );
                                             if let Some(fec_packet) = maybe_fec {
-                                                for destination in &destinations {
-                                                    let _ = socket.send_to(&fec_packet, destination);
+                                                for destination in &destinations.addresses {
+                                                    let _ =
+                                                        socket.send_to(&fec_packet, destination);
                                                 }
                                             }
                                         }
@@ -374,21 +503,29 @@ impl PublisherRuntime {
         let advertiser_running = running.clone();
         let advertiser_active = publish_enabled.clone();
         let advertiser_encrypted = encrypt_enabled.clone();
+        let advertised_format = if publish_opus.load(Ordering::Relaxed) {
+            SAMPLE_FORMAT_OPUS
+        } else {
+            SAMPLE_FORMAT_FLOAT32
+        };
         let advertiser = match thread::Builder::new()
             .name(format!("openaudio-vst3-discovery-{stream_id}"))
             .spawn(move || {
                 let is_enc = advertiser_encrypted.load(Ordering::Relaxed);
-                if let Err(error) = audio_core::start_advertising_with_labels_and_active_encrypted(
-                    "OpenAudio VST3".to_string(),
-                    stream_id,
-                    stream_name,
-                    channels as u8,
-                    network_core::discovery::default_channel_labels(channels as u8),
-                    control_port,
-                    is_enc,
-                    advertiser_running,
-                    advertiser_active,
-                ) {
+                if let Err(error) =
+                    audio_core::start_advertising_with_labels_and_active_encrypted_format(
+                        "OpenAudio VST3".to_string(),
+                        stream_id,
+                        stream_name,
+                        channels as u8,
+                        network_core::discovery::default_channel_labels(channels as u8),
+                        control_port,
+                        is_enc,
+                        advertised_format,
+                        advertiser_running,
+                        advertiser_active,
+                    )
+                {
                     eprintln!(
                         "OpenAudio VST3 [stream {stream_id}]: \
                          discovery advertising stopped: {error}"
@@ -455,7 +592,6 @@ impl Drop for PublisherRuntime {
     }
 }
 
-
 pub struct OpenAudioDawSender {
     params: Arc<OpenAudioDawSenderParams>,
     runtime: Option<PublisherRuntime>,
@@ -463,12 +599,16 @@ pub struct OpenAudioDawSender {
     active_slot: Arc<AtomicU32>,
     encrypt_enabled: Arc<AtomicBool>,
     active_pin: Arc<AtomicU32>,
+    publish_opus: Arc<AtomicBool>,
 }
 
 #[derive(Params)]
 pub struct OpenAudioDawSenderParams {
     #[id = "publish"]
     pub publish: BoolParam,
+
+    #[id = "opus"]
+    pub opus: BoolParam,
 
     #[id = "slot"]
     pub slot: IntParam,
@@ -484,20 +624,29 @@ impl Default for OpenAudioDawSender {
     fn default() -> Self {
         let publish_enabled = Arc::new(AtomicBool::new(false));
         let cb_enabled = publish_enabled.clone();
-        let default_slot = ((STREAM_ID_COUNTER.fetch_add(1, Ordering::Relaxed) - 1) % 32 + 1) as i32;
+        let default_slot =
+            ((STREAM_ID_COUNTER.fetch_add(1, Ordering::Relaxed) - 1) % 32 + 1) as i32;
         let active_slot = Arc::new(AtomicU32::new(default_slot as u32));
         let cb_slot = active_slot.clone();
         let encrypt_enabled = Arc::new(AtomicBool::new(false));
         let cb_encrypt = encrypt_enabled.clone();
         let active_pin = Arc::new(AtomicU32::new(1234));
         let cb_pin = active_pin.clone();
+        let publish_opus = Arc::new(AtomicBool::new(false));
+        let cb_opus = publish_opus.clone();
 
         Self {
             params: Arc::new(OpenAudioDawSenderParams {
-                publish: BoolParam::new("Publish to OpenAudio", false)
-                    .with_callback(Arc::new(move |value| {
+                publish: BoolParam::new("Publish to OpenAudio", false).with_callback(Arc::new(
+                    move |value| {
                         cb_enabled.store(value, Ordering::Release);
-                    })),
+                    },
+                )),
+                opus: BoolParam::new("Publish Opus (48 kHz)", false).with_callback(Arc::new(
+                    move |value| {
+                        cb_opus.store(value, Ordering::Release);
+                    },
+                )),
                 slot: IntParam::new(
                     "Network Track Slot",
                     default_slot,
@@ -506,14 +655,18 @@ impl Default for OpenAudioDawSender {
                 .with_callback(Arc::new(move |value| {
                     cb_slot.store(value.clamp(1, 32) as u32, Ordering::Release);
                 })),
-                encrypt: BoolParam::new("AES-256-GCM Encryption", false)
-                    .with_callback(Arc::new(move |value| {
+                encrypt: BoolParam::new("AES-256-GCM Encryption", false).with_callback(Arc::new(
+                    move |value| {
                         cb_encrypt.store(value, Ordering::Release);
-                    })),
+                    },
+                )),
                 pin: IntParam::new(
                     "Encryption Key PIN",
                     1234,
-                    IntRange::Linear { min: 0, max: 999_999 },
+                    IntRange::Linear {
+                        min: 0,
+                        max: 999_999,
+                    },
                 )
                 .with_callback(Arc::new(move |value| {
                     cb_pin.store(value.clamp(0, 999_999) as u32, Ordering::Release);
@@ -524,6 +677,7 @@ impl Default for OpenAudioDawSender {
             active_slot,
             encrypt_enabled,
             active_pin,
+            publish_opus,
         }
     }
 }
@@ -603,6 +757,8 @@ impl Plugin for OpenAudioDawSender {
         self.encrypt_enabled.store(is_encrypted, Ordering::Release);
         let pin = self.params.pin.value().clamp(0, 999_999) as u32;
         self.active_pin.store(pin, Ordering::Release);
+        self.publish_opus
+            .store(self.params.opus.value(), Ordering::Release);
 
         match PublisherRuntime::start(
             channels,
@@ -612,6 +768,7 @@ impl Plugin for OpenAudioDawSender {
             slot,
             self.encrypt_enabled.clone(),
             self.active_pin.clone(),
+            self.publish_opus.clone(),
         ) {
             Ok(runtime) => {
                 self.runtime = Some(runtime);
@@ -766,7 +923,9 @@ impl ReceiverRuntime {
         let worker_slot = slot;
 
         let maybe_cipher = if decrypt_enabled {
-            Some(audio_core::crypto::StreamCipher::from_passphrase(&pin.to_string()))
+            Some(audio_core::crypto::StreamCipher::from_passphrase(
+                &pin.to_string(),
+            ))
         } else {
             None
         };
@@ -775,6 +934,7 @@ impl ReceiverRuntime {
             .name(format!("openaudio-vst3-rx-{port}"))
             .spawn(move || {
                 let mut buf = vec![0u8; 65536];
+                let mut decoder = audio_core::AudioPacketDecoder::new();
                 let mut last_sub_attempt = Instant::now() - Duration::from_secs(5);
                 let target_stream_name = format!("DAW Slot {worker_slot}");
 
@@ -794,17 +954,22 @@ impl ReceiverRuntime {
                 while worker_running.load(Ordering::Relaxed) {
                     if last_sub_attempt.elapsed() >= Duration::from_secs(1) {
                         last_sub_attempt = Instant::now();
-                        let dir = discovery_dir.lock().unwrap_or_else(|p| p.into_inner()).clone();
+                        let dir = discovery_dir
+                            .lock()
+                            .unwrap_or_else(|p| p.into_inner())
+                            .clone();
                         for (_id, node) in dir {
                             if node.stream_name == target_stream_name
                                 || node.stream_id % 32 == worker_slot % 32
                             {
-                                let _ = network_core::discovery::send_subscribe_request(
-                                    &node.ip,
-                                    node.control_port,
-                                    node.stream_id,
-                                    port,
-                                );
+                                let _ =
+                                    network_core::discovery::send_subscribe_request_with_formats(
+                                        &node.ip,
+                                        node.control_port,
+                                        node.stream_id,
+                                        port,
+                                        PCM_AND_OPUS_WIRE_FORMATS,
+                                    );
                             }
                         }
                     }
@@ -826,53 +991,56 @@ impl ReceiverRuntime {
                     }
 
                     let decrypted_storage: Vec<u8>;
-                    let packet: &[u8] = if raw_packet[5] == network_core::protocol::PACKET_TYPE_AUDIO_ENCRYPTED {
-                        if let Some(ref cipher) = maybe_cipher {
-                            match audio_core::crypto::decrypt_audio_packet(cipher, raw_packet) {
-                                Ok(dec) => {
-                                    decrypted_storage = dec;
-                                    &decrypted_storage[..]
+                    let packet: &[u8] =
+                        if raw_packet[5] == network_core::protocol::PACKET_TYPE_AUDIO_ENCRYPTED {
+                            if let Some(ref cipher) = maybe_cipher {
+                                match audio_core::crypto::decrypt_audio_packet(cipher, raw_packet) {
+                                    Ok(dec) => {
+                                        decrypted_storage = dec;
+                                        &decrypted_storage[..]
+                                    }
+                                    Err(_) => continue,
                                 }
-                                Err(_) => continue,
+                            } else {
+                                continue;
                             }
                         } else {
-                            continue;
-                        }
-                    } else {
-                        raw_packet
-                    };
+                            raw_packet
+                        };
 
                     let Some(parsed) = network_core::protocol::parse_packet(packet) else {
                         continue;
                     };
 
-                    if parsed.channel_count == 0 || parsed.samples_per_channel == 0 {
-                        continue;
-                    }
-
-                    let Some(decoded_samples) = network_core::protocol::decode_float32(packet, &parsed) else {
-                        continue;
+                    // The shared decoder handles Float32 packets and assembles
+                    // multichannel Opus substreams into one frame.
+                    let frames = match decoder.decode(packet, &parsed) {
+                        Ok(frames) => frames,
+                        Err(_) => continue,
                     };
-                    if decoded_samples.is_empty() {
-                        continue;
-                    }
 
-                    let mut block = match worker_free.pop() {
-                        Some(b) => b,
-                        None => match worker_ready.pop() {
+                    for frame in frames {
+                        if frame.pcm.is_empty() {
+                            continue;
+                        }
+
+                        let mut block = match worker_free.pop() {
                             Some(b) => b,
-                            None => continue,
-                        },
-                    };
+                            None => match worker_ready.pop() {
+                                Some(b) => b,
+                                None => break,
+                            },
+                        };
 
-                    block.samples.clear();
-                    block.samples.extend(decoded_samples);
-                    block.channels = parsed.channel_count as usize;
-                    block.sample_rate = parsed.sample_rate;
-                    block.sequence = parsed.sequence_number;
+                        block.samples.clear();
+                        block.samples.extend(frame.pcm);
+                        block.channels = frame.packet.channel_count as usize;
+                        block.sample_rate = frame.packet.sample_rate;
+                        block.sequence = frame.packet.sequence_number;
 
-                    worker_packets.fetch_add(1, Ordering::Relaxed);
-                    let _ = worker_ready.push(block);
+                        worker_packets.fetch_add(1, Ordering::Relaxed);
+                        let _ = worker_ready.push(block);
+                    }
                 }
             })
             .map_err(|e| format!("failed to spawn receiver worker: {e}"))?;
@@ -955,10 +1123,11 @@ impl Default for OpenAudioDawReceiver {
 
         Self {
             params: Arc::new(OpenAudioDawReceiverParams {
-                receive: BoolParam::new("Receive from OpenAudio", false)
-                    .with_callback(Arc::new(move |val| {
+                receive: BoolParam::new("Receive from OpenAudio", false).with_callback(Arc::new(
+                    move |val| {
                         cb_receive.store(val, Ordering::Release);
-                    })),
+                    },
+                )),
                 slot: IntParam::new(
                     "Network Track Slot",
                     default_slot as i32,
@@ -971,20 +1140,27 @@ impl Default for OpenAudioDawReceiver {
                 port: IntParam::new(
                     "UDP Listen Port",
                     default_port as i32,
-                    IntRange::Linear { min: 1024, max: 65535 },
+                    IntRange::Linear {
+                        min: 1024,
+                        max: 65535,
+                    },
                 )
                 .with_callback(Arc::new(move |val| {
                     let p = val.clamp(1024, 65535) as u32;
                     cb_port.store(p, Ordering::Release);
                 })),
-                decrypt: BoolParam::new("AES-256-GCM Decryption", false)
-                    .with_callback(Arc::new(move |val| {
+                decrypt: BoolParam::new("AES-256-GCM Decryption", false).with_callback(Arc::new(
+                    move |val| {
                         cb_decrypt.store(val, Ordering::Release);
-                    })),
+                    },
+                )),
                 pin: IntParam::new(
                     "Decryption Key PIN",
                     1234,
-                    IntRange::Linear { min: 0, max: 999_999 },
+                    IntRange::Linear {
+                        min: 0,
+                        max: 999_999,
+                    },
                 )
                 .with_callback(Arc::new(move |val| {
                     cb_pin.store(val.clamp(0, 999_999) as u32, Ordering::Release);
@@ -1286,7 +1462,8 @@ mod tests {
                 presentation_timestamp_ns: 30,
             })
             .is_ok());
-        let block16 = acquire_audio_block(&free_blocks, &ready_blocks, 16, &dropped_frames).unwrap();
+        let block16 =
+            acquire_audio_block(&free_blocks, &ready_blocks, 16, &dropped_frames).unwrap();
         assert!(block16.samples.is_empty());
         assert_eq!(block16.samples.capacity(), 64);
         // previous 4 frames + (64 / 16 = 4 frames) = 8 frames dropped total
@@ -1315,7 +1492,23 @@ mod tests {
         let plugin = OpenAudioDawSender::default();
         let slot_val = plugin.params.slot.value();
         assert!(slot_val >= 1 && slot_val <= 32);
-        assert_eq!(plugin.active_slot.load(std::sync::atomic::Ordering::Relaxed), slot_val as u32);
+        assert_eq!(
+            plugin
+                .active_slot
+                .load(std::sync::atomic::Ordering::Relaxed),
+            slot_val as u32
+        );
+    }
+
+    #[test]
+    fn opus_publishing_is_opt_in_and_defaults_to_float32() {
+        use super::OpenAudioDawSender;
+
+        let plugin = OpenAudioDawSender::default();
+        assert!(!plugin.params.opus.value());
+        assert!(!plugin
+            .publish_opus
+            .load(std::sync::atomic::Ordering::Relaxed));
     }
 
     #[test]
@@ -1328,8 +1521,18 @@ mod tests {
         assert!(slot_val >= 1 && slot_val <= 32);
         let port_val = receiver.params.port.value();
         assert!(port_val >= 1024 && port_val <= 65535);
-        assert_eq!(receiver.active_slot.load(std::sync::atomic::Ordering::Relaxed), slot_val as u32);
-        assert_eq!(receiver.active_port.load(std::sync::atomic::Ordering::Relaxed), port_val as u32);
+        assert_eq!(
+            receiver
+                .active_slot
+                .load(std::sync::atomic::Ordering::Relaxed),
+            slot_val as u32
+        );
+        assert_eq!(
+            receiver
+                .active_port
+                .load(std::sync::atomic::Ordering::Relaxed),
+            port_val as u32
+        );
     }
 
     #[test]
@@ -1339,14 +1542,32 @@ mod tests {
         let sender = OpenAudioDawSender::default();
         assert!(!sender.params.encrypt.value());
         assert_eq!(sender.params.pin.value(), 1234);
-        assert_eq!(sender.encrypt_enabled.load(std::sync::atomic::Ordering::Relaxed), false);
-        assert_eq!(sender.active_pin.load(std::sync::atomic::Ordering::Relaxed), 1234);
+        assert_eq!(
+            sender
+                .encrypt_enabled
+                .load(std::sync::atomic::Ordering::Relaxed),
+            false
+        );
+        assert_eq!(
+            sender.active_pin.load(std::sync::atomic::Ordering::Relaxed),
+            1234
+        );
 
         let receiver = OpenAudioDawReceiver::default();
         assert!(!receiver.params.decrypt.value());
         assert_eq!(receiver.params.pin.value(), 1234);
-        assert_eq!(receiver.decrypt_enabled.load(std::sync::atomic::Ordering::Relaxed), false);
-        assert_eq!(receiver.active_pin.load(std::sync::atomic::Ordering::Relaxed), 1234);
+        assert_eq!(
+            receiver
+                .decrypt_enabled
+                .load(std::sync::atomic::Ordering::Relaxed),
+            false
+        );
+        assert_eq!(
+            receiver
+                .active_pin
+                .load(std::sync::atomic::Ordering::Relaxed),
+            1234
+        );
     }
 
     #[test]
@@ -1365,10 +1586,14 @@ mod tests {
         let pin = 987654u32;
         let sender_cipher = audio_core::crypto::StreamCipher::from_passphrase(&pin.to_string());
         let encrypted = audio_core::crypto::encrypt_audio_packet(&sender_cipher, &raw).unwrap();
-        assert_eq!(encrypted[5], network_core::protocol::PACKET_TYPE_AUDIO_ENCRYPTED);
+        assert_eq!(
+            encrypted[5],
+            network_core::protocol::PACKET_TYPE_AUDIO_ENCRYPTED
+        );
 
         let receiver_cipher = audio_core::crypto::StreamCipher::from_passphrase(&pin.to_string());
-        let decrypted = audio_core::crypto::decrypt_audio_packet(&receiver_cipher, &encrypted).unwrap();
+        let decrypted =
+            audio_core::crypto::decrypt_audio_packet(&receiver_cipher, &encrypted).unwrap();
         assert_eq!(decrypted[5], network_core::protocol::PACKET_TYPE_AUDIO);
         assert_eq!(decrypted, raw);
     }

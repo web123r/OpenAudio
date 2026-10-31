@@ -19,8 +19,10 @@ gates.
 
 - **Channel capacity:** Support streams of up to 64 channels.
 - **Reference sample rate:** Use 48 kHz as the primary Phase 1 validation rate.
-- **V1 audio representation:** Interleaved little-endian Float32 PCM. Opus and
-  FLAC are not v1-supported formats.
+- **V1 audio representation:** Interleaved little-endian Float32 PCM is the
+  default. Opus is implemented but remains outside the release-certified
+  baseline until interoperability and hardware validation gates pass. FLAC is
+  not implemented.
 - **Latency:** Target measured end-to-end latency below 10 ms on a wired LAN.
 - **Network scope:** Support trusted wired LANs and managed Wi-Fi LANs. The
   under-10-ms latency target applies to wired LAN operation.
@@ -400,17 +402,16 @@ and network tests remain release gates.
 | Wire identifier | Format | V1 status |
 | --- | --- | --- |
 | `0x03` | Interleaved little-endian Float32 PCM | Implemented in current publishers and supported receivers |
-| `0x10` | Opus | Reserved identifier; no encoder/decoder; rejected as unsupported |
+| `0x10` | Opus | Implemented across current publish/receive paths; not release-certified |
 | `0x11` | FLAC | Reserved identifier; no encoder/decoder; rejected as unsupported |
 
 Receivers must not reinterpret compressed payloads as PCM. The receiver CLI and
-browser gateway report Opus/FLAC as unsupported; other native playback paths
-discard non-Float32 packets. A future codec proposal must define packet framing
-and timestamps, maximum decode/resource cost, supported channel/sample-rate
-combinations, malformed-input handling, and interoperability fixtures; it
-must include working encoders/decoders and cross-platform tests before the
-format can be listed as supported. Revisit codec support only if measured
-target-network constraints justify the added complexity.
+browser gateway report FLAC as unsupported; Opus is decoded through the shared
+packet decoder but remains outside the release-certified baseline. A future
+codec proposal must define packet framing and timestamps, maximum decode/resource
+cost, supported channel/sample-rate combinations, malformed-input handling, and
+interoperability fixtures; it must include working encoders/decoders and
+cross-platform tests before a codec can be listed as release-certified.
 
 ## Phase 5 progress (2026-10-13)
 

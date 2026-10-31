@@ -1,9 +1,13 @@
-use crate::discovery::send_subscribe_request;
+use crate::discovery::send_subscribe_request_with_formats;
+use crate::discovery::PCM_AND_OPUS_WIRE_FORMATS;
 use crate::fec::FecDecoder;
+use crate::opus::{MultichannelOpusDecoder, OPUS_FRAME_MS, OPUS_FRAME_SAMPLES};
 use crate::protocol::{
-    decode_float32, float32_payload, parse_fec_packet, parse_packet, peek_packet_type,
-    sample_format_name, ParsedPacket, PACKET_TYPE_FEC, SAMPLE_FORMAT_FLOAT32,
+    decode_float32, float32_payload, opus_payload, parse_fec_packet, parse_packet,
+    peek_packet_type, sample_format_name, ParsedPacket, PACKET_TYPE_FEC, SAMPLE_FORMAT_FLOAT32,
+    SAMPLE_FORMAT_OPUS,
 };
+use socket2::SockRef;
 use std::collections::{BTreeMap, VecDeque};
 use std::net::{Ipv4Addr, UdpSocket};
 use std::time::{Duration, Instant};
@@ -220,6 +224,11 @@ impl PacketReorderWindow {
     }
 }
 
+struct OpusPendingFrame {
+    started: Instant,
+    substreams: BTreeMap<u16, (ParsedPacket, Vec<u8>)>,
+}
+
 pub struct StreamReceiver {
     socket: UdpSocket,
     publisher_ip: String,
@@ -229,17 +238,14 @@ pub struct StreamReceiver {
 
     reorder_window: PacketReorderWindow,
     fec_decoder: FecDecoder,
+    opus_decoder: Option<MultichannelOpusDecoder>,
+    opus_pending: BTreeMap<u64, OpusPendingFrame>,
+    opus_format: Option<(u8, u32)>,
     last_receive: Instant,
     current_format: Option<(u8, u32)>,
     is_connected: bool,
 
     event_queue: VecDeque<ReceiveEvent>,
-    #[allow(clippy::type_complexity)]
-    custom_decoder: Option<Box<dyn FnMut(&ParsedPacket, &[u8]) -> Result<Vec<f32>, String> + Send>>,
-    total_packets_received: u64,
-    total_packets_dropped: u64,
-    jitter_ms: f64,
-    last_transit: Option<(Instant, u64)>,
 }
 
 impl StreamReceiver {
@@ -251,6 +257,9 @@ impl StreamReceiver {
     ) -> Result<Self, String> {
         let socket = UdpSocket::bind((Ipv4Addr::UNSPECIFIED, my_receive_port))
             .map_err(|e| format!("failed to bind receive port {my_receive_port}: {e}"))?;
+        if let Err(error) = SockRef::from(&socket).set_recv_buffer_size(4 * 1024 * 1024) {
+            eprintln!("network-core: could not increase UDP receive buffer: {error}");
+        }
         socket
             .set_read_timeout(Some(Duration::from_millis(10)))
             .map_err(|e| format!("failed to set read timeout: {e}"))?;
@@ -263,57 +272,17 @@ impl StreamReceiver {
             my_receive_port,
             reorder_window: PacketReorderWindow::new(32),
             fec_decoder: FecDecoder::new(32),
+            opus_decoder: None,
+            opus_pending: BTreeMap::new(),
+            opus_format: None,
             last_receive: Instant::now() - Duration::from_secs(10),
             current_format: None,
             is_connected: false,
             event_queue: VecDeque::new(),
-            custom_decoder: None,
-            total_packets_received: 0,
-            total_packets_dropped: 0,
-            jitter_ms: 0.0,
-            last_transit: None,
         };
 
         receiver.resubscribe();
         Ok(receiver)
-    }
-
-    /// Total audio packets successfully received and parsed.
-    pub fn total_packets_received(&self) -> u64 {
-        self.total_packets_received
-    }
-
-    /// Total audio packets dropped/lost.
-    pub fn total_packets_dropped(&self) -> u64 {
-        self.total_packets_dropped
-    }
-
-    /// RFC 3550 interarrival jitter estimate in milliseconds.
-    pub fn jitter_ms(&self) -> f64 {
-        self.jitter_ms
-    }
-
-    /// Current packet loss percentage (0.0% to 100.0%).
-    pub fn packet_loss_pct(&self) -> f64 {
-        let total = self.total_packets_received + self.total_packets_dropped;
-        if total > 0 {
-            (self.total_packets_dropped as f64 / total as f64) * 100.0
-        } else {
-            0.0
-        }
-    }
-
-    /// Current connection status.
-    pub fn is_connected(&self) -> bool {
-        self.is_connected
-    }
-
-    /// Registers a custom payload decoder for compressed formats (e.g. Opus or FLAC).
-    pub fn set_custom_decoder<F>(&mut self, decoder: F)
-    where
-        F: FnMut(&ParsedPacket, &[u8]) -> Result<Vec<f32>, String> + Send + 'static,
-    {
-        self.custom_decoder = Some(Box::new(decoder));
     }
 
     pub fn fec_recovered_count(&self) -> u64 {
@@ -324,50 +293,76 @@ impl StreamReceiver {
         self.reorder_window.set_gap_timeout(timeout);
     }
 
-    pub fn resubscribe(&mut self) {
-        let _ = send_subscribe_request(
+    fn flush_opus_frames(
+        &mut self,
+        allow_concealment: bool,
+    ) -> Result<Option<ReceiveEvent>, String> {
+        let Some(timestamp) = self.opus_pending.keys().next().copied() else {
+            return Ok(None);
+        };
+        let should_wait = self
+            .opus_pending
+            .get(&timestamp)
+            .map(|frame| {
+                let expected = frame
+                    .substreams
+                    .values()
+                    .next()
+                    .map(|(packet, _)| (packet.channel_count as usize).div_ceil(2))
+                    .unwrap_or(0);
+                frame.substreams.len() < expected
+                    && (!allow_concealment
+                        || frame.started.elapsed() < Duration::from_millis(OPUS_FRAME_MS as u64))
+            })
+            .unwrap_or(false);
+        if should_wait {
+            return Ok(None);
+        }
+
+        let frame = self
+            .opus_pending
+            .remove(&timestamp)
+            .ok_or_else(|| "Opus frame disappeared while decoding".to_string())?;
+        let representative = frame
+            .substreams
+            .values()
+            .next()
+            .map(|(packet, _)| packet.clone())
+            .ok_or_else(|| "Opus frame contains no substreams".to_string())?;
+        let mut packet_refs = Vec::with_capacity(frame.substreams.len());
+        for (index, (_, payload)) in &frame.substreams {
+            packet_refs.push((*index, payload.as_slice()));
+        }
+        let decoder = self
+            .opus_decoder
+            .as_mut()
+            .ok_or_else(|| "Opus decoder was not initialized".to_string())?;
+        let pcm = decoder.decode(&packet_refs)?;
+
+        Ok(Some(ReceiveEvent::Packet(representative.clone(), pcm)))
+    }
+
+    fn resubscribe(&mut self) {
+        // This receiver decodes both PCM and Opus, so it declares both.
+        let _ = send_subscribe_request_with_formats(
             &self.publisher_ip,
             self.control_port,
             self.stream_id,
             self.my_receive_port,
+            PCM_AND_OPUS_WIRE_FORMATS,
         );
         self.last_receive = Instant::now();
     }
 
-    fn record_event(&mut self, event: &ReceiveEvent) {
-        match event {
-            ReceiveEvent::Packet(packet, _) => {
-                self.total_packets_received = self.total_packets_received.saturating_add(1);
-                let now = Instant::now();
-                if let Some((prev_arr, prev_ts)) = self.last_transit {
-                    let arr_delta = (now - prev_arr).as_secs_f64() * 1000.0;
-                    let ts_delta = (packet.presentation_timestamp_ns.saturating_sub(prev_ts)) as f64 / 1_000_000.0;
-                    let d = (arr_delta - ts_delta).abs();
-                    self.jitter_ms += (d - self.jitter_ms) / 16.0;
-                }
-                self.last_transit = Some((now, packet.presentation_timestamp_ns));
-            }
-            ReceiveEvent::Dropped(count) => {
-                self.total_packets_dropped = self.total_packets_dropped.saturating_add(*count as u64);
-            }
-            _ => {}
-        }
-    }
-
     /// Blocks until an event occurs or timeout, returning the next event.
     pub fn next_event(&mut self) -> Result<Option<ReceiveEvent>, String> {
-        let event = self.poll_next_event()?;
-        if let Some(ref ev) = event {
-            self.record_event(ev);
-        }
-        Ok(event)
-    }
-
-    fn poll_next_event(&mut self) -> Result<Option<ReceiveEvent>, String> {
         if let Some(event) = self.event_queue.pop_front() {
             return Ok(Some(event));
         }
 
+        if let Some(event) = self.flush_opus_frames(true)? {
+            self.event_queue.push_back(event);
+        }
         self.event_queue
             .extend(self.reorder_window.flush_expired_gap());
         if let Some(event) = self.event_queue.pop_front() {
@@ -401,8 +396,10 @@ impl StreamReceiver {
             if packet_type == PACKET_TYPE_FEC {
                 if let Some(fec) = parse_fec_packet(packet_data) {
                     if fec.stream_id == self.stream_id {
-                        let payload = &packet_data[fec.payload_offset..fec.payload_offset + fec.payload_len];
-                        if let Some((rec_pkt, rec_pcm)) = self.fec_decoder.decode_fec(&fec, payload) {
+                        let payload =
+                            &packet_data[fec.payload_offset..fec.payload_offset + fec.payload_len];
+                        if let Some((rec_pkt, rec_pcm)) = self.fec_decoder.decode_fec(&fec, payload)
+                        {
                             let events = self.reorder_window.push_recovered(rec_pkt, rec_pcm);
                             for ev in events {
                                 self.event_queue.push_back(ev);
@@ -423,22 +420,92 @@ impl StreamReceiver {
         }
 
         if let Some(payload) = float32_payload(packet_data, &packet) {
-            self.fec_decoder.record_received(packet.sequence_number, payload);
+            self.fec_decoder
+                .record_received(packet.sequence_number, payload);
         }
 
-        let pcm = if packet.sample_format == SAMPLE_FORMAT_FLOAT32 {
-            let Some(pcm) = decode_float32(&buf[..len], &packet) else {
-                return Err("invalid or truncated Float32 PCM payload".to_string());
+        let format = (packet.channel_count, packet.sample_rate);
+        if packet.sample_format != SAMPLE_FORMAT_OPUS && self.opus_format.is_some() {
+            self.opus_pending.clear();
+            self.opus_decoder = None;
+            self.opus_format = None;
+            self.reorder_window = PacketReorderWindow::new(32);
+            self.current_format = None;
+        }
+        if packet.sample_format == SAMPLE_FORMAT_OPUS {
+            if packet.sample_rate != 48_000 {
+                return Err(format!(
+                    "unsupported Opus sample rate {} Hz",
+                    packet.sample_rate
+                ));
+            }
+            if !(1..=64).contains(&packet.channel_count)
+                || packet.samples_per_channel as usize != OPUS_FRAME_SAMPLES
+            {
+                return Err("invalid Opus channel count or frame duration".to_string());
+            }
+            let expected_substreams = (packet.channel_count as usize).div_ceil(2);
+            if packet.sub_stream_index as usize >= expected_substreams {
+                return Err(format!(
+                    "Opus substream index {} is out of range",
+                    packet.sub_stream_index
+                ));
+            }
+            if self.opus_format != Some(format) {
+                self.opus_decoder =
+                    Some(MultichannelOpusDecoder::new(packet.channel_count as usize)?);
+                self.opus_format = Some(format);
+                self.opus_pending.clear();
+                self.event_queue.push_back(ReceiveEvent::FormatChanged {
+                    channels: packet.channel_count,
+                    sample_rate: packet.sample_rate,
+                });
+            }
+
+            let Some(payload) = opus_payload(packet_data, &packet) else {
+                return Err("invalid or truncated Opus payload".to_string());
             };
-            pcm
-        } else if let Some(ref mut custom) = self.custom_decoder {
-            custom(&packet, &buf[packet.payload_offset..len])?
-        } else {
+            let frame = self
+                .opus_pending
+                .entry(packet.presentation_timestamp_ns)
+                .or_insert_with(|| OpusPendingFrame {
+                    started: Instant::now(),
+                    substreams: BTreeMap::new(),
+                });
+            if frame.substreams.contains_key(&packet.sub_stream_index) {
+                return Err("duplicate Opus substream packet".to_string());
+            }
+            frame
+                .substreams
+                .insert(packet.sub_stream_index, (packet, payload.to_vec()));
+            while self.opus_pending.len() > 32 {
+                if let Some(oldest) = self.opus_pending.keys().next().copied() {
+                    self.opus_pending.remove(&oldest);
+                }
+            }
+
+            if !self.is_connected {
+                self.is_connected = true;
+                self.event_queue.push_back(ReceiveEvent::Reconnected);
+            }
+            self.last_receive = Instant::now();
+
+            if let Some(event) = self.flush_opus_frames(false)? {
+                self.event_queue.push_back(event);
+            }
+            return Ok(self.event_queue.pop_front());
+        }
+
+        if packet.sample_format != SAMPLE_FORMAT_FLOAT32 {
             let format = sample_format_name(packet.sample_format).unwrap_or("unknown");
             return Err(format!(
-                "unsupported audio format {format} (0x{:02x}); this receiver currently supports Float32 PCM only",
+                "unsupported audio format {format} (0x{:02x}); this receiver only supports Float32 and Opus",
                 packet.sample_format
             ));
+        }
+
+        let Some(pcm) = decode_float32(packet_data, &packet) else {
+            return Err("invalid or truncated Float32 PCM payload".to_string());
         };
 
         if !self.is_connected {
@@ -652,93 +719,70 @@ mod tests {
     }
 
     #[test]
-    fn receiver_reports_unsupported_compressed_and_truncated_pcm_errors() {
-        use crate::protocol::{AudioPayloadHeader, PacketHeader, SAMPLE_FORMAT_OPUS};
+    fn receiver_accepts_opus_and_reports_truncated_pcm_errors() {
+        use crate::protocol::PacketHeader;
 
         let receive_port = 0;
         let mut receiver = StreamReceiver::new("127.0.0.1", 17054, 3, receive_port).unwrap();
         let receive_port = receiver.socket.local_addr().unwrap().port();
         let sender = UdpSocket::bind("127.0.0.1:0").unwrap();
 
-        let mut compressed = Vec::from(
-            PacketHeader {
-                sub_stream_index: 0,
-                stream_id: 3,
-                sequence_number: 1,
-                presentation_timestamp_ns: 0,
-            }
-            .to_bytes(),
-        );
-        compressed.extend(
-            AudioPayloadHeader {
-                channel_count: 2,
-                sample_format: SAMPLE_FORMAT_OPUS,
-                sample_rate_code: 1,
-                samples_per_channel: 1,
-            }
-            .to_bytes(),
-        );
-        compressed.extend([0; 4]);
+        let mut encoder = crate::opus::MultichannelOpusEncoder::new(2, 96_000).unwrap();
+        let samples = (0..crate::opus::OPUS_FRAME_SAMPLES)
+            .flat_map(|frame| {
+                (0..2)
+                    .map(move |channel| ((frame as f32 * 0.03) + channel as f32 * 0.2).sin() * 0.25)
+            })
+            .collect::<Vec<_>>();
+        let encoded = encoder.encode(&samples, 1).unwrap();
+        let mut compressed = Vec::new();
+        for (sub_stream_index, sequence_number, payload) in encoded {
+            compressed.extend(
+                crate::protocol::encode_opus_packet(
+                    &PacketHeader {
+                        sub_stream_index,
+                        stream_id: 3,
+                        sequence_number,
+                        presentation_timestamp_ns: 0,
+                    },
+                    2,
+                    48_000,
+                    OPUS_FRAME_SAMPLES as u16,
+                    &payload,
+                )
+                .unwrap(),
+            );
+        }
         sender
             .send_to(&compressed, ("127.0.0.1", receive_port))
             .unwrap();
 
-        let mut truncated = make_packet(3, 2);
-        truncated.pop();
+        let truncated = {
+            let mut packet = make_packet(3, 10);
+            packet.pop();
+            packet
+        };
         sender
             .send_to(&truncated, ("127.0.0.1", receive_port))
             .unwrap();
 
-        let error = receiver.next_event().unwrap_err();
-        assert!(error.contains("unsupported audio format Opus"));
+        assert!(matches!(
+            receiver.next_event().unwrap(),
+            Some(ReceiveEvent::FormatChanged {
+                channels: 2,
+                sample_rate: 48_000,
+            })
+        ));
+        let event = receiver.next_event().unwrap();
+        assert!(matches!(event, Some(ReceiveEvent::Reconnected)));
+        assert!(matches!(
+            receiver.next_event().unwrap(),
+            Some(ReceiveEvent::Packet(packet, pcm))
+                if packet.channel_count == 2
+                    && pcm.len() == crate::opus::OPUS_FRAME_SAMPLES * 2
+        ));
+        assert!(receiver.is_connected);
         let error = receiver.next_event().unwrap_err();
         assert!(error.contains("invalid or truncated Float32 PCM payload"));
-        assert!(!receiver.is_connected);
-    }
-
-    #[test]
-    fn receiver_supports_custom_decoder() {
-        use crate::protocol::{AudioPayloadHeader, PacketHeader, SAMPLE_FORMAT_OPUS};
-
-        let mut receiver = StreamReceiver::new("127.0.0.1", 17056, 7, 0).unwrap();
-        let receive_port = receiver.socket.local_addr().unwrap().port();
-        let sender = UdpSocket::bind("127.0.0.1:0").unwrap();
-
-        receiver.set_custom_decoder(|packet, payload| {
-            assert_eq!(packet.sample_format, SAMPLE_FORMAT_OPUS);
-            assert_eq!(payload, &[1, 2, 3, 4]);
-            Ok(vec![0.5, -0.5])
-        });
-
-        let mut packet = Vec::from(
-            PacketHeader {
-                sub_stream_index: 0,
-                stream_id: 7,
-                sequence_number: 1,
-                presentation_timestamp_ns: 0,
-            }
-            .to_bytes(),
-        );
-        packet.extend(
-            AudioPayloadHeader {
-                channel_count: 2,
-                sample_format: SAMPLE_FORMAT_OPUS,
-                sample_rate_code: 1,
-                samples_per_channel: 1,
-            }
-            .to_bytes(),
-        );
-        packet.extend([1, 2, 3, 4]);
-
-        sender
-            .send_to(&packet, ("127.0.0.1", receive_port))
-            .unwrap();
-
-        let ev1 = receiver.next_event().unwrap();
-        assert!(matches!(ev1, Some(ReceiveEvent::Reconnected)));
-        let ev2 = receiver.next_event().unwrap();
-        assert!(matches!(ev2, Some(ReceiveEvent::FormatChanged { channels: 2, sample_rate: 48000 })));
-        let ev3 = receiver.next_event().unwrap();
-        assert!(matches!(ev3, Some(ReceiveEvent::Packet(_, pcm)) if pcm == vec![0.5, -0.5]));
     }
 }

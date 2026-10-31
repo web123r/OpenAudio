@@ -1,6 +1,6 @@
 [package]
 name = "audio-core"
-version = "0.3.1"
+version = "0.1.0"
 edition = "2021"
 description = "OpenAudio audio engine: device enumeration, capture, and playback."
 
@@ -9,16 +9,14 @@ name = "audio_core"
 path = "src/lib.rs"
 
 [features]
-default = ["opus"]
+default = []
 # Enable this feature when the Steinberg ASIO SDK is available on the build machine.
 # Set the CPAL_ASIO_DIR environment variable to the SDK root before building:
 #   $env:CPAL_ASIO_DIR = "C:\path\to\asio_sdk"
 #   cargo build --features asio
 asio = ["cpal/asio"]
-opus = ["dep:rusty-opus"]
 
 [dependencies]
-rusty-opus = { version = "1.0.2", optional = true }
 network-core = { path = "../network-core" }
 cpal = { version = "0.15", features = [] }
 hound = "3.5"
@@ -31,13 +29,8 @@ if-addrs = "0.10"
 argon2 = "0.5"
 rand = "0.8"
 aes-gcm = "0.10"
-sha2 = "0.10"
 httparse = "1"
-flacenc = "0.5.1"
-rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
-rustls-pki-types = "1"
-rustls-pemfile = "2"
-rcgen = "0.13"
+opus-rs = "0.1.40"
 
 
 

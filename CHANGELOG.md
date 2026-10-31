@@ -2,66 +2,47 @@
 
 All notable changes to the OpenAudio project will be documented in this file.
 
-## [0.3.1] - 2026-10-23
+## [0.3.2] - 2026-10-31
+
+### 🎛️ **VST3 Plugin Opus Support**
+* The plugin now decodes Opus: its receiver declares PCM and Opus and decodes through the shared `AudioPacketDecoder`, so it receives multichannel Opus streams that previously reached it as nothing.
+* Added an opt-in `Publish Opus` parameter (default off). When enabled, the plugin resamples non-48 kHz host audio, encodes 20 ms frames, advertises the Opus wire format, and filters subscribers by declared capability.
+* Plugin publishing and subscription now use `active_subscribers_for_format` and `send_subscribe_request_with_formats` instead of the format-blind variants.
+
+### 🌐 **Browser Publisher Format Support**
+* The browser microphone publisher now honours format negotiation: it uses the shared subscriber registry and `active_subscribers_for_format`, so it stops inserting every subscriber and reports skipped incompatible ones like the native publishers do.
+* Its handshake accepts `format` (`float32`, `opus`, or `auto`, defaulting to `float32` for older pages), and the publish page gained a format selector. Opus publishing resamples non-48 kHz capture, encodes 20 ms multichannel frames, and advertises the concrete format.
+* Publish timestamps are now derived from the sent frame count instead of wall-clock reads, so packet spacing matches audio time for both formats.
+* The publisher handshake validates the channel count (1–64) before audio is split; a zero-channel handshake previously divided by zero.
+
+### 🐛 **Discovery and Format Fixes**
+* The discovery listener now sizes its receive buffer from the protocol limits (`MAX_ADVERTISEMENT_BYTES`) instead of a fixed 1 KiB array, so 64-channel advertisements — previously ~1035 bytes and silently dropped — are received. A test pins the worst-case escaped advertisement below the buffer size.
+* `PublishFormat::Auto` now resolves against the subscribers already waiting on the stream: a multichannel stream whose waiting subscribers all declared PCM only stays on Float32 rather than publishing Opus to nobody.
+* The receiver's nominal packet-rate report used integer division and under-reported rates (328 packets/s instead of 328.77 at 2 ch), which skewed the expected-packet-loss estimate.
+
+### 📡 **Opus Format Negotiation**
+* Discovery advertisements now carry the concrete wire format a stream sends (`sample_format`), and subscribe requests declare every format the receiver can decode (`supported_formats`).
+* Publishers only stream to subscribers that declared support for the stream's format, and report how many subscribers were skipped for being incompatible instead of sending undecodable packets.
+* Requests without `supported_formats` are treated as Float32-only, preserving compatibility with older clients.
+* Every native receiver — mixed bus, split receiver, browser gateway, network receiver, receiver CLI, ASIO subscriber, and VST3 plugin — declares both PCM and Opus.
+
+### 🔊 **Universal Native Opus Receiving**
+* Added a shared `AudioPacketDecoder` that assembles multichannel Opus substreams, applies packet-loss concealment to missing substreams, and decodes plain Float32 packets, so the simple receivers no longer carry format-specific logic.
+* Simple live playback, WAV capture, ASIO playback, and the `receive_and_serve_web` relay now accept Opus as well as Float32 streams.
+* The ASIO subscriber now declares PCM and Opus support, removing the last native subscriber that rejected Opus.
+* Every receive path (bus, split, ASIO subscriber, shared receiver, playback, WAV capture, web relay, and browser gateway) now decodes through that one assembler instead of four hand-written copies, so substream completeness, duplicate rejection, stale-frame concealment, and the bounded pending-frame limit behave identically everywhere.
+* A quiet socket no longer strands a partly received frame: each receiver calls the decoder's new `flush_expired` on its read timeout, so the tail of a stream and gaps where packets stop are concealed after one 20 ms interval instead of being held until the next packet. The browser gateway had lost this behaviour when its private assembler was removed.
+* Added `DecodeStats` so dropped Opus traffic is explainable rather than silent: duplicate substreams, malformed/unsupported packets, and concealed substreams are counted in the decoder and surfaced in the bus status line and shutdown summary, the ASIO subscriber's timing line, and the browser gateway's metrics message (shown in the player's stats bar).
+
+### 🎛️ **Selectable Opus Publishing**
+* Added a `PublishFormat::Auto` policy that selects Opus at 8 or more channels and Float32 below that; Float32 remains the default.
+* ASIO publishing now honours the selected publish format instead of always sending Float32, and the setting is persisted in presets.
+
+---
+
+## [0.3.0] - 2026-10-16
 
 ### 🚀 Highlights & New Features
-
-#### 🔒 **Native HTTPS / TLS Gateway & Mobile Microphone Access**
-* Integrated native TLS into `web_gateway.rs` via `rustls` and `rcgen`, supporting ephemeral self-signed certificates covering `localhost`, `127.0.0.1`, and local LAN IPv4 addresses.
-* Unlocks the mobile browser "Secure Context" requirement on iOS Safari and Android Chrome without requiring external reverse proxies or mkcert.
-* Added desktop UI HTTPS toggle that updates gateway addresses to `https://` and secure WebSocket relay to `wss://`.
-
-#### 📱 **Low-Bandwidth Mobile Mic Publishing & WebCodecs Opus Compression**
-* Modernized `web-publisher.html` with in-browser WebCodecs `AudioEncoder` streaming real-time RFC 6716 Opus audio chunks at 32 kbps, 64 kbps, or 128 kbps (reducing mobile upload bandwidth from 1.54 Mbps PCM down to 32–64 kbps, a ~25x to 48x reduction).
-* Added inline `AudioWorklet` for glitch-free, jitter-free microphone frame capture on dedicated browser audio threads.
-* Direct server-side packet forwarding (`web_publish.rs`): wraps browser Opus frames into OpenAudio `SAMPLE_FORMAT_OPUS` UDP packets with zero host re-encoding CPU overhead.
-* Added live responsive Canvas VU / peak level meter (-48 dB to 0 dB with peak hold and clip indicator), mic gain control (0 to +24 dB), instant mute toggle, and live upload bandwidth monitor.
-* Built-in fallback to Float32 PCM if accessed from older browsers without WebCodecs.
-
-#### 🎙️ **Pure-Rust Opus End-to-End Transport (70x Bandwidth Reduction)**
-* Fully wired RFC 6716 Opus encoder (`OpusChannelEncoder`) and decoder (`OpusChannelDecoder`) into `transmit.rs`, `bus.rs`, and receiver applications.
-* Enables high-channel-count multi-track live streaming (36, 48, 64 channels) at ~1.5 to 3 Mbps total bandwidth compared to ~220 Mbps uncompressed PCM.
-* Integrated comfort-noise PLC generation (`decode_lost()`) on lost or delayed Opus packets.
-
-#### ⏱️ **Live Stream Latency Breakdown & RFC 3550 Network Quality Indicator**
-* Added live latency breakdown to active playback sessions in the desktop UI: shows real-time UDP Round-Trip Time (RTT), estimated 1-way network delay, jitter buffer depth, and total estimated end-to-end latency with color-coded health badges.
-* Integrated RFC 3550 interarrival jitter calculation into both `bus.rs` and `network-core::StreamReceiver`.
-* Displayed live network quality metrics across GUI sessions and CLI receiver: packet delivery %, packet loss %, jitter in milliseconds, packet throughput rate, and buffer depth.
-
-#### 🔄 **Autonomous Stream Reconnection**
-* Subscribed sessions in both GUI and CLI receiver automatically detect stream disconnects and execute continuous re-subscription handshakes until transmission resumes.
-* In the GUI, the reconnect monitor continuously queries live network discovery advertisements, automatically resolving new dynamic IP addresses or refreshed control ports when a publisher host or process restarts.
-
-#### 💾 **Lossless FLAC Archival Recording & Receiver-Side Recording**
-* Integrated `flacenc` pure-Rust lossless FLAC encoder alongside standard 32-bit float WAV recording (`audio-core::recording`).
-* Added per-stream recording to the headless CLI receiver (`--record <file.flac|file.wav>`), allowing headless nodes to record live audio streams directly to disk.
-* Added FLAC recording option toggles for desktop publishers and subscribers.
-
-#### 🚀 **Headless CLI Publishing Mode**
-* Added `receiver publish` subcommand to `apps/receiver` for running lightweight audio publisher nodes on headless machines, Linux servers, or Raspberry Pis.
-* Supports physical input device selection (`--device`), listing audio devices (`--list-devices`), Opus or PCM compression (`--codec opus`), bitrate configuration, AES-256-GCM encryption, and concurrent archival recording.
-
-#### 🎧 **Headless Receiver CLI Channel Selection & Dynamic Downmixing**
-* Added `--channels <1,2,...>` option to `apps/receiver` for extracting and listening to specific channel subsets from high-channel streams (e.g. listening to channels 1 & 2 from a 48-channel broadcast stream).
-* Added automatic dynamic downmixing and channel remapping (`remap_frame_into`) so incoming streams with any channel layout play seamlessly through default output hardware without channel count mismatch errors.
-
-#### 🍏 **macOS Real-Time Thread Priority via `mach_timebase_info`**
-* Replaced zeroed `thread_time_constraint_policy` parameters in `platform.rs` with accurate Mach absolute time unit conversions queried dynamically via `mach_timebase_info`.
-* Enforces 10ms real-time scheduling periods with 5ms computation slices and 8ms deadline constraints on CoreAudio threads.
-
-## [0.3.0] - 2026-10-18
-
-#### 🎚️ **Demand-Based Gating & Channel Grouping**
-* Implemented demand-based network gating in `transmit.rs` and `asio.rs`: publishers automatically bypass sample encoding and UDP transmissions when no active subscribers are connected, reducing idle CPU and network consumption to zero.
-* Added `ChannelGroup` partitioning (`create_channel_groups`) to chunk large multi-channel arrays into manageable 1-to-2 channel stereo streams.
-
-#### 🎧 **Headless Receiver CLI Channel Selection & Dynamic Downmixing**
-* Added `--channels <1,2,...>` option to `apps/receiver` for extracting and listening to specific channel subsets from high-channel streams (e.g. listening to channels 1 & 2 from a 48-channel broadcast stream).
-* Added automatic dynamic downmixing and channel remapping (`remap_frame_into`) so incoming streams with any channel layout play seamlessly through default output hardware without channel count mismatch errors.
-
-#### 🍏 **macOS Real-Time Thread Priority via `mach_timebase_info`**
-* Replaced zeroed `thread_time_constraint_policy` parameters in `platform.rs` with accurate Mach absolute time unit conversions queried dynamically via `mach_timebase_info`.
-* Enforces 10ms real-time scheduling periods with 5ms computation slices and 8ms deadline constraints on CoreAudio threads.
 
 #### 🔔 **Automatic Background GitHub Update Checker**
 * Integrated background update checker (`apps/sender/src/updater.rs`) that periodically queries the GitHub Releases API for `web123r/OpenAudio`.
@@ -118,8 +99,8 @@ All notable changes to the OpenAudio project will be documented in this file.
 #### 📻 **AES67 / RFC 4566 Broadcast Interoperability**
 * Created `Aes67StreamInfo` module (`aes67.rs`) in `network-core` for generating standard Session Description Protocol (SDP) metadata, enabling stream discovery by commercial broadcast hardware.
 
-#### 🌐 **WebRTC Browser Gateway (Experimental Scaffold)**
-* Created `WebRtcAudioSession` module (`webrtc_gateway.rs`) in `audio-core` providing SDP offer/answer scaffolding for browser signaling. (Production browser streaming is handled via `web_gateway.rs`).
+#### 🌐 **WebRTC Browser Gateway**
+* Created `WebRtcAudioSession` module (`webrtc_gateway.rs`) in `audio-core` for sub-10ms browser audio publishing and playback using WebRTC SDP offers/answers.
 
 #### 🎛️ **Visual Drag-and-Drop Patchbay UI**
 * Created `PatchbayMatrix` module (`patchbay.rs`) in `apps/sender` to render a 2D drag-and-drop routing matrix grid in `egui`.

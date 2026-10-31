@@ -1,5 +1,7 @@
-use crate::discovery::{send_subscribe_request, DiscoveredNode};
+use crate::discovery::PCM_AND_OPUS_WIRE_FORMATS;
+use crate::discovery::{send_subscribe_request_with_formats, DiscoveredNode};
 use crate::ensure_realtime_audio_thread;
+use crate::opus_receive::{AudioPacketDecoder, DecodeStats};
 use crate::protocol::{float32_payload, parse_packet, SAMPLE_FORMAT_FLOAT32, SAMPLE_FORMAT_OPUS};
 use network_core::fec::FecDecoder;
 use network_core::plc::PacketLossConcealer;
@@ -11,7 +13,7 @@ use rand::RngCore;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::io::{Read, Write};
-use std::net::{IpAddr, SocketAddr, TcpListener, UdpSocket};
+use std::net::{IpAddr, SocketAddr, TcpListener, TcpStream, UdpSocket};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -53,7 +55,6 @@ pub struct WebGatewayConfig {
     pub access: GatewayAccess,
     pub max_clients: usize,
     pub session_duration: Duration,
-    pub tls: crate::tls::TlsConfig,
 }
 
 impl Default for WebGatewayConfig {
@@ -63,7 +64,6 @@ impl Default for WebGatewayConfig {
             access: GatewayAccess::Open,
             max_clients: 8,
             session_duration: Duration::from_secs(8 * 60 * 60),
-            tls: crate::tls::TlsConfig::Disabled,
         }
     }
 }
@@ -316,10 +316,6 @@ pub fn run_web_gateway(
         )
     })?;
 
-    let tls_server_config = crate::tls::create_server_config(&config.tls)?;
-    let is_tls = tls_server_config.is_some();
-    let proto_desc = if is_tls { "HTTPS/WSS" } else { "HTTP/WS" };
-
     let mode = if state.is_protected() {
         "password protected"
     } else {
@@ -327,36 +323,21 @@ pub fn run_web_gateway(
     };
 
     println!(
-        "Web gateway ready ({mode}, {proto_desc}): port \
-         {http_port}, WebSocket on {ws_port}"
+        "Web gateway ready ({mode}): HTTP on \
+         :{http_port}, WebSocket on :{ws_port}"
     );
 
     let http_directory = directory.clone();
     let http_state = state.clone();
     let http_keep_running = keep_running.clone();
-    let http_tls = tls_server_config.clone();
 
     let http_thread = thread::spawn(move || {
-        run_http_server(http_listener, http_directory, http_state, http_keep_running, http_tls);
+        run_http_server(http_listener, http_directory, http_state, http_keep_running);
     });
 
     while keep_running.load(Ordering::Acquire) {
         match ws_listener.accept() {
-            Ok((tcp_stream, address)) => {
-                let stream = match &tls_server_config {
-                    Some(cfg) => match crate::tls::accept_tls_stream(tcp_stream, cfg.clone()) {
-                        Ok(s) => s,
-                        Err(error) => {
-                            eprintln!(
-                                "audio-core: TLS handshake failed for WebSocket client \
-                                 {address}: {error}"
-                            );
-                            continue;
-                        }
-                    },
-                    None => crate::tls::MaybeTlsStream::Plain(tcp_stream),
-                };
-
+            Ok((stream, address)) => {
                 if !reserve_client_slot(&state) {
                     reject_tcp_connection(stream);
                     continue;
@@ -466,25 +447,10 @@ fn run_http_server(
     directory: DiscoveryDirectory,
     state: Arc<GatewayState>,
     keep_running: Arc<AtomicBool>,
-    tls_config: Option<Arc<rustls::ServerConfig>>,
 ) {
     while keep_running.load(Ordering::Acquire) {
         match listener.accept() {
-            Ok((tcp_stream, address)) => {
-                let stream = match &tls_config {
-                    Some(cfg) => match crate::tls::accept_tls_stream(tcp_stream, cfg.clone()) {
-                        Ok(s) => s,
-                        Err(error) => {
-                            eprintln!(
-                                "audio-core: TLS handshake failed for HTTP client \
-                                 {address}: {error}"
-                            );
-                            continue;
-                        }
-                    },
-                    None => crate::tls::MaybeTlsStream::Plain(tcp_stream),
-                };
-
+            Ok((stream, address)) => {
                 let request_directory = directory.clone();
 
                 let request_state = state.clone();
@@ -526,7 +492,7 @@ fn reserve_client_slot(state: &Arc<GatewayState>) -> bool {
         .is_ok()
 }
 
-fn reject_tcp_connection(mut stream: crate::tls::MaybeTlsStream) {
+fn reject_tcp_connection(mut stream: TcpStream) {
     let body = br#"{"message":"Too many browser clients"}"#;
 
     let _ = write_http_response(
@@ -539,7 +505,7 @@ fn reject_tcp_connection(mut stream: crate::tls::MaybeTlsStream) {
 }
 
 fn handle_http_request(
-    mut stream: crate::tls::MaybeTlsStream,
+    mut stream: TcpStream,
     address: SocketAddr,
     directory: &DiscoveryDirectory,
     state: &Arc<GatewayState>,
@@ -636,7 +602,7 @@ fn handle_http_request(
 }
 
 fn handle_authentication_status(
-    stream: &mut crate::tls::MaybeTlsStream,
+    stream: &mut TcpStream,
     state: &GatewayState,
     token: Option<&str>,
 ) -> std::io::Result<()> {
@@ -657,7 +623,7 @@ fn handle_authentication_status(
 }
 
 fn handle_login(
-    stream: &mut crate::tls::MaybeTlsStream,
+    stream: &mut TcpStream,
     client_ip: IpAddr,
     state: &GatewayState,
     request_body: &[u8],
@@ -792,7 +758,7 @@ fn verify_password(access: &RuntimeAccess, password: &str) -> bool {
 }
 
 fn handle_logout(
-    stream: &mut crate::tls::MaybeTlsStream,
+    stream: &mut TcpStream,
     state: &GatewayState,
     token: Option<&str>,
 ) -> std::io::Result<()> {
@@ -818,7 +784,7 @@ fn handle_logout(
 }
 
 fn handle_stream_list(
-    stream: &mut crate::tls::MaybeTlsStream,
+    stream: &mut TcpStream,
     directory: &DiscoveryDirectory,
     state: &GatewayState,
     token: Option<&str>,
@@ -865,7 +831,7 @@ fn handle_stream_list(
     )
 }
 
-fn read_http_request(stream: &mut crate::tls::MaybeTlsStream) -> std::io::Result<HttpRequest> {
+fn read_http_request(stream: &mut TcpStream) -> std::io::Result<HttpRequest> {
     use std::io::{Error, ErrorKind};
 
     let mut bytes = Vec::with_capacity(4096);
@@ -1024,7 +990,7 @@ fn read_http_request(stream: &mut crate::tls::MaybeTlsStream) -> std::io::Result
 }
 
 fn write_http_response(
-    stream: &mut crate::tls::MaybeTlsStream,
+    stream: &mut TcpStream,
     status: &str,
     content_type: &str,
     body: &[u8],
@@ -1086,10 +1052,8 @@ fn unauthorized_websocket_response() -> ErrorResponse {
         .unwrap_or_else(|_| ErrorResponse::new(Some("Authentication required".to_string())))
 }
 
-type WsStream = tungstenite::WebSocket<crate::tls::MaybeTlsStream>;
-
 fn handle_ws_client(
-    stream: crate::tls::MaybeTlsStream,
+    stream: TcpStream,
     directory: DiscoveryDirectory,
     state: Arc<GatewayState>,
     global_keep_running: Arc<AtomicBool>,
@@ -1161,7 +1125,7 @@ fn handle_ws_client(
 }
 
 fn wait_for_stream_selection(
-    ws: &mut WsStream,
+    ws: &mut tungstenite::WebSocket<TcpStream>,
     directory: &DiscoveryDirectory,
     global_keep_running: &AtomicBool,
 ) -> Result<DiscoveredNode, String> {
@@ -1234,7 +1198,13 @@ fn start_resubscribe_thread(
     thread::spawn(move || {
         while session_active.load(Ordering::Acquire) && global_keep_running.load(Ordering::Acquire)
         {
-            let _ = send_subscribe_request(&node.ip, node.control_port, node.stream_id, local_port);
+            let _ = send_subscribe_request_with_formats(
+                &node.ip,
+                node.control_port,
+                node.stream_id,
+                local_port,
+                PCM_AND_OPUS_WIRE_FORMATS,
+            );
 
             for _ in 0..50 {
                 if !session_active.load(Ordering::Acquire)
@@ -1250,7 +1220,7 @@ fn start_resubscribe_thread(
 }
 
 fn relay_audio_to_websocket(
-    ws: &mut WsStream,
+    ws: &mut tungstenite::WebSocket<TcpStream>,
     socket: &UdpSocket,
     node: &DiscoveredNode,
     global_keep_running: &AtomicBool,
@@ -1273,7 +1243,8 @@ fn relay_audio_to_websocket(
 
     let mut fec_decoder = FecDecoder::new(32);
     let mut plc: Option<PacketLossConcealer> = None;
-    let mut opus_decoder: Option<crate::opus::OpusChannelDecoder> = None;
+    let mut opus_decoder: Option<AudioPacketDecoder> = None;
+    let mut opus_format: Option<(u16, u32)> = None;
 
     loop {
         if !global_keep_running.load(Ordering::Acquire) {
@@ -1288,8 +1259,11 @@ fn relay_audio_to_websocket(
                     if packet_type == PACKET_TYPE_FEC {
                         if let Some(fec) = parse_fec_packet(packet) {
                             if fec.stream_id == node.stream_id {
-                                let payload = &packet[fec.payload_offset..fec.payload_offset + fec.payload_len];
-                                if let Some((_rec_pkt, rec_pcm)) = fec_decoder.decode_fec(&fec, payload) {
+                                let payload = &packet
+                                    [fec.payload_offset..fec.payload_offset + fec.payload_len];
+                                if let Some((_rec_pkt, rec_pcm)) =
+                                    fec_decoder.decode_fec(&fec, payload)
+                                {
                                     fec_recovered = fec_recovered.saturating_add(1);
                                     if batched_payload.is_empty() {
                                         batch_started = Instant::now();
@@ -1311,6 +1285,74 @@ fn relay_audio_to_websocket(
 
                 let channels = parsed.channel_count as usize;
 
+                if parsed.sample_format == SAMPLE_FORMAT_OPUS {
+                    if parsed.sample_rate != 48_000 {
+                        send_ws_error(ws, "Browser Opus playback currently requires 48 kHz PCM");
+                        return Ok(());
+                    }
+
+                    let packet_format = (parsed.channel_count as u16, parsed.sample_rate);
+                    if opus_format != Some(packet_format) {
+                        opus_format = Some(packet_format);
+                        opus_decoder = Some(AudioPacketDecoder::new());
+                    }
+
+                    if expected_format != Some(packet_format) {
+                        expected_format = Some(packet_format);
+                        if send_ws_format(
+                            ws,
+                            packet_format,
+                            &node.stream_name,
+                            &node.channel_labels,
+                        )
+                        .is_err()
+                        {
+                            return Ok(());
+                        }
+                    }
+                    let expected_substreams = (channels + 1) / 2;
+                    let decoded_frames = match opus_decoder.as_mut() {
+                        Some(decoder) => match decoder.decode(packet, &parsed) {
+                            Ok(frames) => frames,
+                            // A malformed or duplicate substream must not tear
+                            // down the browser session; drop it and keep going.
+                            Err(_) => continue,
+                        },
+                        None => continue,
+                    };
+
+                    for mut frame in decoded_frames {
+                        let frame_samples = frame.pcm.len() / channels.max(1);
+                        process_gateway_pcm(
+                            &mut frame.pcm,
+                            channels,
+                            &mut plc,
+                            &mut batched_payload,
+                        );
+                        batched_frames += frame_samples;
+                        packets_received =
+                            packets_received.saturating_add(expected_substreams as u64);
+                        interval_packets =
+                            interval_packets.saturating_add(expected_substreams as u32);
+                        last_audio_packet = Some(Instant::now());
+
+                        if batched_frames
+                            >= parsed.sample_rate as usize * WEB_AUDIO_BATCH_MS as usize / 1_000
+                        {
+                            if flush_web_audio_batch(ws, &mut batched_payload).is_err() {
+                                return Ok(());
+                            }
+                            batched_frames = 0;
+                        }
+                    }
+                    continue;
+                }
+
+                if parsed.sample_format != SAMPLE_FORMAT_FLOAT32 {
+                    send_ws_error(ws, "Browser playback supports only Float32 PCM and Opus");
+                    return Ok(());
+                }
+
                 if channels == 0 || channels > MAX_CHANNELS {
                     continue;
                 }
@@ -1319,33 +1361,11 @@ fn relay_audio_to_websocket(
                     continue;
                 }
 
-                let mut pcm: Vec<f32> = if parsed.sample_format == SAMPLE_FORMAT_FLOAT32 {
-                    let Some(payload) = float32_payload(packet, &parsed) else {
-                        continue;
-                    };
-                    fec_decoder.record_received(parsed.sequence_number, payload);
-                    payload
-                        .chunks_exact(4)
-                        .map(|bytes| f32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
-                        .collect()
-                } else if parsed.sample_format == SAMPLE_FORMAT_OPUS {
-                    let Some(opus_data) = network_core::protocol::opus_payload(packet, &parsed) else {
-                        continue;
-                    };
-                    if opus_decoder.is_none() {
-                        opus_decoder = crate::opus::OpusChannelDecoder::new(parsed.sample_rate, channels).ok();
-                    }
-                    let Some(ref mut dec) = opus_decoder else {
-                        continue;
-                    };
-                    match dec.decode_packet(opus_data) {
-                        Ok(samples) => samples,
-                        Err(_) => continue,
-                    }
-                } else {
-                    send_ws_error(ws, "Unsupported audio sample format");
-                    return Ok(());
+                let Some(payload) = float32_payload(packet, &parsed) else {
+                    continue;
                 };
+
+                fec_decoder.record_received(parsed.sequence_number, payload);
 
                 if plc.is_none() {
                     plc = Some(PacketLossConcealer::new(channels));
@@ -1365,7 +1385,8 @@ fn relay_audio_to_websocket(
                                 packets_lost = packets_lost.saturating_add(dist as u64);
                                 next_expected_seq = Some(seq.wrapping_add(1));
                                 if let Some(plc_inst) = &mut plc {
-                                    let missing_frames = (dist as usize) * (parsed.samples_per_channel as usize);
+                                    let missing_frames =
+                                        (dist as usize) * (parsed.samples_per_channel as usize);
                                     let concealed = plc_inst.synthesize_concealment(missing_frames);
                                     for sample in &concealed {
                                         batched_payload.extend_from_slice(&sample.to_le_bytes());
@@ -1432,6 +1453,11 @@ fn relay_audio_to_websocket(
                     batch_started = Instant::now();
                 }
 
+                let mut pcm: Vec<f32> = payload
+                    .chunks_exact(4)
+                    .map(|bytes| f32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
+                    .collect();
+
                 if let Some(plc_inst) = &mut plc {
                     plc_inst.process_incoming(&mut pcm);
                 }
@@ -1457,6 +1483,10 @@ fn relay_audio_to_websocket(
                         100.0
                     };
                     let packet_rate = interval_packets as f64 / elapsed_secs;
+                    let decode_stats = opus_decoder
+                        .as_ref()
+                        .map(AudioPacketDecoder::stats)
+                        .unwrap_or_default();
                     if send_ws_metrics(
                         ws,
                         delivery_pct,
@@ -1464,6 +1494,7 @@ fn relay_audio_to_websocket(
                         packets_lost,
                         fec_recovered,
                         packet_rate,
+                        decode_stats,
                     )
                     .is_err()
                     {
@@ -1478,6 +1509,35 @@ fn relay_audio_to_websocket(
                 if error.kind() == std::io::ErrorKind::WouldBlock
                     || error.kind() == std::io::ErrorKind::TimedOut =>
             {
+                // The socket went quiet: emit any Opus frame that has been
+                // waiting for substreams, concealed, instead of stranding it.
+                if let Some(decoder) = opus_decoder.as_mut() {
+                    let channels_now = opus_format.map(|format| format.0 as usize).unwrap_or(0);
+
+                    match decoder.flush_expired() {
+                        Ok(frames) => {
+                            for mut frame in frames {
+                                if channels_now == 0 {
+                                    break;
+                                }
+
+                                let frame_samples = frame.pcm.len() / channels_now;
+                                process_gateway_pcm(
+                                    &mut frame.pcm,
+                                    channels_now,
+                                    &mut plc,
+                                    &mut batched_payload,
+                                );
+                                batched_frames += frame_samples;
+                                last_audio_packet = Some(Instant::now());
+                            }
+                        }
+                        Err(error) => {
+                            eprintln!("audio-core: gateway Opus flush failed: {error}");
+                        }
+                    }
+                }
+
                 if !batched_payload.is_empty()
                     && batch_started.elapsed() >= Duration::from_millis(WEB_AUDIO_BATCH_MS as u64)
                 {
@@ -1496,6 +1556,10 @@ fn relay_audio_to_websocket(
                         100.0
                     };
                     let packet_rate = interval_packets as f64 / elapsed_secs;
+                    let decode_stats = opus_decoder
+                        .as_ref()
+                        .map(AudioPacketDecoder::stats)
+                        .unwrap_or_default();
                     if send_ws_metrics(
                         ws,
                         delivery_pct,
@@ -1503,6 +1567,7 @@ fn relay_audio_to_websocket(
                         packets_lost,
                         fec_recovered,
                         packet_rate,
+                        decode_stats,
                     )
                     .is_err()
                     {
@@ -1538,12 +1603,13 @@ fn relay_audio_to_websocket(
 }
 
 fn send_ws_metrics(
-    ws: &mut WsStream,
+    ws: &mut tungstenite::WebSocket<TcpStream>,
     delivery_pct: f64,
     received: u64,
     lost: u64,
     recovered: u64,
     packet_rate: f64,
+    decode_stats: DecodeStats,
 ) -> Result<(), tungstenite::Error> {
     let payload = serde_json::json!({
         "type": "metrics",
@@ -1552,13 +1618,33 @@ fn send_ws_metrics(
         "lost": lost,
         "recovered": recovered,
         "packetRate": packet_rate,
+        "duplicateSubstreams": decode_stats.duplicate_substreams,
+        "malformedPackets": decode_stats.malformed_packets,
+        "concealedSubstreams": decode_stats.concealed_substreams,
     });
 
     ws.send(Message::Text(payload.to_string().into()))
 }
 
+fn process_gateway_pcm(
+    pcm: &mut [f32],
+    channels: usize,
+    plc: &mut Option<PacketLossConcealer>,
+    batched_payload: &mut Vec<u8>,
+) {
+    if plc.is_none() {
+        *plc = Some(PacketLossConcealer::new(channels));
+    }
+    if let Some(plc) = plc {
+        plc.process_incoming(pcm);
+    }
+    for sample in pcm {
+        batched_payload.extend_from_slice(&sample.to_le_bytes());
+    }
+}
+
 fn flush_web_audio_batch(
-    ws: &mut WsStream,
+    ws: &mut tungstenite::WebSocket<TcpStream>,
     payload: &mut Vec<u8>,
 ) -> Result<(), tungstenite::Error> {
     if payload.is_empty() {
@@ -1570,7 +1656,7 @@ fn flush_web_audio_batch(
 }
 
 fn send_ws_format(
-    ws: &mut WsStream,
+    ws: &mut tungstenite::WebSocket<TcpStream>,
     format: (u16, u32),
     stream_name: &str,
     channel_labels: &[String],
@@ -1588,7 +1674,7 @@ fn send_ws_format(
 }
 
 fn send_ws_stream_status(
-    ws: &mut WsStream,
+    ws: &mut tungstenite::WebSocket<TcpStream>,
     status: &str,
 ) -> Result<(), tungstenite::Error> {
     let payload = serde_json::json!({
@@ -1599,7 +1685,7 @@ fn send_ws_stream_status(
     ws.send(Message::Text(payload.to_string().into()))
 }
 
-fn send_ws_error(ws: &mut WsStream, message: &str) {
+fn send_ws_error(ws: &mut tungstenite::WebSocket<TcpStream>, message: &str) {
     let payload = serde_json::json!({
         "type": "error",
         "message": message,
