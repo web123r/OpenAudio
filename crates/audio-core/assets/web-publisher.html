@@ -32,7 +32,7 @@
             max-width: 400px;
         }
         h1 { margin-top: 0; }
-        input {
+        input, select {
             width: 100%;
             padding: 0.75rem;
             margin-bottom: 1rem;
@@ -62,6 +62,10 @@
     <div class="container">
         <h1>🎙️ Go Live</h1>
         <input type="text" id="streamName" placeholder="Enter stream name (e.g. My Phone)" value="Mobile Mic">
+        <select id="format">
+            <option value="float32" selected>Float32 PCM</option>
+            <option value="opus">Opus (48 kHz)</option>
+        </select>
         <button id="toggleBtn">Start Publishing</button>
         <div class="status" id="statusText">Waiting to start...</div>
     </div>
@@ -114,7 +118,8 @@
                         type: "publish",
                         streamName: nameInput.value || "Mobile Mic",
                         channels: channels,
-                        sampleRate: sampleRate
+                        sampleRate: sampleRate,
+                        format: document.getElementById('format').value
                     };
                     ws.send(JSON.stringify(handshake));
                     statusText.innerText = `Live at ${sampleRate}Hz`;

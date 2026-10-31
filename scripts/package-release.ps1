@@ -1,4 +1,4 @@
-<#
+?<#
 .SYNOPSIS
     Builds and packages the complete standalone OpenAudio release with built-in ASIO support.
 .DESCRIPTION
@@ -18,7 +18,7 @@ Write-Host "==========================================================" -Foregro
 $repoRoot = Resolve-Path (Join-Path $PSScriptRoot "..")
 Set-Location $repoRoot
 
-$version = "0.1.0"
+$version = "0.3.0"
 $distDir = Join-Path $repoRoot "dist"
 $packageDir = Join-Path $distDir "OpenAudio-v$version-windows-x64"
 $zipFile = Join-Path $distDir "OpenAudio-v$version-windows-x64.zip"

@@ -21,7 +21,8 @@
 mod inner {
     use crate::asio::get_asio_device;
     use crate::ensure_realtime_audio_thread;
-    use crate::protocol::{float32_payload, parse_packet, ParsedPacket, SAMPLE_FORMAT_FLOAT32};
+    use crate::opus_receive::{AudioPacketDecoder, DecodedAudioFrame};
+    use crate::protocol::{parse_packet, ParsedPacket};
     use crate::recording::{
         create_wav_writer, finalize as finalize_recording, write_samples, SharedWavWriter,
     };
@@ -103,11 +104,13 @@ mod inner {
         let audio_buffer: SharedAudioBuffer = Arc::new(Mutex::new(VecDeque::new()));
 
         let mut udp_buffer = vec![0u8; MAX_UDP_PACKET_BYTES];
+        let mut decoder = AudioPacketDecoder::new();
 
         let first = wait_for_first_packet(
             &socket,
             &mut udp_buffer,
             &audio_buffer,
+            &mut decoder,
             keep_running.clone(),
         )?;
 
@@ -200,6 +203,7 @@ mod inner {
             subscribed_stream_id,
             incoming_channels,
             sample_rate,
+            &mut decoder,
             &mut resampler,
             &jitter_controller,
             keep_running.clone(),
@@ -249,6 +253,7 @@ mod inner {
             incoming_channels,
             sample_rate,
             output_sample_rate,
+            &mut decoder,
             &mut resampler,
             keep_running,
             &mut last_sequence,
@@ -280,6 +285,7 @@ mod inner {
         socket: &UdpSocket,
         udp_buffer: &mut [u8],
         audio_buffer: &SharedAudioBuffer,
+        decoder: &mut AudioPacketDecoder,
         keep_running: Arc<AtomicBool>,
     ) -> Result<ParsedPacket, String> {
         loop {
@@ -315,8 +321,6 @@ mod inner {
                 continue;
             };
 
-            validate_packet_payload(packet, &parsed)?;
-
             if parsed.channel_count == 0 {
                 continue;
             }
@@ -325,9 +329,9 @@ mod inner {
                 continue;
             }
 
-            append_packet_samples(audio_buffer, packet, &parsed, None)?;
-
-            return Ok(parsed);
+            if append_packet_audio(audio_buffer, decoder, packet, &parsed, None)? {
+                return Ok(parsed);
+            }
         }
     }
 
@@ -339,6 +343,7 @@ mod inner {
         stream_id: u32,
         incoming_channels: usize,
         sample_rate: u32,
+        decoder: &mut AudioPacketDecoder,
         resampler: &mut StreamingLinearResampler,
         jitter_controller: &AdaptiveJitterController,
         keep_running: Arc<AtomicBool>,
@@ -392,11 +397,9 @@ mod inner {
                 continue;
             }
 
-            validate_packet_payload(packet, &parsed)?;
-
             update_sequence_statistics(parsed.sequence_number, last_sequence, packets_dropped);
 
-            append_packet_samples(audio_buffer, packet, &parsed, Some(resampler))?;
+            append_packet_audio(audio_buffer, decoder, packet, &parsed, Some(resampler))?;
 
             *packets_received = packets_received.saturating_add(1);
         }
@@ -420,6 +423,7 @@ mod inner {
         incoming_channels: usize,
         sample_rate: u32,
         output_sample_rate: u32,
+        decoder: &mut AudioPacketDecoder,
         resampler: &mut StreamingLinearResampler,
         keep_running: Arc<AtomicBool>,
         last_sequence: &mut Option<u32>,
@@ -435,10 +439,14 @@ mod inner {
         while keep_running.load(Ordering::Relaxed) {
             let (length, _) = match socket.recv_from(udp_buffer) {
                 Ok(value) => value,
-                Err(ref error) if error.kind() == std::io::ErrorKind::WouldBlock => {
-                    continue;
-                }
-                Err(ref error) if error.kind() == std::io::ErrorKind::TimedOut => {
+                Err(ref error)
+                    if error.kind() == std::io::ErrorKind::WouldBlock
+                        || error.kind() == std::io::ErrorKind::TimedOut =>
+                {
+                    // The socket went quiet: emit any Opus frame that has been
+                    // waiting for substreams, concealed, instead of stranding it.
+                    let frames = decoder.flush_expired()?;
+                    append_decoded_frames(audio_buffer, frames, Some(resampler))?;
                     continue;
                 }
                 Err(ref error) if error.kind() == std::io::ErrorKind::ConnectionReset => {
@@ -480,8 +488,6 @@ mod inner {
                 continue;
             }
 
-            validate_packet_payload(packet, &parsed)?;
-
             clock_synchronizer.observe(
                 parsed.presentation_timestamp_ns,
                 receive_clock_start.elapsed(),
@@ -489,7 +495,7 @@ mod inner {
 
             update_sequence_statistics(parsed.sequence_number, last_sequence, packets_dropped);
 
-            append_packet_samples(audio_buffer, packet, &parsed, Some(resampler))?;
+            append_packet_audio(audio_buffer, decoder, packet, &parsed, Some(resampler))?;
 
             apply_clock_correction(
                 audio_buffer,
@@ -513,11 +519,16 @@ mod inner {
                 .saturating_mul(incoming_channels);
 
             if *packets_received % 500 == 0 {
+                let decode_stats = decoder.stats();
+
                 println!(
-                    "ASIO Subscribe timing: target={:.1}ms, buffered={:.1}ms, clock correction={:.2}ppm",
+                    "ASIO Subscribe timing: target={:.1}ms, buffered={:.1}ms, clock correction={:.2}ppm, opus drops={} duplicate/{} malformed/{} concealed",
                     jitter_controller.target_duration().as_secs_f64() * 1_000.0,
                     buffered_frames as f64 / sample_rate as f64 * 1_000.0,
                     clock_synchronizer.correction_ppm(),
+                    decode_stats.duplicate_substreams,
+                    decode_stats.malformed_packets,
+                    decode_stats.concealed_substreams,
                 );
             }
 
@@ -966,77 +977,40 @@ mod inner {
         }
     }
 
-    fn validate_packet_payload(packet: &[u8], parsed: &ParsedPacket) -> Result<(), String> {
-        if parsed.sample_format != SAMPLE_FORMAT_FLOAT32 {
-            return Err("ASIO playback currently supports Float32 PCM packets only".to_string());
-        }
-
-        let sample_count = (parsed.samples_per_channel as usize)
-            .checked_mul(parsed.channel_count as usize)
-            .ok_or_else(|| "OpenAudio packet sample count overflow".to_string())?;
-
-        let payload_bytes = sample_count
-            .checked_mul(std::mem::size_of::<f32>())
-            .ok_or_else(|| "OpenAudio packet payload-size overflow".to_string())?;
-
-        let required_length = parsed
-            .payload_offset
-            .checked_add(payload_bytes)
-            .ok_or_else(|| "OpenAudio packet length overflow".to_string())?;
-
-        if packet.len() < required_length {
-            return Err(format!(
-                "truncated OpenAudio packet: expected at \
-                 least {required_length} bytes, received {}",
-                packet.len()
-            ));
-        }
-        if float32_payload(packet, parsed).is_none() {
-            return Err("invalid Float32 PCM packet payload".to_string());
-        }
-
-        Ok(())
-    }
-
-    fn append_packet_samples(
+    /// Decodes a packet and appends its audio, returning whether any audio was
+    /// appended. Opus substreams return `false` until their frame completes.
+    fn append_packet_audio(
         audio_buffer: &SharedAudioBuffer,
+        decoder: &mut AudioPacketDecoder,
         packet: &[u8],
         parsed: &ParsedPacket,
         resampler: Option<&mut StreamingLinearResampler>,
-    ) -> Result<(), String> {
-        validate_packet_payload(packet, parsed)?;
+    ) -> Result<bool, String> {
+        let frames = decoder.decode(packet, parsed)?;
 
-        let sample_count = (parsed.samples_per_channel as usize)
-            .checked_mul(parsed.channel_count as usize)
-            .ok_or_else(|| "OpenAudio packet sample count overflow".to_string())?;
+        append_decoded_frames(audio_buffer, frames, resampler)
+    }
 
-        let payload_length = sample_count
-            .checked_mul(std::mem::size_of::<f32>())
-            .ok_or_else(|| "OpenAudio packet payload-size overflow".to_string())?;
+    fn append_decoded_frames(
+        audio_buffer: &SharedAudioBuffer,
+        frames: Vec<DecodedAudioFrame>,
+        mut resampler: Option<&mut StreamingLinearResampler>,
+    ) -> Result<bool, String> {
+        let mut appended = false;
 
-        let payload_end = parsed
-            .payload_offset
-            .checked_add(payload_length)
-            .ok_or_else(|| "OpenAudio packet payload-end overflow".to_string())?;
+        for frame in frames {
+            let samples = match resampler.as_mut() {
+                Some(resampler) => resampler.process(&frame.pcm)?,
+                None => frame.pcm,
+            };
 
-        let payload = packet
-            .get(parsed.payload_offset..payload_end)
-            .ok_or_else(|| "OpenAudio packet payload is truncated".to_string())?;
+            let mut guard = safe_lock(audio_buffer);
+            guard.reserve(samples.len());
+            guard.extend(samples);
+            appended = true;
+        }
 
-        let samples = payload
-            .chunks_exact(4)
-            .map(|bytes| f32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
-            .collect::<Vec<_>>();
-        let samples = match resampler {
-            Some(resampler) => resampler.process(&samples)?,
-            None => samples,
-        };
-
-        let mut guard = safe_lock(audio_buffer);
-        guard.reserve(samples.len());
-        guard.extend(samples);
-
-        Ok(())
+        Ok(appended)
     }
 
     fn resample_buffer(

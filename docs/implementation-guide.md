@@ -9,7 +9,7 @@ For authoritative product requirements and the detailed audio/network test
 runbook, see [the v1 release scope](./release-scope.md). For end-user
 installation, see [the Windows installation guide](./windows-install.md).
 
-**Status snapshot:** 2026-10-13
+**Status snapshot:** 2026-10-29
 
 ## 1. Product vision
 
@@ -51,7 +51,7 @@ At a high level, native audio follows this path:
 ```text
 capture device or DAW
     -> bounded audio handoff
-    -> Float32 packetization
+    -> Float32 or supported Opus packetization
     -> UDP audio on the LAN
     -> discovered stream and subscription control
     -> receive queue and playback conversion
@@ -74,8 +74,10 @@ The important implementation constraints are:
   explicit drop policy and observable loss rather than unbounded latency.
 - Keep UDP payloads within the conservative 1,200-byte packet budget used by
   the current publishers.
-- Reject unsupported or malformed formats clearly. Opus and FLAC identifiers
-  are reserved but have no v1 encoder or decoder.
+- Reject unsupported or malformed formats clearly. Opus is implemented across
+  the current publishing and receiving paths (48 kHz, 10 ms frames), but
+  interoperability and hardware validation remain open; FLAC remains an
+  unimplemented format identifier.
 - Treat Float32 bandwidth and packet rate as real capacity costs. At 64
   channels and 48 kHz, raw audio is 98.304 Mbit/s and the current packet size
   implies approximately 12,000 datagrams/s per stream.
@@ -87,7 +89,7 @@ they do not prove hardware timing, network capacity, or audio quality.
 
 | Location | Responsibility |
 | --- | --- |
-| `crates/network-core` | Wire protocol, Float32 packet handling, discovery, subscription control, and receiver transport |
+| `crates/network-core` | Wire protocol, Float32 and Opus packet/codec support, discovery, subscription control, and receiver transport |
 | `crates/audio-core` | Audio backends, capture/publish paths, routing, playback, diagnostics, and browser gateways |
 | `apps/sender` | Desktop GUI for publishing, receiving/routing, browser sharing, and diagnostics |
 | `apps/receiver` | Headless receiver and inspection CLI |
@@ -108,10 +110,10 @@ imply real-hardware or release certification.
 | --- | --- | --- |
 | Audio reliability | Stateful resampling, frame-aligned queue trimming, bounded publishing handoffs, MTU-safe packetization, and software stress/regression tests | Wired end-to-end latency, sustained real UDP load, clock drift, and representative hardware behavior |
 | Network controls | Validated and bounded discovery/subscriber state, subscriber leases, and expired-subscriber filtering | Wired/Wi-Fi loss and recovery thresholds, long-duration behavior, and security testing |
-| Browser | Float32 playback, output-rate conversion, selected stereo-pair behavior, and interruption/recovery reporting | Browser/device interoperability and real-network recovery; this remains best-effort |
-| Audio formats | Float32 PCM packet creation and clear unsupported-format handling | Opus/FLAC encoders and decoders are intentionally out of v1 scope |
+| Browser | Desktop-gateway Float32/Opus playback, output-rate conversion, selected stereo-pair behavior, interruption/recovery reporting, and Float32/Opus microphone publishing with the same format negotiation as native publishers | Browser/device Opus interoperability and real-network recovery; this remains best-effort |
+| Audio formats | Float32 is the default; Opus encoding/decoding is wired into every desktop publish path (input, loopback, combined-source, ASIO), the browser microphone publisher, the VST3 plugin (opt-in parameter), the bus, split-receive, browser-gateway, shared receiver, and diagnostic paths. Every receive path decodes through the one shared `AudioPacketDecoder` | FLAC is unsupported; Opus interoperability and real-network behavior need broader verification |
 | Windows releases | Portable Windows ZIP and tag-triggered cross-platform release workflow are implemented | Validate real release publication, installation/removal, firewall behavior, signing, and target Windows hardware |
-| VST3 sender | Mono/stereo pass-through, opt-in publishing parameter, discovery/subscription integration, bounded callback queue, and Windows bundle generation | REAPER host scan and audio test, separate-receiver LAN test, sustained/overload behavior, third-party notices, and release packaging |
+| VST3 sender | Mono/stereo pass-through, opt-in publishing and Opus parameters, Float32/Opus receive, discovery/subscription integration, bounded callback queue, and Windows bundle generation | REAPER host scan and audio test, separate-receiver LAN test, sustained/overload behavior, third-party notices, and release packaging |
 
 The VST3 is not currently included in the Windows portable ZIP. REAPER is
 available on the development machine, but the host scan and audio path have
@@ -132,9 +134,19 @@ then strengthened the native and browser paths:
 3. **Browser sharing:** Added interruption/recovery status, stale playback
    buffer clearing, and explicit handling when a stream format changes during
    playback.
-4. **Interoperability:** Kept Float32 PCM as the only supported v1 format and
-   made unsupported compressed formats fail clearly rather than being
-   misinterpreted as PCM.
+4. **Opus integration:** Added Opus packet/codec support, configurable discovery
+   and combined-source desktop publishing, and extended publish/receive Opus to
+   ASIO, the browser microphone publisher, the VST3 plugin, and the remaining
+   native receivers. All receive paths share one `AudioPacketDecoder`
+   (`crates/network-core/src/opus_receive.rs`) that assembles multichannel
+   substreams, rejects duplicates, conceals missing substreams after one frame, and
+   bounds pending frames, replacing the four hand-written assemblers that had
+   drifted apart. Receivers flush the decoder on socket timeout, so a frame whose
+   substreams stop arriving is still concealed and played instead of being held
+   until the next packet, and `DecodeStats` reports duplicate, malformed, and
+   concealed traffic in the bus status line, the ASIO timing line, and browser
+   gateway metrics. Float32 remains the default, and every endpoint can now
+   publish and decode both formats. FLAC remains unsupported.
 5. **Windows release packaging:** Implemented a portable x64 ZIP and
    tag-triggered release/checksum workflow. The Windows package does not
    install drivers or claim to be signed or hardware-certified.
@@ -144,8 +156,8 @@ then strengthened the native and browser paths:
 The latest recorded automated checks passed:
 
 - `cargo fmt --all -- --check`
-- `cargo check --workspace --all-targets --offline`
-- `cargo test --workspace --offline` — 50 Rust tests passed
+- `cargo check --workspace --all-targets` — clean, no warnings
+- `cargo test -p audio-core -p network-core` — 73 Rust tests passed
 - `node --test crates\audio-core\tests\web_player.test.js` — 4 tests passed
 - `cargo xtask bundle openaudio-plugin --release --target x86_64-pc-windows-msvc --offline`
 
@@ -228,8 +240,8 @@ Those tests cover software behavior, not physical transport or hardware timing.
 Only after the preceding gates have evidence should maintainers decide whether
 to ship the VST3 in the portable release, adjust v1 requirements, or start
 additional product work. CLAP, AudioUnit, DAW receive plugins, multichannel
-VST3 ports, a custom plugin editor, and compressed codecs are not part of the
-current v1 commitment; each requires an explicit scope decision.
+VST3 ports, a custom plugin editor, and broader codec coverage remain outside
+the current v1 commitment; each requires an explicit scope decision.
 
 ## 7. Build and test from a clean checkout
 
@@ -263,7 +275,8 @@ state clearly when that coverage is unavailable.
 - Do not claim the sub-10-ms latency target, 64-channel throughput, ASIO
   hardware support, Wi-Fi recovery, or VST3 host compatibility until measured
   and documented.
-- Do not reinterpret Opus/FLAC or malformed packets as Float32.
+- Do not reinterpret unsupported formats (including FLAC) or malformed
+  packets as Float32; keep Opus limited to paths that validate and decode it.
 - Do not move network I/O or blocking work onto audio callbacks.
 - Do not silently hide drops, unsupported formats, mismatched channel layouts,
   or device errors.

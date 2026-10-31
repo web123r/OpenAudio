@@ -3,7 +3,6 @@ use aes_gcm::{
     Aes256Gcm, Nonce,
 };
 use argon2::Argon2;
-use sha2::Digest;
 
 pub struct StreamCipher {
     cipher: Aes256Gcm,
@@ -36,7 +35,12 @@ impl StreamCipher {
             .map_err(|e| format!("decryption failed: {e}"))
     }
 
-    pub fn encrypt_with_aad(&self, nonce_bytes: &[u8; 12], plaintext: &[u8], aad: &[u8]) -> Result<Vec<u8>, String> {
+    pub fn encrypt_with_aad(
+        &self,
+        nonce_bytes: &[u8; 12],
+        plaintext: &[u8],
+        aad: &[u8],
+    ) -> Result<Vec<u8>, String> {
         let nonce = Nonce::from_slice(nonce_bytes);
         let payload = Payload {
             msg: plaintext,
@@ -47,7 +51,12 @@ impl StreamCipher {
             .map_err(|e| format!("authenticated encryption failed: {e}"))
     }
 
-    pub fn decrypt_with_aad(&self, nonce_bytes: &[u8; 12], ciphertext: &[u8], aad: &[u8]) -> Result<Vec<u8>, String> {
+    pub fn decrypt_with_aad(
+        &self,
+        nonce_bytes: &[u8; 12],
+        ciphertext: &[u8],
+        aad: &[u8],
+    ) -> Result<Vec<u8>, String> {
         let nonce = Nonce::from_slice(nonce_bytes);
         let payload = Payload {
             msg: ciphertext,
@@ -59,18 +68,16 @@ impl StreamCipher {
     }
 }
 
-/// Derives a 32-byte key from a user passphrase using Argon2id with OpenAudio domain salt.
+/// Derives a 32-byte key from a user passphrase using Argon2id with OpenAudio
+/// domain salt. A derivation failure aborts rather than silently downgrading
+/// to a weaker hash.
 pub fn derive_key_from_passphrase(passphrase: &str) -> [u8; 32] {
     let mut key = [0u8; 32];
     let salt = b"OpenAudio-V1-Argon2id-Salt";
     let argon2 = Argon2::default();
-    if argon2.hash_password_into(passphrase.as_bytes(), salt, &mut key).is_err() {
-        let mut hasher = sha2::Sha256::new();
-        sha2::Digest::update(&mut hasher, salt);
-        sha2::Digest::update(&mut hasher, passphrase.as_bytes());
-        let result = sha2::Digest::finalize(hasher);
-        key.copy_from_slice(&result);
-    }
+    argon2
+        .hash_password_into(passphrase.as_bytes(), salt, &mut key)
+        .expect("Argon2id key derivation failed; refusing cryptographic downgrade");
     key
 }
 
@@ -94,9 +101,18 @@ pub fn encrypt_audio_packet(cipher: &StreamCipher, raw_packet: &[u8]) -> Result<
     if raw_packet.len() < 32 {
         return Err("raw packet too short to encrypt".to_string());
     }
-    let stream_id = u32::from_be_bytes(raw_packet[8..12].try_into().map_err(|_| "invalid stream_id")?);
-    let sequence_number = u32::from_be_bytes(raw_packet[12..16].try_into().map_err(|_| "invalid seq")?);
-    let timestamp_ns = u64::from_be_bytes(raw_packet[16..24].try_into().map_err(|_| "invalid timestamp")?);
+    let stream_id = u32::from_be_bytes(
+        raw_packet[8..12]
+            .try_into()
+            .map_err(|_| "invalid stream_id")?,
+    );
+    let sequence_number =
+        u32::from_be_bytes(raw_packet[12..16].try_into().map_err(|_| "invalid seq")?);
+    let timestamp_ns = u64::from_be_bytes(
+        raw_packet[16..24]
+            .try_into()
+            .map_err(|_| "invalid timestamp")?,
+    );
     let nonce = packet_nonce(stream_id, sequence_number, timestamp_ns);
 
     let mut header = raw_packet[0..24].to_vec();
@@ -111,7 +127,10 @@ pub fn encrypt_audio_packet(cipher: &StreamCipher, raw_packet: &[u8]) -> Result<
 
 /// Decrypts an encrypted OpenAudio packet back into a standard OpenAudio Float32 audio packet.
 /// Validates both ciphertext authenticity and packet header AAD integrity.
-pub fn decrypt_audio_packet(cipher: &StreamCipher, encrypted_packet: &[u8]) -> Result<Vec<u8>, String> {
+pub fn decrypt_audio_packet(
+    cipher: &StreamCipher,
+    encrypted_packet: &[u8],
+) -> Result<Vec<u8>, String> {
     if encrypted_packet.len() < 24 + 16 {
         return Err("encrypted packet too short".to_string());
     }
@@ -122,9 +141,21 @@ pub fn decrypt_audio_packet(cipher: &StreamCipher, encrypted_packet: &[u8]) -> R
         return Err("not an encrypted OpenAudio packet".to_string());
     }
 
-    let stream_id = u32::from_be_bytes(encrypted_packet[8..12].try_into().map_err(|_| "invalid stream_id")?);
-    let sequence_number = u32::from_be_bytes(encrypted_packet[12..16].try_into().map_err(|_| "invalid seq")?);
-    let timestamp_ns = u64::from_be_bytes(encrypted_packet[16..24].try_into().map_err(|_| "invalid timestamp")?);
+    let stream_id = u32::from_be_bytes(
+        encrypted_packet[8..12]
+            .try_into()
+            .map_err(|_| "invalid stream_id")?,
+    );
+    let sequence_number = u32::from_be_bytes(
+        encrypted_packet[12..16]
+            .try_into()
+            .map_err(|_| "invalid seq")?,
+    );
+    let timestamp_ns = u64::from_be_bytes(
+        encrypted_packet[16..24]
+            .try_into()
+            .map_err(|_| "invalid timestamp")?,
+    );
     let nonce = packet_nonce(stream_id, sequence_number, timestamp_ns);
 
     let header = &encrypted_packet[0..24];
@@ -175,15 +206,20 @@ mod tests {
             .expect("encode float32");
 
         let encrypted = encrypt_audio_packet(&cipher, &raw_packet).expect("encrypt packet");
-        assert_eq!(encrypted[5], network_core::protocol::PACKET_TYPE_AUDIO_ENCRYPTED);
+        assert_eq!(
+            encrypted[5],
+            network_core::protocol::PACKET_TYPE_AUDIO_ENCRYPTED
+        );
         assert_ne!(&encrypted[24..], &raw_packet[24..]);
 
         let decrypted = decrypt_audio_packet(&cipher, &encrypted).expect("decrypt packet");
         assert_eq!(decrypted[5], network_core::protocol::PACKET_TYPE_AUDIO);
         assert_eq!(decrypted, raw_packet);
 
-        let parsed = network_core::protocol::parse_packet(&decrypted).expect("parse decrypted packet");
-        let decoded = network_core::protocol::decode_float32(&decrypted, &parsed).expect("decode float32");
+        let parsed =
+            network_core::protocol::parse_packet(&decrypted).expect("parse decrypted packet");
+        let decoded =
+            network_core::protocol::decode_float32(&decrypted, &parsed).expect("decode float32");
         assert_eq!(decoded, samples);
     }
 
@@ -199,11 +235,15 @@ mod tests {
             presentation_timestamp_ns: 1_000_000_000,
         };
         let samples = vec![0.5f32, -0.25f32];
-        let raw_packet = network_core::protocol::encode_float32_packet(&header, 2, 48000, &samples).unwrap();
+        let raw_packet =
+            network_core::protocol::encode_float32_packet(&header, 2, 48000, &samples).unwrap();
 
         let encrypted = encrypt_audio_packet(&sender_cipher, &raw_packet).unwrap();
         let result = decrypt_audio_packet(&receiver_cipher, &encrypted);
-        assert!(result.is_err(), "Decryption must fail when passphrase does not match");
+        assert!(
+            result.is_err(),
+            "Decryption must fail when passphrase does not match"
+        );
     }
 
     #[test]
@@ -216,7 +256,8 @@ mod tests {
             presentation_timestamp_ns: 1_000_000_000,
         };
         let samples = vec![0.5f32, -0.25f32];
-        let raw_packet = network_core::protocol::encode_float32_packet(&header, 2, 48000, &samples).unwrap();
+        let raw_packet =
+            network_core::protocol::encode_float32_packet(&header, 2, 48000, &samples).unwrap();
 
         let mut encrypted = encrypt_audio_packet(&cipher, &raw_packet).unwrap();
         // Tamper with a byte in ciphertext
@@ -224,7 +265,10 @@ mod tests {
             *b ^= 0xFF;
         }
         let result = decrypt_audio_packet(&cipher, &encrypted);
-        assert!(result.is_err(), "Decryption must reject tampered ciphertext");
+        assert!(
+            result.is_err(),
+            "Decryption must reject tampered ciphertext"
+        );
     }
 
     #[test]
@@ -237,12 +281,16 @@ mod tests {
             presentation_timestamp_ns: 1_000_000_000,
         };
         let samples = vec![0.5f32, -0.25f32];
-        let raw_packet = network_core::protocol::encode_float32_packet(&header, 2, 48000, &samples).unwrap();
+        let raw_packet =
+            network_core::protocol::encode_float32_packet(&header, 2, 48000, &samples).unwrap();
 
         let mut encrypted = encrypt_audio_packet(&cipher, &raw_packet).unwrap();
         // Tamper with sequence number in the header (byte 15)
         encrypted[15] ^= 0x01;
         let result = decrypt_audio_packet(&cipher, &encrypted);
-        assert!(result.is_err(), "Decryption must reject header tampering due to AAD authentication");
+        assert!(
+            result.is_err(),
+            "Decryption must reject header tampering due to AAD authentication"
+        );
     }
 }

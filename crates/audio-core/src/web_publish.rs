@@ -1,13 +1,16 @@
-use crate::protocol::{
-    sample_rate_to_code, AudioPayloadHeader, PacketHeader, SAMPLE_FORMAT_FLOAT32,
+use crate::protocol::{sample_rate_to_code, SAMPLE_FORMAT_FLOAT32};
+use crate::transmit::{report_incompatible_subscribers, PublishFormat};
+use crate::StreamingLinearResampler;
+use network_core::discovery::{
+    active_subscribers_for_format, bind_control_listener_on, run_control_listener,
+    start_advertising_with_format, SubscriberRegistry,
 };
-use network_core::discovery::{start_advertising_with_labels, SubscribeRequest};
 use serde::Deserialize;
-use std::collections::HashSet;
-use std::net::{SocketAddr, TcpStream, UdpSocket};
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::collections::HashMap;
+use std::net::{TcpStream, UdpSocket};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tungstenite::{Message, WebSocket};
 
 #[derive(Deserialize)]
@@ -19,9 +22,34 @@ struct PublishHandshake {
     channels: u8,
     #[serde(rename = "sampleRate")]
     sample_rate: u32,
+    /// Wire format requested by the page. Absent means Float32, which keeps
+    /// older publisher pages working.
+    #[serde(default)]
+    format: PublishFormat,
 }
 
 const MAX_FRAMES_PER_PACKET: usize = 58;
+const MAX_CHANNELS: u8 = 64;
+/// Opus always transmits at 48 kHz; other capture rates are resampled first.
+const OPUS_WIRE_SAMPLE_RATE: u32 = 48_000;
+
+fn validate_channels(channels: u8) -> Result<u8, String> {
+    if channels == 0 || channels > MAX_CHANNELS {
+        return Err(format!(
+            "Unsupported channel count: {channels} (expected 1-{MAX_CHANNELS})"
+        ));
+    }
+
+    Ok(channels)
+}
+
+/// Resolves the page's requested format.
+///
+/// No subscriber has declared anything by handshake time, so `Auto` falls back
+/// to the channel-count policy alone.
+fn negotiated_format(handshake: &PublishHandshake) -> PublishFormat {
+    handshake.format.resolve(handshake.channels as usize, None)
+}
 
 pub fn handle_publish_ws(
     mut ws: WebSocket<TcpStream>,
@@ -42,7 +70,15 @@ pub fn handle_publish_ws(
         return Err("Expected text message for handshake".into());
     };
 
-    let rate_code = sample_rate_to_code(handshake.sample_rate);
+    let channels = validate_channels(handshake.channels)?;
+    let format = negotiated_format(&handshake);
+
+    let wire_sample_rate = if format == PublishFormat::Opus {
+        OPUS_WIRE_SAMPLE_RATE
+    } else {
+        handshake.sample_rate
+    };
+    let rate_code = sample_rate_to_code(wire_sample_rate);
     if rate_code == 0 {
         return Err(format!(
             "Unsupported sample rate: {}",
@@ -54,70 +90,83 @@ pub fn handle_publish_ws(
         .duration_since(UNIX_EPOCH)
         .unwrap()
         .subsec_nanos() as u32;
-    let channels = handshake.channels;
-    let max_frames_per_packet =
+
+    let max_frames_per_packet = if format == PublishFormat::Opus {
+        network_core::opus::OPUS_FRAME_SAMPLES
+    } else {
         network_core::protocol::max_float32_frames_per_packet(channels as usize)?
-            .min(MAX_FRAMES_PER_PACKET);
+            .min(MAX_FRAMES_PER_PACKET)
+    };
+
+    let mut opus_encoder = if format == PublishFormat::Opus {
+        Some(network_core::opus::MultichannelOpusEncoder::new(
+            channels as usize,
+            64_000,
+        )?)
+    } else {
+        None
+    };
+    let mut opus_resampler =
+        if format == PublishFormat::Opus && handshake.sample_rate != OPUS_WIRE_SAMPLE_RATE {
+            Some(StreamingLinearResampler::new(
+                channels as usize,
+                handshake.sample_rate,
+                OPUS_WIRE_SAMPLE_RATE,
+            )?)
+        } else {
+            None
+        };
 
     // We need a UdpSocket for sending audio packets
     let audio_socket = UdpSocket::bind("0.0.0.0:0").map_err(|e| e.to_string())?;
 
-    // We need a UdpSocket for the control port (to receive SubscribeRequest)
-    let control_socket = UdpSocket::bind("0.0.0.0:0").map_err(|e| e.to_string())?;
-    control_socket
-        .set_read_timeout(Some(Duration::from_millis(100)))
-        .unwrap();
+    // The control listener registers subscribers together with the formats they
+    // declared, so this publisher skips receivers that cannot decode it.
+    let control_socket = bind_control_listener_on(0)?;
     let control_port = control_socket.local_addr().unwrap().port();
+    let subscribers: SubscriberRegistry = Arc::new(Mutex::new(HashMap::new()));
 
-    let subscribers = Arc::new(Mutex::new(HashSet::<SocketAddr>::new()));
+    let keep_running = Arc::new(AtomicBool::new(true));
 
-    // Start discovery advertising
-    let adv_keep_running = Arc::new(AtomicBool::new(true));
-    let adv_keep_running_clone = adv_keep_running.clone();
-
+    // Start discovery advertising with the concrete wire format
+    let adv_keep_running = keep_running.clone();
     let mut channel_labels = vec![];
     for i in 0..channels {
         channel_labels.push(format!("Channel {}", i + 1));
     }
 
     let stream_name = handshake.stream_name.clone();
+    let advertised_format = format.wire_sample_format();
     std::thread::spawn(move || {
-        let _ = start_advertising_with_labels(
+        let _ = start_advertising_with_format(
             "Web Publisher".into(),
             stream_id,
             stream_name,
             channels,
             channel_labels,
             control_port,
-            adv_keep_running_clone,
+            advertised_format,
+            adv_keep_running,
         );
     });
 
     // Start control listener
-    let ctrl_keep_running = adv_keep_running.clone();
-    let subs_clone = subscribers.clone();
+    let ctrl_keep_running = keep_running.clone();
+    let ctrl_registry = subscribers.clone();
     std::thread::spawn(move || {
-        let mut buf = [0u8; 256];
-        while ctrl_keep_running.load(Ordering::Relaxed) {
-            if let Ok((len, src)) = control_socket.recv_from(&mut buf) {
-                if let Ok(req) = serde_json::from_slice::<SubscribeRequest>(&buf[..len]) {
-                    if req.stream_id == stream_id {
-                        let dest = SocketAddr::new(src.ip(), req.receiver_port);
-                        subs_clone.lock().unwrap().insert(dest);
-                    }
-                }
-            }
-        }
+        let _ = run_control_listener(control_socket, ctrl_registry, ctrl_keep_running);
     });
 
     println!(
-        "Web Publisher started: id={} port={}",
-        stream_id, control_port
+        "Web Publisher started: id={} port={} format={:?}",
+        stream_id, control_port, format
     );
 
     // Audio sending loop
-    let sequence = Arc::new(AtomicU32::new(0));
-    let start_time = Instant::now();
+    let mut sequence: u32 = 0;
+    let mut wire_frames_sent: u64 = 0;
+    let mut opus_pending: Vec<f32> = Vec::new();
+    let mut last_incompatible_report = 0usize;
 
     loop {
         if !global_keep_running.load(Ordering::Relaxed) {
@@ -126,46 +175,124 @@ pub fn handle_publish_ws(
 
         match ws.read() {
             Ok(Message::Binary(data)) => {
-                // `data` is a flat float32 array
-                let floats_count = data.len() / 4;
-                if floats_count == 0 {
+                // `data` is a flat little-endian float32 array
+                let mut samples = Vec::with_capacity(data.len() / 4);
+                for bytes in data.chunks_exact(4) {
+                    let mut b = [0u8; 4];
+                    b.copy_from_slice(bytes);
+                    samples.push(f32::from_le_bytes(b));
+                }
+                if samples.is_empty() {
                     continue;
                 }
 
-                // parse as f32
-                let mut samples = Vec::with_capacity(floats_count);
-                for i in 0..floats_count {
-                    let mut b = [0u8; 4];
-                    b.copy_from_slice(&data[i * 4..(i + 1) * 4]);
-                    samples.push(f32::from_le_bytes(b));
+                let destinations = active_subscribers_for_format(
+                    &subscribers,
+                    stream_id,
+                    format.wire_sample_format(),
+                );
+                report_incompatible_subscribers(
+                    stream_id,
+                    format,
+                    destinations.skipped_incompatible,
+                    &mut last_incompatible_report,
+                );
+
+                if destinations.addresses.is_empty() {
+                    continue; // drop if no compatible subs
                 }
 
-                let frame_count = floats_count / channels as usize;
+                let timestamp_ns =
+                    |frames: u64| frames.saturating_mul(1_000_000_000) / wire_sample_rate as u64;
+
+                if format == PublishFormat::Opus {
+                    let converted = match opus_resampler.as_mut() {
+                        Some(resampler) => match resampler.process(&samples) {
+                            Ok(converted) => converted,
+                            Err(error) => {
+                                eprintln!("audio-core: web publisher resampling failed: {error}");
+                                continue;
+                            }
+                        },
+                        None => samples,
+                    };
+                    opus_pending.extend(converted);
+
+                    let frame_samples = network_core::opus::OPUS_FRAME_SAMPLES * channels as usize;
+                    let substream_count = (channels as usize).div_ceil(2) as u32;
+
+                    while opus_pending.len() >= frame_samples {
+                        let frame: Vec<f32> = opus_pending.drain(..frame_samples).collect();
+                        let frame_timestamp_ns = timestamp_ns(wire_frames_sent);
+                        wire_frames_sent += network_core::opus::OPUS_FRAME_SAMPLES as u64;
+
+                        let Some(encoder) = opus_encoder.as_mut() else {
+                            eprintln!("audio-core: web publisher Opus encoder unavailable");
+                            break;
+                        };
+                        let sequence_start = sequence;
+                        sequence = sequence.wrapping_add(substream_count);
+                        let encoded = match encoder.encode(&frame, sequence_start) {
+                            Ok(encoded) => encoded,
+                            Err(error) => {
+                                eprintln!(
+                                    "audio-core: web publisher Opus encoding failed: {error}"
+                                );
+                                continue;
+                            }
+                        };
+
+                        for (substream_index, sequence_number, payload) in encoded {
+                            let header = crate::protocol::PacketHeader {
+                                sub_stream_index: substream_index,
+                                stream_id,
+                                sequence_number,
+                                presentation_timestamp_ns: frame_timestamp_ns,
+                            };
+                            let packet = match network_core::protocol::encode_opus_packet(
+                                &header,
+                                channels,
+                                OPUS_WIRE_SAMPLE_RATE,
+                                network_core::opus::OPUS_FRAME_SAMPLES as u16,
+                                &payload,
+                            ) {
+                                Ok(packet) => packet,
+                                Err(error) => {
+                                    eprintln!(
+                                        "audio-core: web publisher failed to frame Opus packet: {error}"
+                                    );
+                                    continue;
+                                }
+                            };
+
+                            for dest in &destinations.addresses {
+                                let _ = audio_socket.send_to(&packet, dest);
+                            }
+                        }
+                    }
+
+                    continue;
+                }
+
+                let frame_count = samples.len() / channels as usize;
                 let mut frame_offset = 0;
-
-                let subs = {
-                    let s = subscribers.lock().unwrap();
-                    s.iter().cloned().collect::<Vec<_>>()
-                };
-
-                if subs.is_empty() {
-                    continue; // drop if no subs
-                }
 
                 while frame_offset < frame_count {
                     let frames_this_packet =
                         (frame_count - frame_offset).min(max_frames_per_packet);
-                    let sequence_number = sequence.fetch_add(1, Ordering::Relaxed);
-                    let timestamp_ns = start_time.elapsed().as_nanos() as u64;
+                    let sequence_number = sequence;
+                    sequence = sequence.wrapping_add(1);
+                    let packet_timestamp_ns = timestamp_ns(wire_frames_sent);
+                    wire_frames_sent += frames_this_packet as u64;
 
-                    let header = PacketHeader {
+                    let header = crate::protocol::PacketHeader {
                         sub_stream_index: 0,
                         stream_id,
                         sequence_number,
-                        presentation_timestamp_ns: timestamp_ns,
+                        presentation_timestamp_ns: packet_timestamp_ns,
                     };
 
-                    let payload_header = AudioPayloadHeader {
+                    let payload_header = crate::protocol::AudioPayloadHeader {
                         channel_count: channels,
                         sample_format: SAMPLE_FORMAT_FLOAT32,
                         sample_rate_code: rate_code,
@@ -184,7 +311,7 @@ pub fn handle_publish_ws(
                         packet.extend_from_slice(&sample.to_le_bytes());
                     }
 
-                    for dest in &subs {
+                    for dest in &destinations.addresses {
                         let _ = audio_socket.send_to(&packet, dest);
                     }
 
@@ -205,6 +332,49 @@ pub fn handle_publish_ws(
         }
     }
 
-    adv_keep_running.store(false, Ordering::Relaxed);
+    keep_running.store(false, Ordering::Relaxed);
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{negotiated_format, validate_channels, PublishFormat, PublishHandshake};
+
+    fn handshake(json: &str) -> PublishHandshake {
+        serde_json::from_str(json).expect("handshake must parse")
+    }
+
+    #[test]
+    fn handshake_without_format_stays_on_float32() {
+        let parsed = handshake(
+            r#"{"type":"publish","streamName":"Mobile Mic","channels":2,"sampleRate":48000}"#,
+        );
+        assert_eq!(negotiated_format(&parsed), PublishFormat::Float32);
+    }
+
+    #[test]
+    fn handshake_format_is_honoured_and_auto_still_follows_channel_count() {
+        let opus = handshake(
+            r#"{"type":"publish","streamName":"Mic","channels":2,"sampleRate":48000,"format":"opus"}"#,
+        );
+        assert_eq!(negotiated_format(&opus), PublishFormat::Opus);
+
+        let auto_stereo = handshake(
+            r#"{"type":"publish","streamName":"Mic","channels":2,"sampleRate":48000,"format":"auto"}"#,
+        );
+        assert_eq!(negotiated_format(&auto_stereo), PublishFormat::Float32);
+
+        let auto_multichannel = handshake(
+            r#"{"type":"publish","streamName":"Mic","channels":16,"sampleRate":48000,"format":"auto"}"#,
+        );
+        assert_eq!(negotiated_format(&auto_multichannel), PublishFormat::Opus);
+    }
+
+    #[test]
+    fn channel_count_is_validated_before_any_audio_is_split() {
+        assert_eq!(validate_channels(1).unwrap(), 1);
+        assert_eq!(validate_channels(64).unwrap(), 64);
+        assert!(validate_channels(0).is_err());
+        assert!(validate_channels(65).is_err());
+    }
 }

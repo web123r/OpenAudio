@@ -2,6 +2,78 @@
 
 All notable changes to the OpenAudio project will be documented in this file.
 
+## [Unreleased]
+
+### 🎛️ **VST3 Plugin Opus Support**
+* The plugin now decodes Opus: its receiver declares PCM and Opus and decodes through the shared `AudioPacketDecoder`, so it receives multichannel Opus streams that previously reached it as nothing.
+* Added an opt-in `Publish Opus` parameter (default off). When enabled, the plugin resamples non-48 kHz host audio, encodes 20 ms frames, advertises the Opus wire format, and filters subscribers by declared capability.
+* Plugin publishing and subscription now use `active_subscribers_for_format` and `send_subscribe_request_with_formats` instead of the format-blind variants.
+
+### 🌐 **Browser Publisher Format Support**
+* The browser microphone publisher now honours format negotiation: it uses the shared subscriber registry and `active_subscribers_for_format`, so it stops inserting every subscriber and reports skipped incompatible ones like the native publishers do.
+* Its handshake accepts `format` (`float32`, `opus`, or `auto`, defaulting to `float32` for older pages), and the publish page gained a format selector. Opus publishing resamples non-48 kHz capture, encodes 20 ms multichannel frames, and advertises the concrete format.
+* Publish timestamps are now derived from the sent frame count instead of wall-clock reads, so packet spacing matches audio time for both formats.
+* The publisher handshake validates the channel count (1–64) before audio is split; a zero-channel handshake previously divided by zero.
+
+### 🐛 **Discovery and Format Fixes**
+* The discovery listener now sizes its receive buffer from the protocol limits (`MAX_ADVERTISEMENT_BYTES`) instead of a fixed 1 KiB array, so 64-channel advertisements — previously ~1035 bytes and silently dropped — are received. A test pins the worst-case escaped advertisement below the buffer size.
+* `PublishFormat::Auto` now resolves against the subscribers already waiting on the stream: a multichannel stream whose waiting subscribers all declared PCM only stays on Float32 rather than publishing Opus to nobody.
+* The receiver's nominal packet-rate report used integer division and under-reported rates (328 packets/s instead of 328.77 at 2 ch), which skewed the expected-packet-loss estimate.
+
+### 📡 **Opus Format Negotiation**
+* Discovery advertisements now carry the concrete wire format a stream sends (`sample_format`), and subscribe requests declare every format the receiver can decode (`supported_formats`).
+* Publishers only stream to subscribers that declared support for the stream's format, and report how many subscribers were skipped for being incompatible instead of sending undecodable packets.
+* Requests without `supported_formats` are treated as Float32-only, preserving compatibility with older clients.
+* Every native receiver — mixed bus, split receiver, browser gateway, network receiver, receiver CLI, ASIO subscriber, and VST3 plugin — declares both PCM and Opus.
+
+### 🔊 **Universal Native Opus Receiving**
+* Added a shared `AudioPacketDecoder` that assembles multichannel Opus substreams, applies packet-loss concealment to missing substreams, and decodes plain Float32 packets, so the simple receivers no longer carry format-specific logic.
+* Simple live playback, WAV capture, ASIO playback, and the `receive_and_serve_web` relay now accept Opus as well as Float32 streams.
+* The ASIO subscriber now declares PCM and Opus support, removing the last native subscriber that rejected Opus.
+* Every receive path (bus, split, ASIO subscriber, shared receiver, playback, WAV capture, web relay, and browser gateway) now decodes through that one assembler instead of four hand-written copies, so substream completeness, duplicate rejection, stale-frame concealment, and the bounded pending-frame limit behave identically everywhere.
+* A quiet socket no longer strands a partly received frame: each receiver calls the decoder's new `flush_expired` on its read timeout, so the tail of a stream and gaps where packets stop are concealed after one 20 ms interval instead of being held until the next packet. The browser gateway had lost this behaviour when its private assembler was removed.
+* Added `DecodeStats` so dropped Opus traffic is explainable rather than silent: duplicate substreams, malformed/unsupported packets, and concealed substreams are counted in the decoder and surfaced in the bus status line and shutdown summary, the ASIO subscriber's timing line, and the browser gateway's metrics message (shown in the player's stats bar).
+
+### 🎛️ **Selectable Opus Publishing**
+* Added a `PublishFormat::Auto` policy that selects Opus at 8 or more channels and Float32 below that; Float32 remains the default.
+* ASIO publishing now honours the selected publish format instead of always sending Float32, and the setting is persisted in presets.
+
+---
+
+## [0.3.0] - 2026-10-16
+
+### 🚀 Highlights & New Features
+
+#### 🔔 **Automatic Background GitHub Update Checker**
+* Integrated background update checker (`apps/sender/src/updater.rs`) that periodically queries the GitHub Releases API for `web123r/OpenAudio`.
+* Added non-intrusive in-app banner alert showing the newly published version, release title, and immediate one-click action buttons to download or view the release notes on GitHub.
+* Added manual "Check for Updates" trigger and status indicator to the desktop GUI status bar.
+
+#### ⚡ **Real-Time Audio Safety & Zero-Allocation Queues**
+* Re-engineered `BoundedAudioQueue` (`crates/audio-core/src/util.rs`) with pre-allocated buffer recycling to guarantee zero heap allocations on high-priority audio callback threads.
+* Eliminated blocking `eprintln!` I/O logging inside audio callback loops in `crates/audio-core/src/transmit.rs`, preventing priority inversion and audio dropouts under network backpressure.
+* Added atomic drop metrics tracking for explicit, observable buffer overrun monitoring.
+
+#### 🎛️ **Non-Blocking VST3 DAW Plugin Lifecycle**
+* Decoupled runtime initialization, socket rebinding, and thread joins from the DAW audio `process()` path (`apps/plugin/src/lib.rs`).
+* Introduced staged parameter updates via atomic dirty flags, ensuring REAPER, Ableton Live, and Cubase audio processing continues uninterrupted when toggling publishing or changing PINs.
+* Hardened multi-instance DAW isolation with strict per-packet stream identity validation.
+
+#### 🎯 **Precision Packet Loss Concealment (PLC)**
+* Dynamically sized PLC concealment synthesis in `crates/audio-core/src/bus.rs` and `apps/receiver/src/main.rs` to match exact stream packet duration and channel count rather than a fixed 128-sample estimate.
+* Ensured sequence continuity and phase alignment across packet loss events.
+
+#### 🔒 **Cryptographic Hardening & Key Derivation**
+* Upgraded stream password key derivation from SHA-256 to memory-hard `Argon2id` using a dedicated domain salt (`OpenAudio-V1-Argon2id-Salt`) (`crates/audio-core/src/crypto.rs`).
+* Hardened AES-256-GCM symmetric transport by binding the 24-byte packet header as Associated Authenticated Data (AAD), thwarting header tampering and stream spoofing.
+* Enforced nonce uniqueness by incorporating nanosecond presentation timestamps into AES-GCM nonces, preventing nonce reuse across restarts and sequence rollovers.
+
+#### 🛡️ **Preset Security & Windows Firewall Hardening**
+* Prevented accidental credential leakage by skipping serialization of sensitive passphrases in preset files (`.oapreset`).
+* Restricted firewall configuration script (`scripts/setup-firewall.ps1`) to `Private,Domain` network profiles, avoiding open port exposure on untrusted public Wi-Fi networks.
+
+---
+
 ## [0.2.0] - 2026-10-10
 
 ### 🚀 Added Features & Major Architecture Upgrades

@@ -848,6 +848,14 @@
       } else {
         parts.push(`Delivery: ${pct}% (${lost} lost)`);
       }
+      const dup = Number(latestMetrics.duplicateSubstreams || 0);
+      const bad = Number(latestMetrics.malformedPackets || 0);
+      const concealed = Number(latestMetrics.concealedSubstreams || 0);
+      if (dup + bad + concealed > 0) {
+        parts.push(
+          `Opus drops: ${dup} duplicate, ${bad} malformed, ${concealed} concealed`
+        );
+      }
       parts.push(`${rate} pkts/s`);
     }
     statsEl.textContent = parts.join(" · ");

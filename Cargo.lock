@@ -402,10 +402,10 @@ dependencies = [
  "if-addrs",
  "libc",
  "network-core",
+ "opus-rs",
  "rand",
  "serde",
  "serde_json",
- "sha2",
  "socket2",
  "tungstenite",
  "windows 0.59.0",
@@ -2081,6 +2081,7 @@ name = "network-core"
 version = "0.1.0"
 dependencies = [
  "if-addrs",
+ "opus-rs",
  "serde",
  "serde_json",
  "socket2",
@@ -2513,7 +2514,7 @@ checksum = "c08d65885ee38876c4f86fa503fb49d7b507c2b62552df7c70b2fce627e06381"
 
 [[package]]
 name = "openaudio-gui"
-version = "0.1.0"
+version = "0.3.0"
 dependencies = [
  "audio-core",
  "ctrlc",
@@ -2542,6 +2543,12 @@ version = "0.1.0"
 dependencies = [
  "nice-plug-xtask",
 ]
+
+[[package]]
+name = "opus-rs"
+version = "0.1.40"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5d664b01dda81206fd3c80582eafd8dfef0e936eea1c2ac90ed408823bbb410c"
 
 [[package]]
 name = "orbclient"
@@ -3152,17 +3159,6 @@ name = "sha1"
 version = "0.10.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a978451301f4db1d02937a4ab3ccce137717b81826e79b7d49ffe3244a13c3b8"
-dependencies = [
- "cfg-if",
- "cpufeatures",
- "digest",
-]
-
-[[package]]
-name = "sha2"
-version = "0.10.9"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a7507d819769d01a365ab707794a4084392c824f54a7a6a7862f8c3d0892b283"
 dependencies = [
  "cfg-if",
  "cpufeatures",

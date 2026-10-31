@@ -72,24 +72,20 @@ impl SignalMeter {
             return;
         }
 
-        let measured_channels = channel_count.min(self.channel_peaks.len());
-
+        let mut peaks = [0.0_f32; 64];
+        let measured_channels = channel_count.min(self.channel_peaks.len()).min(peaks.len());
         let mut signal_detected = false;
 
-        for frame in samples.chunks(channel_count) {
-            for channel in 0..measured_channels {
-                let Some(sample) = frame.get(channel) else {
-                    continue;
-                };
-
+        for frame in samples.chunks_exact(channel_count) {
+            for (channel, sample) in frame[..measured_channels].iter().enumerate() {
                 let peak = sanitize_peak(*sample);
-
-                if peak >= SIGNAL_THRESHOLD_LINEAR {
-                    signal_detected = true;
-                }
-
-                atomic_max_f32(&self.channel_peaks[channel], peak);
+                peaks[channel] = peaks[channel].max(peak);
+                signal_detected |= peak >= SIGNAL_THRESHOLD_LINEAR;
             }
+        }
+
+        for (channel, peak) in peaks[..measured_channels].iter().copied().enumerate() {
+            atomic_max_f32(&self.channel_peaks[channel], peak);
         }
 
         if signal_detected {

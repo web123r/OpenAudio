@@ -5,7 +5,7 @@
 
 use audio_core::{
     publish_diagnostic_stream_with_discovery, DiagnosticPublishConfig, DiagnosticPublishReport,
-    SubscriberRegistry,
+    DiagnosticTransportFormat, SubscriberRegistry,
 };
 use eframe::egui;
 
@@ -36,6 +36,7 @@ struct DiagnosticSession {
     stream_id: u32,
     channel_count: usize,
     sample_rate: u32,
+    transport_format: DiagnosticTransportFormat,
 
     running: Arc<AtomicBool>,
     status: Arc<Mutex<String>>,
@@ -176,22 +177,48 @@ impl DiagnosticPanel {
                                         );
                                         ui.end_row();
 
+                                        ui.label("Transport format");
+                                        ui.horizontal(|ui| {
+                                            ui.radio_value(
+                                                &mut session.transport_format,
+                                                DiagnosticTransportFormat::Float32,
+                                                "Float32",
+                                            );
+                                            if ui
+                                                .radio_value(
+                                                    &mut session.transport_format,
+                                                    DiagnosticTransportFormat::Opus,
+                                                    "Opus",
+                                                )
+                                                .clicked()
+                                            {
+                                                session.sample_rate = 48_000;
+                                            }
+                                        });
+                                        ui.end_row();
+
                                         ui.label("Sample rate");
-                                        egui::ComboBox::from_id_source(format!(
-                                            "diagnostic_rate_{}",
-                                            session.id
-                                        ))
-                                        .selected_text(format!("{} Hz", session.sample_rate))
-                                        .show_ui(
-                                            ui,
+                                        ui.add_enabled_ui(
+                                            session.transport_format
+                                                == DiagnosticTransportFormat::Float32,
                                             |ui| {
-                                                for sample_rate in SAMPLE_RATE_OPTIONS {
-                                                    ui.selectable_value(
-                                                        &mut session.sample_rate,
-                                                        sample_rate,
-                                                        format!("{sample_rate} Hz"),
-                                                    );
-                                                }
+                                                egui::ComboBox::from_id_source(format!(
+                                                    "diagnostic_rate_{}",
+                                                    session.id
+                                                ))
+                                                .selected_text(format!(
+                                                    "{} Hz",
+                                                    session.sample_rate
+                                                ))
+                                                .show_ui(ui, |ui| {
+                                                    for sample_rate in SAMPLE_RATE_OPTIONS {
+                                                        ui.selectable_value(
+                                                            &mut session.sample_rate,
+                                                            sample_rate,
+                                                            format!("{sample_rate} Hz"),
+                                                        );
+                                                    }
+                                                });
                                             },
                                         );
                                         ui.end_row();
@@ -280,6 +307,7 @@ impl DiagnosticPanel {
             stream_id,
             channel_count,
             sample_rate: DEFAULT_SAMPLE_RATE,
+            transport_format: DiagnosticTransportFormat::Float32,
             running: Arc::new(AtomicBool::new(false)),
             status: Arc::new(Mutex::new(
                 "Ready. Start the test, then subscribe normally.".to_string(),
@@ -311,6 +339,18 @@ fn start_session(session: &mut DiagnosticSession, subscribers_by_stream: Subscri
         session.channel_count,
         session.sample_rate,
     ) {
+        Ok(config) => config,
+        Err(error) => {
+            write_status(&session.status, format!("Failed: {error}"));
+            return;
+        }
+    };
+
+    let config = match session.transport_format {
+        DiagnosticTransportFormat::Float32 => Ok(config),
+        DiagnosticTransportFormat::Opus => config.with_opus(128_000),
+    };
+    let config = match config {
         Ok(config) => config,
         Err(error) => {
             write_status(&session.status, format!("Failed: {error}"));

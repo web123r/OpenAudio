@@ -6,6 +6,8 @@
 pub mod aes67;
 pub mod discovery;
 pub mod fec;
+pub mod opus;
+pub mod opus_receive;
 pub mod plc;
 pub mod protocol;
 pub mod receiver;

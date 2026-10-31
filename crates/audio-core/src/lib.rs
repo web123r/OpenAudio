@@ -26,6 +26,8 @@ pub mod cpal_backend;
 mod devices;
 mod diagnostic_publish;
 mod discovery;
+mod opus_codec;
+mod opus_receive;
 mod platform;
 mod playback;
 mod protocol;
@@ -46,6 +48,10 @@ pub mod crypto;
 pub use crypto::{
     decrypt_audio_packet, derive_key_from_passphrase, encrypt_audio_packet, packet_nonce,
     StreamCipher,
+};
+pub use opus_codec::{
+    MultichannelOpusDecoder as OpusMultichannelDecoder,
+    MultichannelOpusEncoder as OpusMultichannelEncoder, OpusChannelDecoder, OpusChannelEncoder,
 };
 pub mod ptp;
 pub mod signal_meter;
@@ -68,6 +74,12 @@ pub use stream_control::{
     StreamingLinearResampler,
 };
 
+// ── Wire format identifiers and packet decoding ────────────────────────
+
+pub use protocol::{SAMPLE_FORMAT_FLOAT32, SAMPLE_FORMAT_OPUS};
+
+pub use opus_receive::{AudioPacketDecoder, DecodedAudioFrame};
+
 // ── Standard audio-device discovery ─────────────────────────────────────
 
 pub use devices::{list_input_devices, list_output_devices, DeviceInfo, NONE_DEVICE};
@@ -82,9 +94,11 @@ pub use receive::receive_to_wav;
 
 pub use transmit::{
     transmit, transmit_loopback_with_discovery, transmit_loopback_with_discovery_labeled,
-    transmit_loopback_with_discovery_labeled_encrypted, transmit_multi, transmit_with_control,
-    transmit_with_discovery, transmit_with_discovery_labeled,
-    transmit_with_discovery_labeled_encrypted,
+    transmit_loopback_with_discovery_labeled_encrypted,
+    transmit_loopback_with_discovery_labeled_encrypted_format, transmit_multi,
+    transmit_with_control, transmit_with_discovery, transmit_with_discovery_labeled,
+    transmit_with_discovery_labeled_encrypted, transmit_with_discovery_labeled_encrypted_format,
+    PublishFormat,
 };
 
 // ── Synthetic diagnostic publishing ─────────────────────────────────────
@@ -95,36 +109,43 @@ pub use transmit::{
 
 pub use diagnostic_publish::{
     publish_diagnostic_stream_with_discovery, DiagnosticPublishConfig, DiagnosticPublishReport,
+    DiagnosticTransportFormat,
 };
 
 // ── Mixed subscriber bus ────────────────────────────────────────────────
 
 pub use bus::{
     get_volume, new_volume_control, receive_and_play_bus, receive_and_play_bus_filtered,
-    receive_and_play_bus_filtered_with_status, receive_and_play_bus_filtered_with_status_and_jitter,
-    receive_and_play_bus_filtered_with_status_jitter_and_cipher,
-    receive_and_play_bus_with_control, receive_and_play_bus_with_volume, set_volume, VolumeControl,
+    receive_and_play_bus_filtered_with_status,
+    receive_and_play_bus_filtered_with_status_and_jitter,
+    receive_and_play_bus_filtered_with_status_jitter_and_cipher, receive_and_play_bus_with_control,
+    receive_and_play_bus_with_volume, set_volume, VolumeControl,
 };
 
 // ── Discovery and subscription control ──────────────────────────────────
 
 pub use discovery::{
-    bind_control_listener_on_interface, list_network_interfaces, measure_node_rtt,
-    send_subscribe_request, send_subscribe_request_from_interface, start_advertising,
-    start_advertising_with_active, start_advertising_with_labels,
+    active_subscribers_accept_opus, bind_control_listener_on_interface, list_network_interfaces,
+    measure_node_rtt, send_subscribe_request, send_subscribe_request_from_interface,
+    send_subscribe_request_with_formats, start_advertising, start_advertising_with_active,
+    start_advertising_with_format, start_advertising_with_labels,
     start_advertising_with_labels_and_active, start_advertising_with_labels_and_active_encrypted,
+    start_advertising_with_labels_and_active_encrypted_format,
     start_advertising_with_labels_and_active_encrypted_interface,
     start_advertising_with_labels_and_active_encrypted_selector, start_control_listener,
     start_discovery_listener, start_discovery_listener_on_interface,
-    start_discovery_listener_on_interface_selector, DiscoveredNode, NetworkInterfaceInfo,
-    NodeAdvertisement, SubscriberRegistry,
+    start_discovery_listener_on_interface_selector, subscriber_supports_format, DiscoveredNode,
+    NetworkInterfaceInfo, NodeAdvertisement, SubscriberRegistry, PCM_AND_OPUS_WIRE_FORMATS,
+    PCM_WIRE_FORMATS,
 };
 
 // ── Multichannel standard-device and SAR routing ────────────────────────
 
 pub use combine::{
-    capture_and_combine_with_discovery, capture_and_combine_with_labels,
-    capture_and_combine_with_labels_encrypted, ChannelSource,
+    capture_and_combine_with_discovery, capture_and_combine_with_discovery_format,
+    capture_and_combine_with_labels, capture_and_combine_with_labels_encrypted,
+    capture_and_combine_with_labels_encrypted_format, capture_and_combine_with_labels_format,
+    ChannelSource,
 };
 
 pub use split::{receive_and_split_to_devices, receive_and_split_to_devices_with_cipher};
@@ -150,8 +171,8 @@ pub use recording::{create_wav_writer, finalize as finalize_recording, generate_
 // the rest of the application to compile normally.
 
 pub use asio::{
-    capture_asio_with_channel_labels, capture_asio_with_discovery, list_asio_drivers,
-    AsioDriverInfo,
+    capture_asio_with_channel_labels, capture_asio_with_channel_labels_format,
+    capture_asio_with_discovery, list_asio_drivers, AsioDriverInfo,
 };
 
 // ── ASIO subscription and output routing ────────────────────────────────

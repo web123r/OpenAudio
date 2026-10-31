@@ -21,6 +21,8 @@ pub struct PublishPreset {
     pub stream_id: u32,
     pub selected_input: Option<String>,
     pub is_loopback: bool,
+    #[serde(default)]
+    pub format: audio_core::PublishFormat,
     pub record: bool,
     #[serde(default)]
     pub channel_labels: Vec<String>,
@@ -45,6 +47,8 @@ pub struct CombinePublishPreset {
     pub encrypted: bool,
     #[serde(skip_serializing, default)]
     pub passphrase: String,
+    #[serde(default)]
+    pub format: audio_core::PublishFormat,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -56,6 +60,8 @@ pub struct AsioPublishPreset {
     pub channel_indices: Vec<usize>,
     #[serde(default)]
     pub channel_labels: Vec<String>,
+    #[serde(default)]
+    pub format: audio_core::PublishFormat,
 }
 
 fn default_jitter_ms() -> u32 {

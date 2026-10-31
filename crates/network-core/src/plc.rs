@@ -59,8 +59,9 @@ impl PacketLossConcealer {
         let total_frames = samples.len() / self.channel_count;
         if total_frames > 0 {
             let last_frame_offset = (total_frames - 1) * self.channel_count;
-            self.last_samples
-                .copy_from_slice(&samples[last_frame_offset..last_frame_offset + self.channel_count]);
+            self.last_samples.copy_from_slice(
+                &samples[last_frame_offset..last_frame_offset + self.channel_count],
+            );
         }
     }
 
@@ -77,13 +78,13 @@ impl PacketLossConcealer {
         self.in_loss_state = true;
 
         for _ in 0..frames {
-            for c in 0..self.channel_count {
-                current_frame[c] *= self.decay_factor;
+            for sample in current_frame.iter_mut().take(self.channel_count) {
+                *sample *= self.decay_factor;
                 // Clamp denormals
-                if current_frame[c].abs() < 1e-6 {
-                    current_frame[c] = 0.0;
+                if sample.abs() < 1e-6 {
+                    *sample = 0.0;
                 }
-                concealment.push(current_frame[c]);
+                concealment.push(*sample);
             }
         }
 

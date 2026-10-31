@@ -1,5 +1,6 @@
 use crate::crypto::StreamCipher;
 use crate::devices::is_skip;
+use crate::opus_receive::AudioPacketDecoder;
 use crate::recording::{
     create_wav_writer, finalize as finalize_recording, write_samples, SharedWavWriter,
 };
@@ -11,10 +12,11 @@ use crate::{
 use network_core::fec::FecDecoder;
 use network_core::plc::PacketLossConcealer;
 use network_core::protocol::{
-    decode_float32, float32_payload, parse_fec_packet, parse_packet, peek_packet_type,
-    ParsedPacket, PACKET_TYPE_FEC,
+    decode_float32, float32_payload, opus_payload, parse_fec_packet, parse_packet,
+    peek_packet_type, PACKET_TYPE_FEC, SAMPLE_FORMAT_OPUS,
 };
 use network_core::receiver::{PacketReorderWindow, ReceiveEvent};
+use socket2::SockRef;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::net::UdpSocket;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
@@ -159,6 +161,9 @@ pub fn receive_and_play_bus_filtered_with_status_jitter_and_cipher(
 
     let socket = UdpSocket::bind(bind_addr)
         .map_err(|error| format!("failed to bind {bind_addr}: {error}"))?;
+    if let Err(error) = SockRef::from(&socket).set_recv_buffer_size(4 * 1024 * 1024) {
+        eprintln!("audio-core: could not increase bus UDP receive buffer: {error}");
+    }
 
     socket
         .set_read_timeout(Some(Duration::from_millis(200)))
@@ -183,7 +188,9 @@ pub fn receive_and_play_bus_filtered_with_status_jitter_and_cipher(
                 let raw_packet = &packet_buffer[..length];
                 let decrypted_buf: Vec<u8>;
                 let packet: &[u8] = if let Some(ref c) = cipher {
-                    if raw_packet.len() >= 6 && raw_packet[5] == network_core::protocol::PACKET_TYPE_AUDIO_ENCRYPTED {
+                    if raw_packet.len() >= 6
+                        && raw_packet[5] == network_core::protocol::PACKET_TYPE_AUDIO_ENCRYPTED
+                    {
                         match crate::crypto::decrypt_audio_packet(c, raw_packet) {
                             Ok(dec) => {
                                 decrypted_buf = dec;
@@ -204,7 +211,14 @@ pub fn receive_and_play_bus_filtered_with_status_jitter_and_cipher(
                             continue;
                         }
                     }
-                    if float32_payload(packet, &parsed).is_none() {
+                    if parsed.sample_format != SAMPLE_FORMAT_OPUS
+                        && float32_payload(packet, &parsed).is_none()
+                    {
+                        continue;
+                    }
+                    if parsed.sample_format == SAMPLE_FORMAT_OPUS
+                        && (parsed.sample_rate != 48_000 || opus_payload(packet, &parsed).is_none())
+                    {
                         continue;
                     }
                     break (
@@ -256,13 +270,18 @@ pub fn receive_and_play_bus_filtered_with_status_jitter_and_cipher(
         let mut resamplers = HashMap::new();
         let first_parsed = parse_packet(&first_packet)
             .ok_or_else(|| "first bus packet became invalid".to_string())?;
-        push_samples(
-            &buffers,
-            &mut resamplers,
-            &first_packet,
-            &first_parsed,
-            sample_rate,
-        )?;
+        let mut decoder = AudioPacketDecoder::new();
+        for frame in decoder.decode(&first_packet, &first_parsed)? {
+            push_pcm_samples(
+                &buffers,
+                &mut resamplers,
+                frame.packet.stream_id,
+                frame.packet.channel_count,
+                frame.packet.sample_rate,
+                sample_rate,
+                &frame.pcm,
+            )?;
+        }
 
         let writer: Option<SharedWavWriter> = match &record_path {
             Some(path) => Some(create_wav_writer(path, channel_count, sample_rate)?),
@@ -295,6 +314,7 @@ pub fn receive_and_play_bus_filtered_with_status_jitter_and_cipher(
             &mut packet_buffer,
             &buffers,
             &mut resamplers,
+            &mut decoder,
             channel_count,
             sample_rate,
             keep_running,
@@ -331,13 +351,18 @@ pub fn receive_and_play_bus_filtered_with_status_jitter_and_cipher(
     let mut resamplers = HashMap::new();
     let first_parsed =
         parse_packet(&first_packet).ok_or_else(|| "first bus packet became invalid".to_string())?;
-    push_samples(
-        &buffers,
-        &mut resamplers,
-        &first_packet,
-        &first_parsed,
-        output_sample_rate,
-    )?;
+    let mut decoder = AudioPacketDecoder::new();
+    for frame in decoder.decode(&first_packet, &first_parsed)? {
+        push_pcm_samples(
+            &buffers,
+            &mut resamplers,
+            frame.packet.stream_id,
+            frame.packet.channel_count,
+            frame.packet.sample_rate,
+            output_sample_rate,
+            &frame.pcm,
+        )?;
+    }
 
     if output_channels != input_channels {
         println!(
@@ -408,6 +433,7 @@ pub fn receive_and_play_bus_filtered_with_status_jitter_and_cipher(
         &mut packet_buffer,
         &buffers,
         &mut resamplers,
+        &mut decoder,
         channel_count,
         sample_rate,
         output_sample_rate,
@@ -428,6 +454,7 @@ pub fn receive_and_play_bus_filtered_with_status_jitter_and_cipher(
         &mut packet_buffer,
         &buffers,
         &mut resamplers,
+        &mut decoder,
         channel_count,
         output_sample_rate,
         keep_running,
@@ -504,6 +531,7 @@ fn prime_bus_buffers(
     packet_buffer: &mut [u8],
     buffers: &Arc<Mutex<HashMap<u32, VecDeque<f32>>>>,
     resamplers: &mut HashMap<u32, (u32, StreamingLinearResampler)>,
+    decoder: &mut AudioPacketDecoder,
     channel_count: u16,
     sample_rate: u32,
     output_sample_rate: u32,
@@ -515,7 +543,8 @@ fn prime_bus_buffers(
     let target_samples = ((output_sample_rate as f64 * jitter_target_secs) as usize)
         .saturating_mul(channel_count as usize);
 
-    let prime_deadline = Instant::now() + Duration::from_millis((jitter_target_secs * 1000.0 * 2.5).clamp(25.0, 500.0) as u64);
+    let prime_deadline = Instant::now()
+        + Duration::from_millis((jitter_target_secs * 1000.0 * 2.5).clamp(25.0, 500.0) as u64);
 
     while total_buffered_samples(buffers) < target_samples && Instant::now() < prime_deadline {
         if !keep_running.load(Ordering::Relaxed) {
@@ -527,7 +556,9 @@ fn prime_bus_buffers(
                 let raw_packet = &packet_buffer[..length];
                 let decrypted_buf: Vec<u8>;
                 let packet: &[u8] = if let Some(c) = cipher {
-                    if raw_packet.len() >= 6 && raw_packet[5] == network_core::protocol::PACKET_TYPE_AUDIO_ENCRYPTED {
+                    if raw_packet.len() >= 6
+                        && raw_packet[5] == network_core::protocol::PACKET_TYPE_AUDIO_ENCRYPTED
+                    {
                         match crate::crypto::decrypt_audio_packet(c, raw_packet) {
                             Ok(dec) => {
                                 decrypted_buf = dec;
@@ -550,9 +581,18 @@ fn prime_bus_buffers(
                     }
                     if parsed.channel_count as u16 == channel_count
                         && parsed.sample_rate == sample_rate
-                        && float32_payload(packet, &parsed).is_some()
                     {
-                        push_samples(buffers, resamplers, packet, &parsed, output_sample_rate)?;
+                        for frame in decoder.decode(packet, &parsed)? {
+                            push_pcm_samples(
+                                buffers,
+                                resamplers,
+                                frame.packet.stream_id,
+                                frame.packet.channel_count,
+                                frame.packet.sample_rate,
+                                output_sample_rate,
+                                &frame.pcm,
+                            )?;
+                        }
                     }
                 }
             }
@@ -607,7 +647,8 @@ fn handle_receive_event(
             let frames_per_packet = if *last_frames_per_packet > 0 {
                 *last_frames_per_packet
             } else {
-                network_core::protocol::max_float32_frames_per_packet(channel_count as usize).unwrap_or(58)
+                network_core::protocol::max_float32_frames_per_packet(channel_count as usize)
+                    .unwrap_or(58)
             };
             let total_frames = (count as usize) * frames_per_packet;
             let concealed = plc.synthesize_concealment(total_frames);
@@ -638,6 +679,7 @@ fn run_receive_loop(
     packet_buffer: &mut [u8],
     buffers: &Arc<Mutex<HashMap<u32, VecDeque<f32>>>>,
     resamplers: &mut HashMap<u32, (u32, StreamingLinearResampler)>,
+    decoder: &mut AudioPacketDecoder,
     channel_count: u16,
     output_sample_rate: u32,
     keep_running: Arc<AtomicBool>,
@@ -660,7 +702,9 @@ fn run_receive_loop(
     let mut plc = PacketLossConcealer::new(channel_count as usize);
     let mut last_frames_per_packet = 0usize;
 
-    socket.set_read_timeout(Some(Duration::from_millis(5))).map_err(|e| e.to_string())?;
+    socket
+        .set_read_timeout(Some(Duration::from_millis(5)))
+        .map_err(|e| e.to_string())?;
 
     while keep_running.load(Ordering::Relaxed) {
         let current_target_ms = jitter_target_ms
@@ -670,7 +714,7 @@ fn run_receive_loop(
             .clamp(3, 200);
 
         reorder_window.set_gap_timeout(Duration::from_millis(
-            (current_target_ms / 2).clamp(4, 40) as u64,
+            (current_target_ms / 2).clamp(4, 40) as u64
         ));
 
         for event in reorder_window.flush_expired_gap() {
@@ -692,6 +736,25 @@ fn run_receive_loop(
                 if error.kind() == std::io::ErrorKind::WouldBlock
                     || error.kind() == std::io::ErrorKind::TimedOut =>
             {
+                // The socket went quiet: emit any Opus frame that has been
+                // waiting for substreams, concealed, instead of stranding it.
+                for frame in decoder.flush_expired()? {
+                    let substream_count = (channel_count as usize).div_ceil(2) as u64;
+                    streams_seen.insert(frame.packet.stream_id);
+                    packets_received = packets_received.saturating_add(substream_count);
+                    interval_packets = interval_packets.saturating_add(substream_count as u32);
+                    handle_receive_event(
+                        ReceiveEvent::Packet(frame.packet, frame.pcm),
+                        buffers,
+                        resamplers,
+                        &mut plc,
+                        &mut last_frames_per_packet,
+                        channel_count,
+                        output_sample_rate,
+                        &mut packets_lost,
+                    )?;
+                }
+
                 continue;
             }
             Err(ref error) if error.kind() == std::io::ErrorKind::ConnectionReset => {
@@ -706,7 +769,9 @@ fn run_receive_loop(
 
         let decrypted_store: Vec<u8>;
         let packet: &[u8] = if let Some(ref c) = cipher {
-            if raw_packet.len() >= 6 && raw_packet[5] == network_core::protocol::PACKET_TYPE_AUDIO_ENCRYPTED {
+            if raw_packet.len() >= 6
+                && raw_packet[5] == network_core::protocol::PACKET_TYPE_AUDIO_ENCRYPTED
+            {
                 match crate::crypto::decrypt_audio_packet(c, raw_packet) {
                     Ok(dec) => {
                         decrypted_store = dec;
@@ -722,8 +787,10 @@ fn run_receive_loop(
                 if packet_type == PACKET_TYPE_FEC {
                     if let Some(fec) = parse_fec_packet(raw_packet) {
                         if target_stream_id.is_none() || target_stream_id == Some(fec.stream_id) {
-                            let payload = &raw_packet[fec.payload_offset..fec.payload_offset + fec.payload_len];
-                            if let Some((rec_pkt, rec_pcm)) = fec_decoder.decode_fec(&fec, payload) {
+                            let payload = &raw_packet
+                                [fec.payload_offset..fec.payload_offset + fec.payload_len];
+                            if let Some((rec_pkt, rec_pcm)) = fec_decoder.decode_fec(&fec, payload)
+                            {
                                 fec_recovered = fec_recovered.saturating_add(1);
                                 for event in reorder_window.push_recovered(rec_pkt, rec_pcm) {
                                     handle_receive_event(
@@ -756,10 +823,6 @@ fn run_receive_loop(
             }
         }
 
-        if float32_payload(packet, &parsed).is_none() {
-            continue;
-        }
-
         if parsed.channel_count as u16 != channel_count {
             eprintln!(
                 "audio-core: bus dropping packet from stream \
@@ -769,32 +832,58 @@ fn run_receive_loop(
             continue;
         }
 
-        let Some(payload) = float32_payload(packet, &parsed) else {
-            continue;
-        };
+        if parsed.sample_format == SAMPLE_FORMAT_OPUS {
+            let substream_count = (channel_count as usize).div_ceil(2) as u64;
+            for frame in decoder.decode(packet, &parsed)? {
+                streams_seen.insert(parsed.stream_id);
+                packets_received = packets_received.saturating_add(substream_count);
+                interval_packets = interval_packets.saturating_add(substream_count as u32);
+                handle_receive_event(
+                    ReceiveEvent::Packet(frame.packet, frame.pcm),
+                    buffers,
+                    resamplers,
+                    &mut plc,
+                    &mut last_frames_per_packet,
+                    channel_count,
+                    output_sample_rate,
+                    &mut packets_lost,
+                )?;
+            }
+        } else {
+            let Some(payload) = float32_payload(packet, &parsed) else {
+                continue;
+            };
+            fec_decoder.record_received(parsed.sequence_number, payload);
+            let Some(pcm) = decode_float32(packet, &parsed) else {
+                continue;
+            };
 
-        fec_decoder.record_received(parsed.sequence_number, payload);
+            streams_seen.insert(parsed.stream_id);
+            packets_received = packets_received.saturating_add(1);
+            interval_packets = interval_packets.saturating_add(1);
 
-        let Some(pcm) = decode_float32(packet, &parsed) else {
-            continue;
-        };
-
-        streams_seen.insert(parsed.stream_id);
-        packets_received = packets_received.saturating_add(1);
-        interval_packets = interval_packets.saturating_add(1);
-
-        for event in reorder_window.push(parsed.clone(), pcm) {
-            handle_receive_event(
-                event,
-                buffers,
-                resamplers,
-                &mut plc,
-                &mut last_frames_per_packet,
-                channel_count,
-                output_sample_rate,
-                &mut packets_lost,
-            )?;
+            for event in reorder_window.push(parsed.clone(), pcm) {
+                handle_receive_event(
+                    event,
+                    buffers,
+                    resamplers,
+                    &mut plc,
+                    &mut last_frames_per_packet,
+                    channel_count,
+                    output_sample_rate,
+                    &mut packets_lost,
+                )?;
+            }
         }
+
+        let mut guard = safe_lock(buffers);
+
+        if let Some(stream_buffer) = guard.get_mut(&parsed.stream_id) {
+            let max_queue_secs = ((current_target_ms as f64) * 3.5 / 1000.0).max(0.025);
+            let maximum_frames = (output_sample_rate as f64 * max_queue_secs) as usize;
+            trim_interleaved_queue(stream_buffer, maximum_frames, channel_count as usize);
+        }
+        drop(guard);
 
         if let Some(status) = &status_text {
             let elapsed = last_status_update.elapsed();
@@ -806,27 +895,36 @@ fn run_receive_loop(
                     100.0
                 };
                 let rate = interval_packets as f64 / elapsed.as_secs_f64();
-                let msg = if fec_recovered > 0 {
+                let mut msg = if fec_recovered > 0 {
                     format!("Receiving • {delivery_pct:.1}% delivered ({fec_recovered} recovered via FEC, {packets_lost} lost) • {rate:.0} pkts/s • {current_target_ms}ms buffer")
                 } else if packets_lost == 0 {
                     format!("Receiving • {delivery_pct:.1}% delivered (0 lost) • {rate:.0} pkts/s • {current_target_ms}ms buffer")
                 } else {
                     format!("Receiving • {delivery_pct:.1}% delivered ({packets_lost} lost) • {rate:.0} pkts/s • {current_target_ms}ms buffer")
                 };
+
+                // Opus traffic that never became audio, by reason, so a quiet
+                // or glitchy stream can be told apart from a rejected one.
+                let decode_stats = decoder.stats();
+
+                if decode_stats.duplicate_substreams
+                    + decode_stats.malformed_packets
+                    + decode_stats.concealed_substreams
+                    > 0
+                {
+                    msg.push_str(&format!(
+                        " • Opus drops: {} duplicate, {} malformed, {} concealed",
+                        decode_stats.duplicate_substreams,
+                        decode_stats.malformed_packets,
+                        decode_stats.concealed_substreams
+                    ));
+                }
                 if let Ok(mut guard) = status.lock() {
                     *guard = msg;
                 }
                 interval_packets = 0;
                 last_status_update = Instant::now();
             }
-        }
-
-        let mut guard = safe_lock(buffers);
-
-        if let Some(stream_buffer) = guard.get_mut(&parsed.stream_id) {
-            let max_queue_secs = ((current_target_ms as f64) * 3.5 / 1000.0).max(0.025);
-            let maximum_frames = (output_sample_rate as f64 * max_queue_secs) as usize;
-            trim_interleaved_queue(stream_buffer, maximum_frames, channel_count as usize);
         }
     }
 
@@ -853,6 +951,20 @@ fn run_receive_loop(
         streams_seen.len(),
         streams_seen
     );
+
+    let decode_stats = decoder.stats();
+    if decode_stats.duplicate_substreams
+        + decode_stats.malformed_packets
+        + decode_stats.concealed_substreams
+        > 0
+    {
+        println!(
+            "Opus drops: {} duplicate, {} malformed, {} concealed",
+            decode_stats.duplicate_substreams,
+            decode_stats.malformed_packets,
+            decode_stats.concealed_substreams
+        );
+    }
 
     Ok(())
 }
@@ -1020,39 +1132,67 @@ fn push_pcm_samples(
     Ok(())
 }
 
-fn push_samples(
-    buffers: &Arc<Mutex<HashMap<u32, VecDeque<f32>>>>,
-    resamplers: &mut HashMap<u32, (u32, StreamingLinearResampler)>,
-    packet: &[u8],
-    parsed: &ParsedPacket,
-    output_sample_rate: u32,
-) -> Result<(), String> {
-    let Some(payload) = float32_payload(packet, parsed) else {
-        return Err(format!(
-            "bus received unsupported or truncated payload from stream {}",
-            parsed.stream_id
-        ));
-    };
-
-    let input = payload
-        .chunks_exact(4)
-        .map(|bytes| f32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
-        .collect::<Vec<_>>();
-
-    push_pcm_samples(
-        buffers,
-        resamplers,
-        parsed.stream_id,
-        parsed.channel_count,
-        parsed.sample_rate,
-        output_sample_rate,
-        &input,
-    )
-}
-
 #[cfg(test)]
 mod tests {
     use super::remap_frame_into;
+    use crate::opus_receive::AudioPacketDecoder;
+    use network_core::opus::{MultichannelOpusEncoder, OPUS_FRAME_SAMPLES};
+    use network_core::protocol::{encode_opus_packet, parse_packet, PacketHeader};
+
+    #[test]
+    fn opus_receive_state_assembles_and_decodes_all_substreams_by_timestamp() {
+        let channels = 5;
+        let samples = (0..OPUS_FRAME_SAMPLES)
+            .flat_map(|frame| {
+                (0..channels)
+                    .map(move |channel| ((frame as f32 * 0.03) + channel as f32 * 0.2).sin() * 0.25)
+            })
+            .collect::<Vec<_>>();
+        let mut encoder = MultichannelOpusEncoder::new(channels, 128_000).unwrap();
+        let encoded = encoder.encode(&samples, 100).unwrap();
+        let mut decoder = AudioPacketDecoder::new();
+
+        let (first_index, first_sequence, first_payload) = &encoded[0];
+        let first = encode_opus_packet(
+            &PacketHeader {
+                sub_stream_index: *first_index,
+                stream_id: 71,
+                sequence_number: *first_sequence,
+                presentation_timestamp_ns: 10_000,
+            },
+            channels as u8,
+            48_000,
+            OPUS_FRAME_SAMPLES as u16,
+            first_payload,
+        )
+        .unwrap();
+        let parsed_first = parse_packet(&first).unwrap();
+        assert!(decoder.decode(&first, &parsed_first).unwrap().is_empty());
+
+        let mut decoded_frame = None;
+        for (index, sequence, payload) in encoded.iter().skip(1) {
+            let packet = encode_opus_packet(
+                &PacketHeader {
+                    sub_stream_index: *index,
+                    stream_id: 71,
+                    sequence_number: *sequence,
+                    presentation_timestamp_ns: 10_000,
+                },
+                channels as u8,
+                48_000,
+                OPUS_FRAME_SAMPLES as u16,
+                payload,
+            )
+            .unwrap();
+            let parsed = parse_packet(&packet).unwrap();
+            decoded_frame = decoder.decode(&packet, &parsed).unwrap().pop();
+        }
+
+        let frame = decoded_frame.expect("all substreams decode together");
+        assert_eq!(frame.packet.presentation_timestamp_ns, 10_000);
+        assert_eq!(frame.pcm.len(), OPUS_FRAME_SAMPLES * channels);
+        assert!(frame.pcm.iter().all(|sample| sample.is_finite()));
+    }
 
     #[test]
     fn remapping_groups_channels_without_allocating_per_frame_scratch() {

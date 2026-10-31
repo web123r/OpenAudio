@@ -1,6 +1,7 @@
 use crate::backend::get_backend;
 use crate::ensure_realtime_audio_thread;
-use crate::protocol::{float32_payload, parse_packet};
+use crate::opus_receive::AudioPacketDecoder;
+use crate::protocol::parse_packet;
 use crate::util::trim_interleaved_queue;
 use crate::{StreamingLinearResampler, JITTER_BUFFER_TARGET_SECS};
 use std::collections::VecDeque;
@@ -13,9 +14,11 @@ use std::time::{Duration, Instant};
 /// Milestone 4: real-time playback via a small jitter buffer, in
 /// place of the WAV file from Milestone 3.
 ///
-/// Note: this assumes the output device's default channel count and
-/// sample rate match what the sender is transmitting. Resampling for
-/// mismatched devices is a later milestone.
+/// Both Float32 PCM and Opus streams are accepted; the wire format is
+/// detected from the packets themselves.
+///
+/// Note: this assumes the output device's default channel count matches
+/// what the sender is transmitting. Sample-rate conversion is handled.
 pub fn receive_and_play(bind_addr: &str, duration_secs: u64) -> Result<(), String> {
     ensure_realtime_audio_thread();
     let socket =
@@ -33,34 +36,32 @@ pub fn receive_and_play(bind_addr: &str, duration_secs: u64) -> Result<(), Strin
     // buffer (old MTU-sized default) causes WSAEMSGSIZE the moment
     // more than ~9 channels are streamed in one packet.
     let mut buf = [0u8; 65536];
+    let mut decoder = AudioPacketDecoder::new();
 
-    // No initial value here on purpose -- the loop below always
-    // assigns this (via `Some(...)`) on the only path that exits
-    // it, so the compiler can prove it's initialized before the
-    // first real read, without us writing a throwaway `None` that
-    // gets silently discarded (that's what caused the warning).
-    let mut last_sequence: Option<u32>;
-    let mut packets_received = 0u32;
-    let mut packets_dropped = 0u32;
-
-    // Block until the first valid packet arrives, so we know channel
+    // Block until the first decodable audio arrives, so we know channel
     // count and sample rate before opening an output stream.
     let (channel_count, sample_rate) = loop {
-        let (len, _src) = socket
+        let len = socket
             .recv_from(&mut buf)
-            .map_err(|e| format!("recv error while waiting for first packet: {e}"))?;
-        if let Some(parsed) = parse_packet(&buf[..len]) {
-            let Some(payload) = float32_payload(&buf[..len], &parsed) else {
-                continue;
-            };
-            let mut jitter_buf = buffer.lock().unwrap();
-            for chunk in payload.chunks_exact(4) {
-                jitter_buf.push_back(f32::from_le_bytes(chunk.try_into().unwrap()));
-            }
-            last_sequence = Some(parsed.sequence_number);
-            packets_received += 1;
-            break (parsed.channel_count as u16, parsed.sample_rate);
+            .map(|(len, _src)| len)
+            .map_err(|error| format!("recv error while waiting for first packet: {error}"))?;
+        let Some(parsed) = parse_packet(&buf[..len]) else {
+            continue;
+        };
+        let Ok(frames) = decoder.decode(&buf[..len], &parsed) else {
+            continue;
+        };
+
+        if frames.is_empty() {
+            continue;
         }
+
+        let mut jitter_buf = buffer.lock().unwrap();
+        for frame in &frames {
+            jitter_buf.extend(frame.pcm.iter().copied());
+        }
+
+        break (parsed.channel_count as u16, parsed.sample_rate);
     };
 
     println!("Detected {channel_count}ch @ {sample_rate}Hz. Setting up playback...");
@@ -100,31 +101,38 @@ pub fn receive_and_play(bind_addr: &str, duration_secs: u64) -> Result<(), Strin
     let target_samples =
         ((output_sample_rate as f64 * JITTER_BUFFER_TARGET_SECS) as usize) * channel_count as usize;
     let prime_deadline = Instant::now() + Duration::from_millis(500);
+
+    let mut packets_received = 1u32;
+    let mut packets_dropped = 0u32;
+    let mut last_sequence = None;
+
     while buffer.lock().unwrap().len() < target_samples && Instant::now() < prime_deadline {
-        if let Ok((len, _src)) = socket.recv_from(&mut buf) {
-            if let Some(parsed) = parse_packet(&buf[..len]) {
-                if parsed.channel_count as u16 != channel_count || parsed.sample_rate != sample_rate
-                {
-                    continue;
-                }
-                let Some(payload) = float32_payload(&buf[..len], &parsed) else {
-                    continue;
-                };
-                if let Some(prev) = last_sequence {
-                    let expected = prev.wrapping_add(1);
-                    if parsed.sequence_number != expected {
-                        packets_dropped += parsed.sequence_number.wrapping_sub(expected);
-                    }
-                }
-                last_sequence = Some(parsed.sequence_number);
-                packets_received += 1;
-                let input = payload
-                    .chunks_exact(4)
-                    .map(|chunk| f32::from_le_bytes(chunk.try_into().unwrap()))
-                    .collect::<Vec<_>>();
-                let converted = resampler.process(&input)?;
-                buffer.lock().unwrap().extend(converted);
-            }
+        let Ok(len) = socket.recv_from(&mut buf).map(|(len, _)| len) else {
+            continue;
+        };
+        let Some(parsed) = parse_packet(&buf[..len]) else {
+            continue;
+        };
+        if parsed.channel_count as u16 != channel_count || parsed.sample_rate != sample_rate {
+            continue;
+        }
+        let Ok(frames) = decoder.decode(&buf[..len], &parsed) else {
+            continue;
+        };
+        if frames.is_empty() {
+            continue;
+        }
+
+        track_sequence(
+            parsed.sequence_number,
+            &mut last_sequence,
+            &mut packets_dropped,
+        );
+        packets_received += 1;
+
+        for frame in frames {
+            let converted = resampler.process(&frame.pcm)?;
+            buffer.lock().unwrap().extend(converted);
         }
     }
 
@@ -135,10 +143,25 @@ pub fn receive_and_play(bind_addr: &str, duration_secs: u64) -> Result<(), Strin
 
     let start = Instant::now();
     while start.elapsed().as_secs() < duration_secs {
-        let (len, _src) = match socket.recv_from(&mut buf) {
-            Ok(r) => r,
-            Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => continue,
-            Err(ref e) if e.kind() == std::io::ErrorKind::TimedOut => continue,
+        let len = match socket.recv_from(&mut buf) {
+            Ok((len, _src)) => len,
+            Err(ref e)
+                if e.kind() == std::io::ErrorKind::WouldBlock
+                    || e.kind() == std::io::ErrorKind::TimedOut =>
+            {
+                // The socket went quiet: emit any Opus frame that has been
+                // waiting for substreams, concealed, instead of stranding it.
+                for frame in decoder.flush_expired()? {
+                    let converted = resampler.process(&frame.pcm)?;
+                    let mut jitter_buf = buffer.lock().unwrap();
+                    jitter_buf.extend(converted);
+
+                    let max_frames = (output_sample_rate as f64 * 0.2) as usize;
+                    trim_interleaved_queue(&mut jitter_buf, max_frames, channel_count as usize);
+                }
+
+                continue;
+            }
             Err(e) => return Err(format!("recv error: {e}")),
         };
 
@@ -149,33 +172,48 @@ pub fn receive_and_play(bind_addr: &str, duration_secs: u64) -> Result<(), Strin
         if parsed.channel_count as u16 != channel_count || parsed.sample_rate != sample_rate {
             continue;
         }
-        let Some(payload) = float32_payload(&buf[..len], &parsed) else {
+        let Ok(frames) = decoder.decode(&buf[..len], &parsed) else {
             continue;
         };
-
-        if let Some(prev) = last_sequence {
-            let expected = prev.wrapping_add(1);
-            if parsed.sequence_number != expected {
-                packets_dropped += parsed.sequence_number.wrapping_sub(expected);
-            }
+        if frames.is_empty() {
+            continue;
         }
-        last_sequence = Some(parsed.sequence_number);
+
+        track_sequence(
+            parsed.sequence_number,
+            &mut last_sequence,
+            &mut packets_dropped,
+        );
         packets_received += 1;
 
-        let input = payload
-            .chunks_exact(4)
-            .map(|chunk| f32::from_le_bytes(chunk.try_into().unwrap()))
-            .collect::<Vec<_>>();
-        let converted = resampler.process(&input)?;
-        let mut jitter_buf = buffer.lock().unwrap();
-        jitter_buf.extend(converted);
+        for frame in frames {
+            let converted = resampler.process(&frame.pcm)?;
+            let mut jitter_buf = buffer.lock().unwrap();
+            jitter_buf.extend(converted);
 
-        // Cap buffer growth at ~200ms in case playback ever falls behind.
-        let max_frames = (output_sample_rate as f64 * 0.2) as usize;
-        trim_interleaved_queue(&mut jitter_buf, max_frames, channel_count as usize);
+            // Cap buffer growth at ~200ms in case playback ever falls behind.
+            let max_frames = (output_sample_rate as f64 * 0.2) as usize;
+            trim_interleaved_queue(&mut jitter_buf, max_frames, channel_count as usize);
+        }
     }
 
     drop(stream);
     println!("Done. {packets_received} packets received, ~{packets_dropped} dropped.");
     Ok(())
+}
+
+fn track_sequence(
+    sequence_number: u32,
+    last_sequence: &mut Option<u32>,
+    packets_dropped: &mut u32,
+) {
+    if let Some(previous) = *last_sequence {
+        let expected = previous.wrapping_add(1);
+        if sequence_number != expected {
+            *packets_dropped =
+                packets_dropped.saturating_add(sequence_number.wrapping_sub(expected));
+        }
+    }
+
+    *last_sequence = Some(sequence_number);
 }

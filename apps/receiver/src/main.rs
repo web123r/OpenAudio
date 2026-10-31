@@ -1,5 +1,6 @@
 use network_core::discovery::{
     NodeAdvertisement, CONTROL_PORT, DISCOVERY_MULTICAST_ADDR, DISCOVERY_PORT,
+    MAX_ADVERTISEMENT_BYTES,
 };
 use std::collections::HashMap;
 use std::env;
@@ -88,7 +89,7 @@ fn discover_streams(
         .map_err(|error| format!("failed to set discovery timeout: {error}"))?;
 
     let deadline = Instant::now() + timeout;
-    let mut buffer = [0u8; 4096];
+    let mut buffer = vec![0u8; MAX_ADVERTISEMENT_BYTES];
     let mut streams = HashMap::new();
 
     while Instant::now() < deadline {
@@ -115,14 +116,38 @@ fn discover_streams(
     Ok(streams)
 }
 
+#[cfg(test)]
 fn nominal_packet_rate(channels: u8, sample_rate: u32) -> Result<f64, String> {
+    nominal_packet_rate_for_format(
+        channels,
+        sample_rate,
+        network_core::protocol::SAMPLE_FORMAT_FLOAT32,
+    )
+}
+
+fn nominal_packet_rate_for_format(
+    channels: u8,
+    sample_rate: u32,
+    sample_format: u8,
+) -> Result<f64, String> {
     if sample_rate == 0 {
         return Err("cannot calculate packet rate for a zero sample rate".to_string());
     }
+    let rate = match sample_format {
+        network_core::protocol::SAMPLE_FORMAT_OPUS => {
+            let packets_per_frame = (channels as usize).div_ceil(2);
+            sample_rate as f64 / network_core::opus::OPUS_FRAME_SAMPLES as f64
+                * packets_per_frame as f64
+        }
+        network_core::protocol::SAMPLE_FORMAT_FLOAT32 => {
+            let frames_per_packet =
+                network_core::protocol::max_float32_frames_per_packet(channels as usize)?;
+            sample_rate as f64 / frames_per_packet as f64
+        }
+        _ => return Err(format!("unsupported sample format 0x{sample_format:02x}")),
+    };
 
-    let frames_per_packet =
-        network_core::protocol::max_float32_frames_per_packet(channels as usize)?;
-    Ok(sample_rate as f64 / frames_per_packet as f64)
+    Ok(rate)
 }
 
 fn inspect_stream(
@@ -146,13 +171,19 @@ fn inspect_stream(
     let mut dropped = 0u64;
     let mut received_frames = 0u64;
     let mut format = None;
+    let mut sample_format = None;
 
     while Instant::now() < deadline {
         match receiver.next_event()? {
             Some(ReceiveEvent::Packet(packet, _pcm)) => {
-                packets += 1;
+                packets += if packet.sample_format == network_core::protocol::SAMPLE_FORMAT_OPUS {
+                    (packet.channel_count as u64).div_ceil(2)
+                } else {
+                    1
+                };
                 received_frames = received_frames.saturating_add(packet.samples_per_channel as u64);
                 format = Some((packet.channel_count, packet.sample_rate));
+                sample_format = Some(packet.sample_format);
                 if packets % 100 == 0 {
                     println!(
                         "source={publisher} packets={packets} dropped={dropped} \
@@ -184,8 +215,10 @@ fn inspect_stream(
         .filter(|(_, sample_rate)| *sample_rate > 0)
         .map(|(_, sample_rate)| received_frames as f64 / sample_rate as f64)
         .unwrap_or(0.0);
-    let nominal_packets_per_second = match format {
-        Some((channels, sample_rate)) => nominal_packet_rate(channels, sample_rate)?,
+    let nominal_packets_per_second = match (format, sample_format) {
+        (Some((channels, sample_rate)), Some(sample_format)) => {
+            nominal_packet_rate_for_format(channels, sample_rate, sample_format)?
+        }
         _ => 0.0,
     };
     let nominal_expected_packets = nominal_packets_per_second * elapsed_seconds;
@@ -282,7 +315,8 @@ fn play_stream(
                     let frames_per_packet = if last_packet_frames > 0 {
                         last_packet_frames
                     } else if let Some((channels, _)) = format {
-                        network_core::protocol::max_float32_frames_per_packet(channels as usize).unwrap_or(58)
+                        network_core::protocol::max_float32_frames_per_packet(channels as usize)
+                            .unwrap_or(58)
                     } else {
                         58
                     };
@@ -294,7 +328,11 @@ fn play_stream(
                             jitter_buf.extend(to_push);
                             if let Some((channels, _)) = format {
                                 let max_frames = (output_sample_rate as f64 * 0.2) as usize;
-                                trim_interleaved_queue(&mut jitter_buf, max_frames, channels as usize);
+                                trim_interleaved_queue(
+                                    &mut jitter_buf,
+                                    max_frames,
+                                    channels as usize,
+                                );
                             }
                         }
                     }
@@ -307,7 +345,9 @@ fn play_stream(
                 validate_output_channel_count(channels, output_channels)?;
 
                 format = Some((channels, sample_rate));
-                plc = Some(network_core::plc::PacketLossConcealer::new(channels as usize));
+                plc = Some(network_core::plc::PacketLossConcealer::new(
+                    channels as usize,
+                ));
                 resampler = Some(StreamingLinearResampler::new(
                     channels as usize,
                     sample_rate,
@@ -459,6 +499,11 @@ mod tests {
     fn nominal_packet_rate_reports_expected_64_channel_rate() {
         assert_eq!(nominal_packet_rate(64, 48_000).unwrap(), 12_000.0);
         assert!((nominal_packet_rate(2, 48_000).unwrap() - 48_000.0 / 146.0).abs() < 0.001);
+        assert_eq!(
+            nominal_packet_rate_for_format(4, 48_000, network_core::protocol::SAMPLE_FORMAT_OPUS)
+                .unwrap(),
+            200.0
+        );
         assert!(nominal_packet_rate(2, 0).is_err());
     }
 

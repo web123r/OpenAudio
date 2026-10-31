@@ -12,12 +12,12 @@
 //! - Verify that packets remain below the fragmentation limit.
 //! - Distinguish publisher/network problems from capture problems.
 
-use crate::discovery::{start_advertising, SubscriberRegistry};
+use crate::discovery::{start_advertising_with_format, SubscriberRegistry};
 use crate::ensure_realtime_audio_thread;
 use crate::protocol::{
     sample_rate_to_code, AudioPayloadHeader, PacketHeader, SAMPLE_FORMAT_FLOAT32,
 };
-use crate::{register_scoped_signal_meter, SignalDirection};
+use crate::{register_scoped_signal_meter, OpusMultichannelEncoder, SignalDirection};
 
 use socket2::SockRef;
 use std::f64::consts::TAU;
@@ -45,6 +45,12 @@ const MAX_CATCH_UP_MILLISECONDS: u32 = 20;
 /// output does not immediately clip.
 const TEST_SIGNAL_AMPLITUDE: f64 = 0.20;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DiagnosticTransportFormat {
+    Float32,
+    Opus,
+}
+
 /// Configuration for a synthetic OpenAudio publisher.
 #[derive(Debug, Clone)]
 pub struct DiagnosticPublishConfig {
@@ -53,6 +59,8 @@ pub struct DiagnosticPublishConfig {
     pub stream_id: u32,
     pub channel_count: usize,
     pub sample_rate: u32,
+    pub transport_format: DiagnosticTransportFormat,
+    pub opus_bitrate_per_stream_bps: i32,
 }
 
 impl DiagnosticPublishConfig {
@@ -69,10 +77,22 @@ impl DiagnosticPublishConfig {
             stream_id,
             channel_count,
             sample_rate,
+            transport_format: DiagnosticTransportFormat::Float32,
+            opus_bitrate_per_stream_bps: 128_000,
         };
 
         config.validate()?;
         Ok(config)
+    }
+
+    pub fn with_opus(mut self, bitrate_per_stream_bps: i32) -> Result<Self, String> {
+        if self.sample_rate != 48_000 {
+            return Err("Opus diagnostic publishing currently requires 48 kHz".to_string());
+        }
+        self.transport_format = DiagnosticTransportFormat::Opus;
+        self.opus_bitrate_per_stream_bps = bitrate_per_stream_bps.max(6_000);
+        self.validate()?;
+        Ok(self)
     }
 
     pub fn validate(&self) -> Result<(), String> {
@@ -238,13 +258,20 @@ pub fn publish_diagnostic_stream_with_discovery(
 
     let advertised_channels = config.channel_count as u8;
 
+    let advertised_format = match config.transport_format {
+        DiagnosticTransportFormat::Opus => network_core::protocol::SAMPLE_FORMAT_OPUS,
+        DiagnosticTransportFormat::Float32 => network_core::protocol::SAMPLE_FORMAT_FLOAT32,
+    };
+
     std::thread::spawn(move || {
-        if let Err(error) = start_advertising(
+        if let Err(error) = start_advertising_with_format(
             advertising_node_name,
             advertising_stream_id,
             advertising_stream_name,
             advertised_channels,
+            crate::discovery::default_channel_labels(advertised_channels),
             crate::discovery::CONTROL_PORT,
+            advertised_format,
             advertising_flag,
         ) {
             eprintln!(
@@ -274,6 +301,14 @@ pub fn publish_diagnostic_stream_with_discovery(
     let mut interleaved_samples = Vec::<f32>::with_capacity(sample_capacity);
 
     let mut packet = Vec::<u8>::with_capacity(maximum_packet_bytes);
+    let mut opus_encoder = if config.transport_format == DiagnosticTransportFormat::Opus {
+        Some(OpusMultichannelEncoder::new(
+            config.channel_count,
+            config.opus_bitrate_per_stream_bps,
+        )?)
+    } else {
+        None
+    };
 
     println!(
         "Diagnostic Publish: '{}' / '{}' (stream {})",
@@ -297,15 +332,27 @@ pub fn publish_diagnostic_stream_with_discovery(
     println!("Diagnostic Publish: waiting for a subscriber...");
 
     let mut had_subscriber = false;
+    let mut last_incompatible_report = 0usize;
 
     while keep_running.load(Ordering::Relaxed) {
-        let destinations =
-            crate::discovery::active_subscribers(&subscribers_by_stream, config.stream_id)
-                .filter(|addresses| !addresses.is_empty());
+        let destinations = crate::discovery::active_subscribers_for_format(
+            &subscribers_by_stream,
+            config.stream_id,
+            advertised_format,
+        );
+        crate::transmit::report_incompatible_subscribers(
+            config.stream_id,
+            match config.transport_format {
+                DiagnosticTransportFormat::Opus => crate::PublishFormat::Opus,
+                DiagnosticTransportFormat::Float32 => crate::PublishFormat::Float32,
+            },
+            destinations.skipped_incompatible,
+            &mut last_incompatible_report,
+        );
 
         let elapsed_target_frames = elapsed_frames(start.elapsed(), config.sample_rate);
 
-        if destinations.is_none() {
+        if destinations.addresses.is_empty() {
             if let Some(subscriber_start) = subscriber_started_at.take() {
                 report.subscriber_elapsed += subscriber_start.elapsed();
             }
@@ -351,7 +398,7 @@ pub fn publish_diagnostic_stream_with_discovery(
             subscriber_started_at = Some(Instant::now());
         }
 
-        let destinations = destinations.unwrap_or_default();
+        let destinations = destinations.addresses;
 
         if elapsed_target_frames <= generated_timeline_frames {
             wait_for_next_audio_frame(start, generated_timeline_frames, config.sample_rate);
@@ -381,7 +428,15 @@ pub fn publish_diagnostic_stream_with_discovery(
 
         let frames_due = elapsed_target_frames - generated_timeline_frames;
 
-        let frames_to_generate = (frames_due as usize).min(maximum_frames_per_packet);
+        let frames_to_generate = if config.transport_format == DiagnosticTransportFormat::Opus {
+            if frames_due < crate::opus_codec::OPUS_FRAME_SAMPLES as u64 {
+                wait_for_next_audio_frame(start, generated_timeline_frames, config.sample_rate);
+                continue;
+            }
+            crate::opus_codec::OPUS_FRAME_SAMPLES
+        } else {
+            (frames_due as usize).min(maximum_frames_per_packet)
+        };
 
         if frames_to_generate == 0 {
             std::thread::sleep(IDLE_SLEEP);
@@ -403,55 +458,95 @@ pub fn publish_diagnostic_stream_with_discovery(
         let presentation_timestamp_ns =
             frames_to_nanoseconds(generated_timeline_frames, config.sample_rate);
 
-        build_audio_packet(
-            &mut packet,
-            config.stream_id,
-            sequence_number,
-            presentation_timestamp_ns,
-            config.channel_count,
-            sample_rate_code,
-            frames_to_generate,
-            &interleaved_samples,
-        )?;
+        if config.transport_format == DiagnosticTransportFormat::Opus {
+            let Some(encoder) = opus_encoder.as_mut() else {
+                return Err("Opus diagnostic encoder was not initialized".to_string());
+            };
 
-        if packet.len() > SAFE_UDP_PAYLOAD_BYTES {
-            return Err(format!(
-                "diagnostic publisher generated a \
-                 {}-byte UDP payload, exceeding the \
-                 configured safe limit of {} bytes",
-                packet.len(),
-                SAFE_UDP_PAYLOAD_BYTES
-            ));
-        }
+            let encoded_packets = encoder.encode(&interleaved_samples, sequence_number)?;
+            for (substream_index, substream_sequence, opus_payload) in encoded_packets {
+                let opus_packet = network_core::protocol::encode_opus_packet(
+                    &network_core::protocol::PacketHeader {
+                        sub_stream_index: substream_index,
+                        stream_id: config.stream_id,
+                        sequence_number: substream_sequence,
+                        presentation_timestamp_ns,
+                    },
+                    config.channel_count as u8,
+                    config.sample_rate,
+                    crate::opus_codec::OPUS_FRAME_SAMPLES as u16,
+                    &opus_payload,
+                )?;
+                packet.extend_from_slice(&opus_packet[24..]);
 
-        report.packets_built = report.packets_built.saturating_add(1);
+                report.packets_built = report.packets_built.saturating_add(1);
 
-        for destination in &destinations {
-            match socket.send_to(&packet, destination) {
-                Ok(bytes_sent) if bytes_sent == packet.len() => {
-                    report.datagrams_sent = report.datagrams_sent.saturating_add(1);
-                }
-
-                Ok(bytes_sent) => {
-                    report.send_errors = report.send_errors.saturating_add(1);
-
-                    eprintln!(
-                        "audio-core: partial diagnostic \
-                         UDP send to {destination}: sent \
-                         {bytes_sent} of {} bytes",
-                        packet.len()
-                    );
-                }
-
-                Err(error) => {
-                    report.send_errors = report.send_errors.saturating_add(1);
-
-                    eprintln!(
-                        "audio-core: diagnostic UDP send \
-                         to {destination} failed: {error}"
-                    );
+                for destination in &destinations {
+                    match socket.send_to(&opus_packet, destination) {
+                        Ok(bytes_sent) if bytes_sent == opus_packet.len() => {
+                            report.datagrams_sent = report.datagrams_sent.saturating_add(1);
+                        }
+                        Ok(bytes_sent) => {
+                            report.send_errors = report.send_errors.saturating_add(1);
+                            eprintln!(
+                                "audio-core: partial Opus diagnostic UDP send to {destination}: sent {bytes_sent} of {} bytes",
+                                opus_packet.len()
+                            );
+                        }
+                        Err(error) => {
+                            report.send_errors = report.send_errors.saturating_add(1);
+                            eprintln!(
+                                "audio-core: Opus diagnostic UDP send to {destination} failed: {error}"
+                            );
+                        }
+                    }
                 }
             }
+
+            sequence_number = sequence_number.wrapping_add(((config.channel_count + 1) / 2) as u32);
+        } else {
+            build_audio_packet(
+                &mut packet,
+                config.stream_id,
+                sequence_number,
+                presentation_timestamp_ns,
+                config.channel_count,
+                sample_rate_code,
+                frames_to_generate,
+                &interleaved_samples,
+            )?;
+
+            if packet.len() > SAFE_UDP_PAYLOAD_BYTES {
+                return Err(format!(
+                    "diagnostic publisher generated a {}-byte UDP payload, exceeding the configured safe limit of {} bytes",
+                    packet.len(), SAFE_UDP_PAYLOAD_BYTES
+                ));
+            }
+
+            report.packets_built = report.packets_built.saturating_add(1);
+
+            for destination in &destinations {
+                match socket.send_to(&packet, destination) {
+                    Ok(bytes_sent) if bytes_sent == packet.len() => {
+                        report.datagrams_sent = report.datagrams_sent.saturating_add(1);
+                    }
+                    Ok(bytes_sent) => {
+                        report.send_errors = report.send_errors.saturating_add(1);
+                        eprintln!(
+                            "audio-core: partial diagnostic UDP send to {destination}: sent {bytes_sent} of {} bytes",
+                            packet.len()
+                        );
+                    }
+                    Err(error) => {
+                        report.send_errors = report.send_errors.saturating_add(1);
+                        eprintln!(
+                            "audio-core: diagnostic UDP send to {destination} failed: {error}"
+                        );
+                    }
+                }
+            }
+
+            sequence_number = sequence_number.wrapping_add(1);
         }
 
         report.generated_frames = report
@@ -884,6 +979,8 @@ mod tests {
             stream_id: 9_001,
             channel_count: 32,
             sample_rate: 123_456,
+            transport_format: DiagnosticTransportFormat::Float32,
+            opus_bitrate_per_stream_bps: 128_000,
         };
 
         assert!(config.validate().is_err());
@@ -897,6 +994,8 @@ mod tests {
             stream_id: 9_001,
             channel_count: 0,
             sample_rate: 48_000,
+            transport_format: DiagnosticTransportFormat::Float32,
+            opus_bitrate_per_stream_bps: 128_000,
         };
 
         assert!(config.validate().is_err());

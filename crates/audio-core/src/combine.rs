@@ -1,7 +1,7 @@
 use crate::backend::get_backend;
 use crate::crypto::StreamCipher;
 use crate::devices::is_skip;
-use crate::discovery::SubscriberRegistry;
+use crate::discovery::{active_subscribers_accept_opus, SubscriberRegistry};
 use crate::ensure_realtime_audio_thread;
 use crate::protocol::{
     sample_rate_to_code, AudioPayloadHeader, PacketHeader, SAMPLE_FORMAT_FLOAT32,
@@ -10,8 +10,10 @@ use crate::recording::{
     create_wav_writer, finalize as finalize_recording, generate_record_path, write_samples,
     SharedWavWriter,
 };
+use crate::transmit::PublishFormat;
 use crate::util::BoundedAudioQueue;
-use crate::{register_scoped_signal_meter, SignalDirection};
+use crate::{register_scoped_signal_meter, SignalDirection, StreamingLinearResampler};
+use network_core::opus::{MultichannelOpusEncoder, OPUS_FRAME_SAMPLES};
 use std::collections::VecDeque;
 use std::net::UdpSocket;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
@@ -53,7 +55,29 @@ pub fn capture_and_combine_with_discovery(
     record_each_channel: bool,
     keep_running: Arc<AtomicBool>,
 ) -> Result<(), String> {
-    capture_and_combine_with_labels(
+    capture_and_combine_with_discovery_format(
+        node_name,
+        stream_name,
+        stream_id,
+        sources,
+        subscribers_by_stream,
+        record_each_channel,
+        keep_running,
+        PublishFormat::Float32,
+    )
+}
+
+pub fn capture_and_combine_with_discovery_format(
+    node_name: String,
+    stream_name: String,
+    stream_id: u32,
+    sources: Vec<ChannelSource>,
+    subscribers_by_stream: SubscriberRegistry,
+    record_each_channel: bool,
+    keep_running: Arc<AtomicBool>,
+    format: PublishFormat,
+) -> Result<(), String> {
+    capture_and_combine_with_labels_format(
         node_name,
         stream_name,
         stream_id,
@@ -62,6 +86,7 @@ pub fn capture_and_combine_with_discovery(
         record_each_channel,
         None,
         keep_running,
+        format,
     )
 }
 
@@ -75,7 +100,31 @@ pub fn capture_and_combine_with_labels(
     channel_labels: Option<Vec<String>>,
     keep_running: Arc<AtomicBool>,
 ) -> Result<(), String> {
-    capture_and_combine_with_labels_encrypted(
+    capture_and_combine_with_labels_format(
+        node_name,
+        stream_name,
+        stream_id,
+        sources,
+        subscribers_by_stream,
+        record_each_channel,
+        channel_labels,
+        keep_running,
+        PublishFormat::Float32,
+    )
+}
+
+pub fn capture_and_combine_with_labels_format(
+    node_name: String,
+    stream_name: String,
+    stream_id: u32,
+    sources: Vec<ChannelSource>,
+    subscribers_by_stream: SubscriberRegistry,
+    record_each_channel: bool,
+    channel_labels: Option<Vec<String>>,
+    keep_running: Arc<AtomicBool>,
+    format: PublishFormat,
+) -> Result<(), String> {
+    capture_and_combine_with_labels_encrypted_format(
         node_name,
         stream_name,
         stream_id,
@@ -85,6 +134,7 @@ pub fn capture_and_combine_with_labels(
         channel_labels,
         None,
         keep_running,
+        format,
     )
 }
 
@@ -99,9 +149,39 @@ pub fn capture_and_combine_with_labels_encrypted(
     cipher: Option<Arc<StreamCipher>>,
     keep_running: Arc<AtomicBool>,
 ) -> Result<(), String> {
+    capture_and_combine_with_labels_encrypted_format(
+        node_name,
+        stream_name,
+        stream_id,
+        sources,
+        subscribers_by_stream,
+        record_each_channel,
+        channel_labels,
+        cipher,
+        keep_running,
+        PublishFormat::Float32,
+    )
+}
+
+pub fn capture_and_combine_with_labels_encrypted_format(
+    node_name: String,
+    stream_name: String,
+    stream_id: u32,
+    sources: Vec<ChannelSource>,
+    subscribers_by_stream: SubscriberRegistry,
+    record_each_channel: bool,
+    channel_labels: Option<Vec<String>>,
+    cipher: Option<Arc<StreamCipher>>,
+    keep_running: Arc<AtomicBool>,
+    format: PublishFormat,
+) -> Result<(), String> {
     ensure_realtime_audio_thread();
 
     let channel_count = sources.len();
+    let format = format.resolve(
+        channel_count,
+        active_subscribers_accept_opus(&subscribers_by_stream, stream_id),
+    );
 
     if channel_count == 0 {
         return Err("no sources provided".to_string());
@@ -111,9 +191,20 @@ pub fn capture_and_combine_with_labels_encrypted(
         return Err("channel count exceeds protocol limit of 255".to_string());
     }
 
-    let max_frames_per_packet =
+    if format == PublishFormat::Opus && channel_count == 0 {
+        return Err("Opus combine requires at least one channel".to_string());
+    }
+    if format == PublishFormat::Opus && channel_count > 64 {
+        return Err(format!(
+            "Opus supports up to 64 channels, got {channel_count}"
+        ));
+    }
+    let max_frames_per_packet = if format == PublishFormat::Opus {
+        OPUS_FRAME_SAMPLES
+    } else {
         network_core::protocol::max_float32_frames_per_packet(channel_count)?
-            .min(MAX_FRAMES_PER_PACKET);
+            .min(MAX_FRAMES_PER_PACKET)
+    };
 
     let mut slots = Vec::<ChannelSlot>::with_capacity(channel_count);
     let backend = get_backend();
@@ -245,7 +336,7 @@ pub fn capture_and_combine_with_labels_encrypted(
     }
 
     // The pacing clock comes from the first active device.
-    let sample_rate = slots
+    let source_sample_rate = slots
         .iter()
         .find_map(|slot| match slot {
             ChannelSlot::Active(channel) => Some(channel.sample_rate),
@@ -259,22 +350,35 @@ pub fn capture_and_combine_with_labels_encrypted(
 
     for slot in &slots {
         if let ChannelSlot::Active(channel) = slot {
-            if channel.sample_rate != sample_rate {
+            if channel.sample_rate != source_sample_rate {
                 return Err(format!(
                     "channel '{}' runs at {}Hz but another \
                      active channel runs at {}Hz — all \
                      active channels must share one sample \
                      rate",
-                    channel.label, channel.sample_rate, sample_rate
+                    channel.label, channel.sample_rate, source_sample_rate
                 ));
             }
         }
     }
 
-    let sample_rate_code = sample_rate_to_code(sample_rate);
+    let wire_sample_rate = if format == PublishFormat::Opus {
+        48_000
+    } else {
+        source_sample_rate
+    };
+    let sample_rate_code = sample_rate_to_code(wire_sample_rate);
 
+    if format == PublishFormat::Opus && sample_rate_code == 0 {
+        return Err(format!(
+            "unsupported Opus wire sample rate: {wire_sample_rate}"
+        ));
+    }
     if sample_rate_code == 0 {
-        return Err(format!("unsupported sample rate: {sample_rate}"));
+        return Err(format!("unsupported sample rate: {wire_sample_rate}"));
+    }
+    if format == PublishFormat::Opus {
+        println!("Combine: Opus selected; capture audio is resampled to 48 kHz in the combine publisher.");
     }
 
     // Register before moving node_name and stream_name into the
@@ -297,18 +401,22 @@ pub fn capture_and_combine_with_labels_encrypted(
     });
 
     let is_encrypted = cipher.is_some();
+    let advertised_format = format.wire_sample_format();
     std::thread::spawn(move || {
-        if let Err(error) = crate::discovery::start_advertising_with_labels_and_active_encrypted(
-            node_name,
-            stream_id,
-            stream_name,
-            advertised_channel_count,
-            labels,
-            crate::discovery::CONTROL_PORT,
-            is_encrypted,
-            advertising_keep_running.clone(),
-            advertising_keep_running,
-        ) {
+        if let Err(error) =
+            crate::discovery::start_advertising_with_labels_and_active_encrypted_format(
+                node_name,
+                stream_id,
+                stream_name,
+                advertised_channel_count,
+                labels,
+                crate::discovery::CONTROL_PORT,
+                is_encrypted,
+                advertised_format,
+                advertising_keep_running.clone(),
+                advertising_keep_running,
+            )
+        {
             eprintln!("audio-core: advertising stopped: {error}");
         }
     });
@@ -321,11 +429,33 @@ pub fn capture_and_combine_with_labels_encrypted(
 
     println!(
         "Combining {channel_count} channel(s) @ \
-         {sample_rate}Hz into stream {stream_id}..."
+         {wire_sample_rate}Hz into stream {stream_id}..."
     );
 
     let poll_interval = Duration::from_millis(2);
     let mut last_drop_report = Instant::now();
+    let mut opus_encoder = if format == PublishFormat::Opus {
+        Some(MultichannelOpusEncoder::new(channel_count, 64_000)?)
+    } else {
+        None
+    };
+    let mut opus_resamplers = if format == PublishFormat::Opus && source_sample_rate != 48_000 {
+        let mut resamplers = Vec::with_capacity(channel_count);
+        for _ in 0..channel_count {
+            resamplers.push(StreamingLinearResampler::new(
+                1,
+                source_sample_rate,
+                48_000,
+            )?);
+        }
+        Some(resamplers)
+    } else {
+        None
+    };
+    let mut opus_pending: Vec<f32> = Vec::new();
+    let mut opus_pending_timestamp_ns: Option<u64> = None;
+    let mut opus_sequence: u32 = 0;
+    let mut last_incompatible_report = 0usize;
 
     while keep_running.load(Ordering::Relaxed) {
         for slot in &mut slots {
@@ -375,8 +505,17 @@ pub fn capture_and_combine_with_labels_encrypted(
 
         let frames_to_send = available_frames.min(max_frames_per_packet);
 
-        let destinations = crate::discovery::active_subscribers(&subscribers_by_stream, stream_id)
-            .filter(|addresses| !addresses.is_empty());
+        let destinations = crate::discovery::active_subscribers_for_format(
+            &subscribers_by_stream,
+            stream_id,
+            format.wire_sample_format(),
+        );
+        crate::transmit::report_incompatible_subscribers(
+            stream_id,
+            format,
+            destinations.skipped_incompatible,
+            &mut last_incompatible_report,
+        );
 
         // Always drain active capture buffers, including when no
         // subscriber is connected, to keep latency and memory bounded.
@@ -409,13 +548,87 @@ pub fn capture_and_combine_with_labels_encrypted(
         // when no receiver is currently subscribed.
         signal_meter.observe_interleaved(&interleaved, channel_count);
 
-        let Some(destinations) = destinations else {
+        let presentation_timestamp_ns = clock_start.elapsed().as_nanos() as u64;
+
+        if format == PublishFormat::Opus {
+            let combined_resampled = if let Some(ref mut resamplers) = opus_resamplers {
+                let mut per_channel_resampled: Vec<Vec<f32>> = vec![vec![]; channel_count];
+                for channel_index in 0..channel_count {
+                    per_channel_resampled[channel_index] =
+                        resamplers[channel_index].process(&per_channel_samples[channel_index])?;
+                }
+                let resampled_frames = if per_channel_resampled.is_empty() {
+                    0
+                } else {
+                    per_channel_resampled[0].len()
+                };
+                let mut out = Vec::with_capacity(resampled_frames * channel_count);
+                for frame_idx in 0..resampled_frames {
+                    for channel_index in 0..channel_count {
+                        out.push(per_channel_resampled[channel_index][frame_idx]);
+                    }
+                }
+                out
+            } else {
+                interleaved.clone()
+            };
+            if opus_pending.is_empty() {
+                opus_pending_timestamp_ns = Some(presentation_timestamp_ns);
+            }
+            opus_pending.extend(combined_resampled);
+            let frame_samples = OPUS_FRAME_SAMPLES * channel_count;
+            while opus_pending.len() >= frame_samples {
+                let frame: Vec<f32> = opus_pending.drain(..frame_samples).collect();
+                let timestamp_ns = opus_pending_timestamp_ns.unwrap_or(presentation_timestamp_ns);
+                let Some(encoder) = opus_encoder.as_mut() else {
+                    break;
+                };
+                let substream_count = (channel_count as u32).div_ceil(2);
+                let sequence_start = opus_sequence;
+                opus_sequence = opus_sequence.wrapping_add(substream_count);
+                let encoded = encoder.encode(&frame, sequence_start)?;
+                if !destinations.addresses.is_empty() {
+                    for (sub_stream_index, seq_num, payload) in encoded {
+                        let header = PacketHeader {
+                            sub_stream_index,
+                            stream_id,
+                            sequence_number: seq_num,
+                            presentation_timestamp_ns: timestamp_ns,
+                        };
+                        let packet = network_core::protocol::encode_opus_packet(
+                            &header,
+                            channel_count as u8,
+                            48_000,
+                            OPUS_FRAME_SAMPLES as u16,
+                            &payload,
+                        )?;
+                        let packet_to_send = if let Some(ref c) = cipher {
+                            crate::crypto::encrypt_audio_packet(c, &packet)?
+                        } else {
+                            packet
+                        };
+                        for destination in &destinations.addresses {
+                            if let Err(error) = socket.send_to(&packet_to_send, destination) {
+                                eprintln!("audio-core: Opus send to {destination} failed: {error}");
+                            }
+                        }
+                    }
+                }
+                opus_pending_timestamp_ns = if opus_pending.len() >= frame_samples {
+                    Some(timestamp_ns.saturating_add(network_core::opus::OPUS_FRAME_DURATION_NS))
+                } else {
+                    None
+                };
+            }
             continue;
-        };
+        }
+
+        if destinations.addresses.is_empty() {
+            continue;
+        }
+        let destinations = destinations.addresses;
 
         let sequence_number = sequence.fetch_add(1, Ordering::Relaxed);
-
-        let presentation_timestamp_ns = clock_start.elapsed().as_nanos() as u64;
 
         let packet_header = PacketHeader {
             sub_stream_index: 0,

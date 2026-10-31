@@ -1,3 +1,5 @@
+#![allow(clippy::too_many_arguments)]
+
 /// Fixed 24-byte OpenAudio packet header, per protocol spec section 3.1.
 pub struct PacketHeader {
     pub sub_stream_index: u16,
@@ -68,7 +70,7 @@ pub struct AudioPayloadHeader {
 }
 
 pub const SAMPLE_FORMAT_FLOAT32: u8 = 0x03;
-/// Reserved wire-format identifier; no OpenAudio Opus encoder/decoder is implemented.
+/// Wire-format identifier for 48 kHz, 10 ms Opus frames.
 pub const SAMPLE_FORMAT_OPUS: u8 = 0x10;
 /// Reserved wire-format identifier; no OpenAudio FLAC encoder/decoder is implemented.
 pub const SAMPLE_FORMAT_FLAC: u8 = 0x11;
@@ -113,6 +115,7 @@ pub fn sample_rate_to_code(rate: u32) -> u16 {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ParsedPacket {
+    pub sub_stream_index: u16,
     pub stream_id: u32,
     pub sequence_number: u32,
     pub presentation_timestamp_ns: u64,
@@ -164,7 +167,7 @@ pub fn encode_float32_packet(
     }
 
     let channels = channel_count as usize;
-    if interleaved_samples.is_empty() || interleaved_samples.len() % channels != 0 {
+    if interleaved_samples.is_empty() || !interleaved_samples.len().is_multiple_of(channels) {
         return Err("Float32 packet samples must contain complete interleaved frames".to_string());
     }
 
@@ -207,6 +210,7 @@ pub fn parse_packet(buf: &[u8]) -> Option<ParsedPacket> {
         return None;
     }
 
+    let sub_stream_index = u16::from_be_bytes(buf[6..8].try_into().ok()?);
     let stream_id = u32::from_be_bytes(buf[8..12].try_into().ok()?);
     let sequence_number = u32::from_be_bytes(buf[12..16].try_into().ok()?);
     let presentation_timestamp_ns = u64::from_be_bytes(buf[16..24].try_into().ok()?);
@@ -225,6 +229,7 @@ pub fn parse_packet(buf: &[u8]) -> Option<ParsedPacket> {
     }
 
     Some(ParsedPacket {
+        sub_stream_index,
         stream_id,
         sequence_number,
         presentation_timestamp_ns,
@@ -255,15 +260,67 @@ pub fn float32_payload<'a>(buf: &'a [u8], packet: &ParsedPacket) -> Option<&'a [
 /// Decodes a complete interleaved little-endian Float32 audio packet.
 pub fn decode_float32(buf: &[u8], packet: &ParsedPacket) -> Option<Vec<f32>> {
     let payload = float32_payload(buf, packet)?;
-    Some(
-        payload
-            .chunks_exact(std::mem::size_of::<f32>())
-            .map(|sample| {
-                let value = f32::from_le_bytes(sample.try_into().ok()?);
-                value.is_finite().then_some(value)
-            })
-            .collect::<Option<Vec<_>>>()?,
-    )
+    payload
+        .chunks_exact(std::mem::size_of::<f32>())
+        .map(|sample| {
+            let value = f32::from_le_bytes(sample.try_into().ok()?);
+            value.is_finite().then_some(value)
+        })
+        .collect::<Option<Vec<_>>>()
+}
+
+/// Encodes an Opus payload in the OpenAudio packet envelope.
+pub fn encode_opus_packet(
+    header: &PacketHeader,
+    channel_count: u8,
+    sample_rate: u32,
+    samples_per_channel: u16,
+    opus_payload: &[u8],
+) -> Result<Vec<u8>, String> {
+    if !(1..=64).contains(&channel_count) {
+        return Err(format!("unsupported channel count: {channel_count}"));
+    }
+    if opus_payload.is_empty() {
+        return Err("Opus payload cannot be empty".to_string());
+    }
+
+    let sample_rate_code = sample_rate_to_code(sample_rate);
+    if sample_rate_code == 0 {
+        return Err(format!("unsupported sample rate: {sample_rate}"));
+    }
+
+    let packet_len = OPENAUDIO_HEADER_BYTES
+        .checked_add(opus_payload.len())
+        .ok_or_else(|| "Opus packet size overflow".to_string())?;
+    if packet_len > MAX_SAFE_UDP_PAYLOAD_BYTES {
+        return Err(format!(
+            "Opus payload is too large: {} bytes, maximum packet size is {} bytes",
+            opus_payload.len(),
+            MAX_SAFE_UDP_PAYLOAD_BYTES - OPENAUDIO_HEADER_BYTES
+        ));
+    }
+
+    let mut packet = Vec::with_capacity(packet_len);
+    packet.extend_from_slice(&header.to_bytes_with_type(PACKET_TYPE_AUDIO));
+    packet.extend_from_slice(
+        &AudioPayloadHeader {
+            channel_count,
+            sample_format: SAMPLE_FORMAT_OPUS,
+            sample_rate_code,
+            samples_per_channel,
+        }
+        .to_bytes(),
+    );
+    packet.extend_from_slice(opus_payload);
+    Ok(packet)
+}
+
+/// Returns the format-specific payload for a valid Opus packet.
+pub fn opus_payload<'a>(buf: &'a [u8], packet: &ParsedPacket) -> Option<&'a [u8]> {
+    if packet.sample_format != SAMPLE_FORMAT_OPUS || packet.payload_offset > buf.len() {
+        return None;
+    }
+    buf.get(packet.payload_offset..)
 }
 
 /// Peeks at the packet type byte if the buffer is a valid OpenAudio v1 packet.
@@ -324,7 +381,11 @@ pub fn encode_fec_packet(
 }
 
 pub fn parse_fec_packet(buf: &[u8]) -> Option<ParsedFecPacket> {
-    if buf.len() < FEC_HEADER_BYTES || &buf[0..4] != b"OAv1" || buf[4] != 1 || buf[5] != PACKET_TYPE_FEC {
+    if buf.len() < FEC_HEADER_BYTES
+        || &buf[0..4] != b"OAv1"
+        || buf[4] != 1
+        || buf[5] != PACKET_TYPE_FEC
+    {
         return None;
     }
     let stream_id = u32::from_be_bytes(buf[8..12].try_into().ok()?);
@@ -403,9 +464,26 @@ mod tests {
         decode_float32, encode_fec_packet, encode_nack_packet, float32_payload,
         max_float32_frames_per_packet, parse_fec_packet, parse_nack_packet, parse_packet,
         peek_packet_type, AudioPayloadHeader, PacketHeader, MAX_SAFE_UDP_PAYLOAD_BYTES,
-        OPENAUDIO_HEADER_BYTES, PACKET_TYPE_FEC, PACKET_TYPE_NACK,
-        SAMPLE_FORMAT_FLOAT32,
+        OPENAUDIO_HEADER_BYTES, PACKET_TYPE_FEC, PACKET_TYPE_NACK, SAMPLE_FORMAT_FLOAT32,
     };
+
+    #[test]
+    fn opus_packet_round_trip_and_payload_limit() {
+        let header = PacketHeader {
+            sub_stream_index: 2,
+            stream_id: 42,
+            sequence_number: 100,
+            presentation_timestamp_ns: 12345,
+        };
+        let opus_payload = [0x01_u8; 200];
+        let packet = super::encode_opus_packet(&header, 2, 48_000, 960, &opus_payload).unwrap();
+        let parsed = parse_packet(&packet).expect("valid Opus packet");
+
+        assert_eq!(parsed.channel_count, 2);
+        assert_eq!(parsed.sample_format, super::SAMPLE_FORMAT_OPUS);
+        assert_eq!(parsed.samples_per_channel, 960);
+        assert_eq!(super::opus_payload(&packet, &parsed).unwrap(), opus_payload);
+    }
 
     #[test]
     fn packet_header_and_payload_round_trip() {
@@ -634,13 +712,10 @@ mod tests {
         let fec_bytes = encode_fec_packet(
             101, // stream_id
             5,   // fec_seq
-            1_000_000,
-            10,  // base_seq
-            4,   // count
-            2,   // channels
-            48_000,
-            128,
-            &parity,
+            1_000_000, 10, // base_seq
+            4,  // count
+            2,  // channels
+            48_000, 128, &parity,
         )
         .expect("encode fec");
 

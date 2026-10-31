@@ -66,7 +66,9 @@ impl BoundedAudioQueue {
             .ok_or_else(|| "audio queue capacity overflow".to_string())?;
 
         let block_capacity = (maximum_samples / 4).clamp(64, 8192);
-        let recycled = (0..16).map(|_| Vec::with_capacity(block_capacity)).collect();
+        let recycled = (0..16)
+            .map(|_| Vec::with_capacity(block_capacity))
+            .collect();
 
         Ok(Self {
             channels,

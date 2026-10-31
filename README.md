@@ -2,8 +2,14 @@
 
 OpenAudio is an open-source, cross-platform audio-over-IP project written in
 Rust. It includes a desktop sender/router, a headless receiver, and browser
-playback and publishing gateways. The v1 wire format is uncompressed
-interleaved little-endian Float32 PCM over UDP on a trusted local network.
+playback and publishing gateways. The project is currently LAN-development
+software, not a production-certified broadcast system. Publishing and playback
+primarily use interleaved little-endian Float32 PCM over UDP, with Opus
+(48 kHz, 10 ms frames, multichannel split into mono/stereo substreams) wired
+through the current publish and receive paths. Opus interoperability and
+hardware behavior remain release-validation items; see
+[Audio formats and Opus status](#audio-formats-and-opus-status) before relying
+on codec interoperability.
 
 The project is usable for development and LAN testing, but is not yet a
 production-certified replacement for established broadcast audio systems. See
@@ -113,14 +119,18 @@ default output device. Run `cargo run -p receiver -- --help` for its options.
 
 Start the **Browser Sharing** gateway in the desktop app and open
 `http://<computer-ip>:7100/` for playback or
-`http://<computer-ip>:7100/publish` for browser microphone publishing. The
+`http://<computer-ip>:7100/publish` for browser microphone publishing, where the
+page's format selector chooses Float32 PCM or Opus. The
 gateway's default HTTP port is `7100`; its WebSocket port is `7101`. Use the
 access mode displayed in the app. The gateway is stopped by default.
 
-Browser playback accepts Float32 PCM and resamples to the browser's output
-sample rate. For multichannel streams it defaults to a selected stereo pair;
-the optional alternate L/R mode averages even and odd channels and is not a
-speaker-layout-aware surround downmix.
+The desktop browser gateway and the `receive_and_serve_web` relay both accept
+Float32 and Opus streams and decode to PCM, resampling to the browser's output
+sample rate. For
+multichannel desktop-gateway streams, playback defaults to a selected stereo
+pair; the optional alternate L/R mode averages even and odd channels and is not
+a speaker-layout-aware surround downmix. Browser Opus interoperability still
+needs end-to-end verification.
 
 Browser microphone capture requires a secure browser context. Most browsers
 allow microphone access on `localhost` or HTTPS, but not on an ordinary
@@ -142,30 +152,84 @@ encryption. Because the gateway does not provide TLS, do not expose it to the
 public internet, forward its ports from a router, or use it on an untrusted
 network. Prefer password protection even on a shared LAN.
 
-## Audio format and interoperability
+## Audio formats and Opus status
 
-The v1 native and browser audio paths use interleaved little-endian Float32
-PCM. Packet headers carry a sample-format identifier, but the Opus (`0x10`)
-and FLAC (`0x11`) identifiers are reserved compatibility values only: OpenAudio
-does not currently encode or decode those formats. The receiver CLI and browser
-gateway report them as unsupported rather than interpreting compressed bytes
-as PCM; other native playback paths discard non-Float32 packets.
+The wire packet format identifies Float32 PCM (`0x03`), Opus (`0x10`), and
+FLAC (`0x11`). Current application support is uneven:
 
-Float32 is retained for v1 because it is already used throughout capture,
-routing, browser playback, and receiver paths, and avoids codec delay and
-implementation/dependency complexity while predictable LAN latency and
-channel/sample integrity are the current priorities. Its uncompressed payload
-rate is `channels × sample_rate × 32` bits/s: at 64 channels and 48 kHz this is
-98.304 Mbit/s before packet/network overhead. Validate that load on target
-hardware and networks; do not infer Wi-Fi capacity from the codec decision.
-Any future codec requires a specified framing/timing contract, real encoder
-and decoder implementations, malformed-input limits, and cross-implementation
-interoperability tests before being advertised as supported.
+- **Float32 PCM** is the default format. Every publisher can emit either
+  Float32 PCM or Opus: the desktop GUI (input, loopback, combined-source, and
+  ASIO) through its format setting and saved presets, and the browser
+  microphone page through its format selector.
+- **Opus** is implemented in `network-core` (48 kHz, 10 ms frames, multichannel
+  streams encoded as consecutive mono/stereo substreams) with encoder/decoder
+  support and packet envelope helpers. The desktop GUI can publish via discovery
+  (input or loopback) in Opus; combined-source publishing also supports Opus.
+  Every receive path — simple live playback, WAV capture, ASIO playback, the
+  ASIO subscriber, the mixed subscriber bus, the split-device receiver, the
+  desktop browser gateway, the shared network receiver (`network_core::receiver`),
+  the `receive_and_serve_web` relay, and the VST3 plugin — decodes through one
+  shared packet decoder (`network_core::opus_receive::AudioPacketDecoder`). It
+  assembles multichannel substreams, rejects duplicates, conceals a missing
+  substream after one frame interval, and bounds pending frames. Receivers flush
+  it when the socket goes quiet, so the tail of a stream — or a gap where packets
+  stop arriving — is concealed and played rather than held indefinitely. Duplicate,
+  malformed, and concealed traffic is counted and reported in the bus status line,
+  the ASIO timing line, and the browser player's stats bar, so a silent or
+  glitching stream can be told apart from a rejected one. The synthetic
+  diagnostic publisher can emit Opus. Resampling from non-48 kHz sources to
+  48 kHz is handled in the Opus publisher path. The wire framing,
+  sequence/timestamp, and per-substream sequencing are implemented, but
+  end-to-end interoperability still needs verification across all subscriber
+  types.
+- **FLAC** has a format identifier but no implemented encoder/decoder.
+
+### Format negotiation
+
+Publishers advertise the concrete wire format a stream sends in the discovery
+advertisement (`sample_format`), and subscribers declare every format they can
+decode in the subscribe request (`supported_formats`). A publisher only streams
+to subscribers that declared support for its format, and reports the number of
+skipped subscribers instead of sending them packets they cannot decode. A
+subscribe request without `supported_formats` is treated as Float32-only, so
+older clients keep working against a Float32 publisher and are safely skipped by
+an Opus publisher.
+
+Every subscriber (mixed, split, ASIO, browser gateway, network receiver, the
+receiver CLI, and the VST3 plugin) declares PCM and Opus. The VST3 plugin also
+publishes Opus when its "Publish Opus" parameter is enabled, which costs a little
+CPU for a large bandwidth reduction on multichannel sessions.
+
+The browser microphone page requests its format in the publish handshake and
+runs the same registry and filtering as the native publishers, so a page
+publishing Opus does not send packets to a receiver that declared PCM only.
+
+The `Auto` publish policy resolves against both the channel count and the
+subscribers already waiting on the stream: multichannel streams pick Opus, but if
+every waiting subscriber declared PCM only, the publisher stays on PCM instead of
+streaming into the void. Subscribers that connect later with a narrower format
+are skipped and counted rather than silently dropping the stream. The resolved
+format is fixed for the life of a publish session, so changing it means stopping
+and restarting the publisher.
+
+Opus is **integrated across every publish and receive path**: the wire framing and
+sequence/timestamp contract should still be validated in target scenarios before
+relying on Opus in production. Float32 remains important as the default because
+it is already used across the regular capture, routing, and playback paths. Its
+uncompressed payload rate is
+`channels × sample_rate × 32` bits/s: at 64 channels and 48 kHz this is
+98.304 Mbit/s before packet/network overhead. Opus may reduce bandwidth, but
+its frame duration, per-substream sequencing, packet loss behavior, and added
+codec work need validation on target hardware and networks; codec presence does
+not prove lower latency or reliable Wi-Fi operation.
 
 ## Current limitations
 
-- Native receive and browser playback currently decode Float32 PCM only;
-  Opus/FLAC format identifiers have no corresponding encoders or decoders.
+- Opus is available on every publish and receive path, but it is only lightly
+  exercised: no Opus stream has been validated on real hardware, across a live
+  ASIO driver, or inside a DAW host. Publishers negotiate formats, so an Opus
+  stream is never sent to a subscriber that cannot decode it.
+- FLAC is not implemented despite its reserved format identifier.
 - Browser sample-rate conversion uses linear interpolation. It handles source
   and output rate differences but is not a high-quality resampler or a complete
   end-to-end clock synchronization solution.
@@ -185,11 +249,16 @@ interoperability tests before being advertised as supported.
   multicast and that UDP `5450` is allowed through host firewalls. Guest Wi-Fi
   and client-isolation settings commonly block device discovery.
 - **A stream appears but does not play:** Check UDP firewall rules, confirm the
-  receiver output channel count matches the stream, and verify that the selected
-  device is available to the operating system.
-- **Browser playback is silent or distorted:** Confirm the stream is Float32,
-  select the intended stereo pair, and check browser audio output/permissions.
-  The browser player does not decode Opus or FLAC.
+  receiver output channel count matches the stream, verify that the selected
+  device is available to the operating system, and confirm that both ends use
+  a format supported by that complete receive path. Opus support varies by
+  subscriber (e.g. mixed bus and desktop browser gateway support it; some
+  native routes may not).
+- **Browser playback is silent or distorted:** Check that the source format is
+  supported by the selected gateway path, select the intended stereo pair, and
+  check browser audio output/permissions. The desktop browser gateway supports
+  Float32 and Opus (interoperability still needs verification). FLAC is
+  unsupported.
 - **Browser microphone permission is denied:** Use localhost or serve the
   publishing page through a trusted HTTPS origin; ordinary HTTP LAN pages
   generally cannot access the microphone.
