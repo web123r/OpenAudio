@@ -79,12 +79,17 @@ test does not satisfy a hardware or release gate.
 ## VST3 and DAW
 
 - [ ] Scan the plugin in REAPER
+- [ ] Scan the plugin in Studio One
 - [ ] Confirm audio pass-through when publishing is disabled
 - [ ] Confirm mono and stereo publishing when enabled
+- [ ] Confirm Studio One plug-in discovery, reset-blocklist behavior, and
+      transport start/stop
 - [ ] Confirm plugin processing performs no network I/O or blocking
 - [ ] Verify plugin reconnect and shutdown
 - [ ] Verify separate receiver playback on the LAN
 - [ ] Verify overload behavior and bounded callback queues
+- [ ] Repeat Studio One validation at 44.1 kHz and 48 kHz with multiple block
+      sizes
 - [ ] Decide whether the plugin is ready for the portable release package
 
 ## Release decision

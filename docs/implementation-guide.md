@@ -35,7 +35,7 @@ The agreed v1 targets are:
 - A measured end-to-end latency below 10 ms on a wired LAN. This remains a
   target, not a demonstrated result.
 - Windows WASAPI and ASIO workflows.
-- A Windows VST3 effect that passes mono/stereo DAW audio through unchanged and
+- A Windows VST3 effect that passes DAW audio through unchanged and
   publishes it to OpenAudio when explicitly enabled.
 - Trusted private LAN operation only. Native discovery, control, and audio are
   not encrypted or authenticated.
@@ -93,7 +93,7 @@ they do not prove hardware timing, network capacity, or audio quality.
 | `crates/audio-core` | Audio backends, capture/publish paths, routing, playback, diagnostics, and browser gateways |
 | `apps/sender` | Desktop GUI for publishing, receiving/routing, browser sharing, and diagnostics |
 | `apps/receiver` | Headless receiver and inspection CLI |
-| `apps/plugin` | Experimental mono/stereo Windows VST3 DAW sender |
+| `apps/plugin` | Experimental Windows VST3 DAW sender |
 | `.github/workflows/ci.yml` | Cross-platform checks/tests and Windows VST3 bundle build |
 | `.github/workflows/release.yml` | Tag-triggered release packaging and checksum workflow |
 | `docs/release-scope.md` | Requirements, current support boundary, release gates, and detailed test runbook |
@@ -189,8 +189,9 @@ First build the bundle and install it in a VST3 directory REAPER scans. Verify:
 6. Observe dropped-frame reports and latency during a several-minute run.
    Repeat with a receiver on another computer over a trusted private LAN.
 
-Keep receiver/channel configuration compatible with the plugin's mono/stereo
-stream. Record any host-specific scan path or behavior in the plugin guide.
+Keep receiver/channel configuration compatible with the plugin's declared
+mono, stereo, and multichannel stream layouts. Record any host-specific scan
+path or behavior in the plugin guide.
 Do not add the VST3 to the release ZIP until this gate and the licensing gate
 below are complete.
 
