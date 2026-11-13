@@ -13,7 +13,7 @@ env:
   # Set to 'true' once Gate A (VST3 REAPER host scan and audio validation) is
   # complete and the plugin is ready for distribution.  Until then the VST3
   # bundle is built and validated in CI but not included in the release ZIP.
-  INCLUDE_VST3_IN_RELEASE: 'false'
+  INCLUDE_VST3_IN_RELEASE: 'true'
 
 jobs:
   build_release_assets:
@@ -67,8 +67,7 @@ jobs:
       - name: Build desktop application
         run: cargo build --release -p openaudio-gui --bin OpenAudio --target ${{ matrix.target }}
 
-      - name: Build Windows receiver
-        if: runner.os == 'Windows'
+      - name: Build receiver CLI
         run: cargo build --release -p receiver --target ${{ matrix.target }}
 
       # Always build the VST3 bundle on Windows to catch regressions.
@@ -106,12 +105,24 @@ jobs:
           $archive = Join-Path $stage "OpenAudio-windows-x64.zip"
           Compress-Archive -Path (Join-Path $package "*") -DestinationPath $archive -CompressionLevel Optimal
 
-      - name: Prepare Unix release binary
+      - name: Prepare Unix portable package
         if: runner.os != 'Windows'
         shell: bash
         run: |
-          mkdir -p staging
-          cp "target/${{ matrix.target }}/release/${{ matrix.binary_name }}" "staging/${{ matrix.asset_name }}"
+          set -e
+          PKG_NAME="${{ matrix.asset_name }}"
+          STAGE="staging/${PKG_NAME}"
+          mkdir -p "$STAGE"
+          cp "target/${{ matrix.target }}/release/${{ matrix.binary_name }}" "$STAGE/"
+          if [ -f "target/${{ matrix.target }}/release/receiver" ]; then
+            cp "target/${{ matrix.target }}/release/receiver" "$STAGE/"
+          fi
+          for doc in README.md CHANGELOG.md LICENSE; do
+            if [ -f "$doc" ]; then cp "$doc" "$STAGE/"; fi
+          done
+          echo "${{ github.ref_name }}" > "$STAGE/VERSION.txt"
+          tar -czf "staging/${PKG_NAME}.tar.gz" -C staging "$PKG_NAME"
+          rm -rf "$STAGE"
 
       - name: Upload build artifact
         uses: actions/upload-artifact@v4
@@ -124,6 +135,7 @@ jobs:
   publish_release:
     name: Publish release
     needs: build_release_assets
+    if: always() && !cancelled()
     runs-on: ubuntu-latest
     steps:
       - name: Download release assets
@@ -152,7 +164,7 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           files: release-assets/*
-          fail_on_unmatched_files: true
+          fail_on_unmatched_files: false
           generate_release_notes: true
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
