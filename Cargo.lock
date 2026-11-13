@@ -2514,7 +2514,7 @@ checksum = "c08d65885ee38876c4f86fa503fb49d7b507c2b62552df7c70b2fce627e06381"
 
 [[package]]
 name = "openaudio-gui"
-version = "0.3.2"
+version = "0.3.3"
 dependencies = [
  "audio-core",
  "ctrlc",

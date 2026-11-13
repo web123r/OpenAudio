@@ -2,6 +2,14 @@
 
 All notable changes to the OpenAudio project will be documented in this file.
 
+## [0.3.3] - 2026-11-13
+
+### 🎹 **Studio One DAW Integration**
+* Added full Studio One compatibility documentation, plug-in deployment guidance, and host validation procedures for **OpenAudio DAW Sender** and receiver workflows.
+* Verified VST3 bundle discovery via Studio One Plug-in Manager (`%LOCALAPPDATA%\Programs\Common\VST3` and `%CommonProgramFiles%\VST3`), including blocklist recovery and transport start/stop testing.
+* Validated mono, stereo, and multichannel surround/bus channel layouts (up to 64 channels) under 44.1 kHz and 48 kHz host sample rates across multiple audio buffer block sizes.
+* Updated test checklists and DAW deployment guides with Studio One specific verification steps.
+
 ## [0.3.2] - 2026-10-31
 
 ### 🎛️ **VST3 Plugin Opus Support**

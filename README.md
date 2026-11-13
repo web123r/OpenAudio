@@ -234,8 +234,9 @@ not prove lower latency or reliable Wi-Fi operation.
   and output rate differences but is not a high-quality resampler or a complete
   end-to-end clock synchronization solution.
 - The VST3 sender is an initial implementation, not yet certified across DAW
-  hosts. It publishes mono/stereo tracks only, and its host-visible Publish
-  parameter must be enabled before audio is sent. See
+  hosts, including Studio One. It publishes host-supported mono, stereo, and
+  multichannel layouts, and its host-visible Publish parameter must be enabled
+  before audio is sent. See
   [the plugin guide](./apps/plugin/README.md).
 - Browser microphone publishing may be blocked by browsers that require HTTPS
   for microphone permission on non-localhost origins.

@@ -18,7 +18,7 @@ Write-Host "==========================================================" -Foregro
 $repoRoot = Resolve-Path (Join-Path $PSScriptRoot "..")
 Set-Location $repoRoot
 
-$version = "0.3.2"
+$version = "0.3.3"
 $distDir = Join-Path $repoRoot "dist"
 $packageDir = Join-Path $distDir "OpenAudio-v$version-windows-x64"
 $zipFile = Join-Path $distDir "OpenAudio-v$version-windows-x64.zip"

@@ -11,7 +11,7 @@ best-effort until they have equivalent hardware coverage and validation.
 
 The release-critical product is the native desktop sender/router and native
 receiver. Windows v1 must support both WASAPI and ASIO workflows. The v1 scope
-now also includes a first Windows VST3 sender for mono and stereo DAW tracks.
+now also includes a first Windows VST3 sender for DAW tracks.
 Browser playback and publishing may remain best-effort and are not release
 gates.
 
@@ -33,12 +33,12 @@ gates.
   adds access control but its HTTP/WebSocket traffic is unencrypted and can be
   observed on the LAN. It does not secure native streams or encrypt media.
 - **Windows audio APIs:** WASAPI and ASIO are both release requirements.
-- **DAW integration:** A VST3 effect plug-in sends mono/stereo host audio as a
+- **DAW integration:** A VST3 effect plug-in sends host audio as a
   discoverable OpenAudio stream, passes audio through unchanged, and publishes
   only when its host-visible Publish parameter is enabled. Plugin processing
   must not perform network I/O or wait on a lock. CLAP, AudioUnit, DAW receive,
-  multichannel plugin ports, and a custom editor are outside this first VST3
-  milestone.
+  and a custom editor are outside this first VST3 milestone; host validation of
+  multichannel layouts remains an explicit compatibility task.
 - **Non-goals for v1:** Release-critical browser playback/publishing and DAW
   plugin formats other than VST3.
 
@@ -435,7 +435,7 @@ Only the current workflow's release artifacts should be distributed.
 
 ## Phase 6 progress (2026-10-13)
 
-The v1 scope was revised to include a Windows VST3 mono/stereo sender. The
+The v1 scope was revised to include a Windows VST3 sender. The
 initial plug-in implementation passes DAW audio through unchanged, offers a
 host-visible Publish parameter that defaults off, advertises streams through
 the existing discovery protocol, and moves packetization and UDP sending off
