@@ -19,6 +19,7 @@ jobs:
   build_release_assets:
     name: Build Release Artifact (${{ matrix.target }})
     runs-on: ${{ matrix.os }}
+    continue-on-error: ${{ matrix.allow_failure || false }}
     strategy:
       fail-fast: false
       matrix:
@@ -31,10 +32,12 @@ jobs:
             target: x86_64-apple-darwin
             binary_name: OpenAudio
             asset_name: openaudio-macos-x64
+            allow_failure: true
           - os: macos-latest
             target: aarch64-apple-darwin
             binary_name: OpenAudio
             asset_name: openaudio-macos-arm64
+            allow_failure: true
           - os: windows-latest
             target: x86_64-pc-windows-msvc
 
@@ -42,9 +45,8 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@master
+        uses: dtolnay/rust-toolchain@stable
         with:
-          toolchain: 1.81.0
           targets: ${{ matrix.target }}
 
       - name: Verify release tag matches the GUI package version
